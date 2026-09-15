@@ -1,0 +1,34 @@
+# Timeline Editing Workflow
+
+## Goal
+
+Arrange imported media on a multi-track timeline: move, trim, split, and delete clips; add/remove tracks; mute, lock, or hide a track.
+
+## Steps
+
+1. Drag a clip from the Media Bin onto a track, or double-click it to append it to the end of the first compatible track (video clips/images go to a video track, audio-only files go to an audio track).
+2. Drag a clip horizontally to move it; drag its left/right edge (the `HANDLE_WIDTH`-wide strip at each end, `ui/widgets/timeline_items.py`) to trim in/out without affecting the rest of the timeline.
+3. Position the playhead (click the ruler, or drag it) and press **S** / click **Split** to split the selected clip at the playhead.
+4. Press **Delete** / click **Delete** to remove the selected clip.
+5. Use **+ Video Track** / **+ Audio Track** to add tracks; select a clip and click **Delete Track** to remove its track.
+6. Click a track header's **M** / **L** / **H** buttons to mute, lock, or hide that track. A locked track's clips can't be dragged or trimmed; a hidden video track is skipped entirely by both the preview and the export filter graph.
+
+## Snapping
+
+Toggle **Snap** in the timeline toolbar. When enabled, dragging or trimming a clip snaps its edges to: `0:00`, the playhead, and every other clip's start/end across all tracks (`TimelineWidget._snap_targets()`), within `SNAP_THRESHOLD_PX` (8px) of the pointer. A dashed guide line shows the active snap target while dragging.
+
+## Overlap prevention
+
+Every move/trim commits through `Track.has_overlap()` before being applied (`TimelineWidget._on_clip_moved`/`_on_clip_trimmed`) — a drop or trim that would overlap another clip on the destination track snaps back to the clip's pre-drag position instead of applying. Tracks are strictly non-overlapping by design; there is no ripple/insert mode that shifts other clips out of the way.
+
+## Undo/redo
+
+Every operation above goes through a `Command` (`core/commands.py`) executed via `core.history.History`, so `Ctrl+Z`/`Ctrl+Y` (or **Edit > Undo/Redo**) reverses/reapplies it. The Edit menu and toolbar show the label of the next undo/redo action.
+
+## Layout notes
+
+The track-header column (name + M/L/H buttons, `HEADER_WIDTH = 130px`) is pinned to the left edge of the viewport — it stays visible and never overlaps clip content regardless of horizontal scroll position (`TimelineWidget._pin_header_items()`, connected to the view's horizontal scrollbar). Clips, the ruler, the playhead, and the snap guide all live in scene coordinates starting at `x = HEADER_WIDTH`.
+
+## Validation
+
+`tests/test_clip_and_track.py` covers clip duration/speed math and `Track.has_overlap()`/`clip_at()`. `tests/test_commands_and_history.py` covers add/remove/move/trim/split undo-redo round trips, including that a split outside the clip's span is a no-op and that redo is cleared after a new command. There is no automated test for drag/drop mouse interaction or the header-pinning behavior (both require a live Qt event loop) — verify those manually, or headlessly via a `QT_QPA_PLATFORM=offscreen` script driving `TimelineWidget` directly.

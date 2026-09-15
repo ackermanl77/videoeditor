@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Application entry point.
+
+Run with ``python main.py`` during development, or launch the packaged
+executable built by PyInstaller (see build.spec / README.md).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+# Ensure the project root is importable whether launched as `python main.py`
+# from another directory or bundled by PyInstaller.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen  # noqa: E402
+
+from ui.main_window import MainWindow  # noqa: E402
+from ui.theme import DARK_STYLESHEET  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("video_editor")
+
+APP_ID = "OpenVideoEditor.VideoEditor.1"  # Windows AppUserModelID
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icons")
+
+
+def _set_windows_app_id() -> None:
+    """Give the app its own taskbar identity on Windows.
+
+    Without this, a PyInstaller-packaged Python GUI app is grouped under
+    (and shows the icon of) the generic Python/pythonw process in the
+    Windows taskbar instead of using our own icon. This is a no-op on any
+    other OS.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:  # noqa: BLE001 - purely cosmetic, never fatal
+        pass
+
+
+def _show_splash(app: QApplication) -> QSplashScreen | None:
+    splash_path = os.path.join(ASSETS_DIR, "splash.png")
+    if not os.path.exists(splash_path):
+        return None
+    pixmap = QPixmap(splash_path)
+    if pixmap.isNull():
+        return None
+    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash.setWindowFlag(Qt.FramelessWindowHint)
+    splash.show()
+    app.processEvents()
+    return splash
+
+
+def main() -> int:
+    _set_windows_app_id()
+
+    QApplication.setApplicationName("Open Video Editor")
+    QApplication.setApplicationDisplayName("Open Video Editor")
+    QApplication.setOrganizationName("OpenVideoEditor")
+
+    app = QApplication(sys.argv)
+    app.setStyleSheet(DARK_STYLESHEET)
+
+    icon_path = os.path.join(ASSETS_DIR, "app_icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+    splash = _show_splash(app)
+
+    ffmpeg_missing = False
+    try:
+        from core.ffmpeg_utils import find_binary
+
+        find_binary("ffmpeg")
+    except FileNotFoundError:
+        ffmpeg_missing = True
+        log.warning(
+            "FFmpeg was not found. Media import, thumbnails, preview and export "
+            "will not work until FFmpeg is installed and available on PATH."
+        )
+
+    window = MainWindow()
+    window.show()
+
+    if splash is not None:
+        splash.finish(window)
+
+    if ffmpeg_missing:
+        QMessageBox.warning(
+            window,
+            "FFmpeg Not Found",
+            "FFmpeg could not be found on this system.\n\n"
+            "Media import, thumbnails, preview playback and video export all "
+            "depend on FFmpeg. Please install it and make sure it is on your "
+            "PATH (or place ffmpeg/ffprobe next to this application), then "
+            "restart the app.\n\n"
+            "Download: https://ffmpeg.org/download.html",
+        )
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
