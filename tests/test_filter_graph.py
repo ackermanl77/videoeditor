@@ -125,6 +125,9 @@ class CrossfadeTransitionTests(unittest.TestCase):
         self.assertEqual(graph.filter_complex.count("overlay=0:0"), 1)
         # Each clip's own fade (superseded by the crossfade) is skipped.
         self.assertNotIn(":alpha=1", graph.filter_complex)
+        # xfade hard-fails ("inputs needs to be a constant frame rate")
+        # without this — confirmed against real FFmpeg, see PROJECT_STATUS.md.
+        self.assertEqual(graph.filter_complex.count(f",fps={ProjectSettings().fps}"), 2)
 
     def test_no_gap_means_no_crossfade(self):
         project = Project()

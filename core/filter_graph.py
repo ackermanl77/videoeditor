@@ -259,10 +259,17 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
                 partner = sorted_clips[partner_i]
                 d = _crossfade_duration(clip, partner)
 
+                # xfade requires constant-frame-rate inputs ("inputs needs to
+                # be a constant frame rate" is a hard failure otherwise) —
+                # neither trim/setpts nor the final -r output flag guarantees
+                # that on their own, so force it explicitly on both sides
+                # feeding into it. Standalone clips don't need this: overlay
+                # has no such requirement, and the exporter's -r already
+                # fixes the final output rate.
                 idx_a = _register_video_input(clip, fps, input_specs)
-                chain_a = _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True)
+                chain_a = _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True) + f",fps={fps}"
                 idx_b = _register_video_input(partner, fps, input_specs)
-                chain_b = _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True)
+                chain_b = _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True) + f",fps={fps}"
 
                 label_a = f"xf{clip_counter}a"
                 label_b = f"xf{clip_counter}b"
