@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.clip import Clip, MediaType, TextStyle
+from core.clip import Clip, MediaType, TextStyle, TransitionType
 from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand
 from core.history import History
 from core.project import Project
@@ -136,6 +136,67 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(self.clip_group)
 
+        # ---- Transition group (video/image only) ----
+        self.transition_group = QGroupBox("Transition")
+        transition_form = QFormLayout(self.transition_group)
+
+        self.crossfade_checkbox = QCheckBox("Crossfade into next clip")
+        self.crossfade_checkbox.setToolTip(
+            "Blends this clip's tail into the next clip on the same track, "
+            "if it immediately follows with no gap."
+        )
+        transition_form.addRow("", self.crossfade_checkbox)
+
+        self.transition_duration_spin = QDoubleSpinBox()
+        self.transition_duration_spin.setRange(0.1, 10.0)
+        self.transition_duration_spin.setSingleStep(0.1)
+        self.transition_duration_spin.setSuffix(" s")
+        transition_form.addRow("Duration", self.transition_duration_spin)
+
+        layout.addWidget(self.transition_group)
+
+        # ---- Color correction group (video/image only) ----
+        self.color_group = QGroupBox("Color Correction")
+        color_form = QFormLayout(self.color_group)
+
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        color_form.addRow("Brightness", self.brightness_slider)
+
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(0, 200)
+        color_form.addRow("Contrast", self.contrast_slider)
+
+        self.saturation_slider = QSlider(Qt.Horizontal)
+        self.saturation_slider.setRange(0, 300)
+        color_form.addRow("Saturation", self.saturation_slider)
+
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setRange(10, 300)
+        color_form.addRow("Gamma", self.gamma_slider)
+
+        layout.addWidget(self.color_group)
+
+        # ---- Chroma key group (video/image only) ----
+        self.chroma_group = QGroupBox("Chroma Key (Green Screen)")
+        chroma_form = QFormLayout(self.chroma_group)
+
+        self.chroma_enabled_checkbox = QCheckBox("Enable chroma key")
+        chroma_form.addRow("", self.chroma_enabled_checkbox)
+
+        self.chroma_color_btn = QPushButton("Key Color")
+        chroma_form.addRow("Color", self.chroma_color_btn)
+
+        self.chroma_similarity_slider = QSlider(Qt.Horizontal)
+        self.chroma_similarity_slider.setRange(0, 100)
+        chroma_form.addRow("Similarity", self.chroma_similarity_slider)
+
+        self.chroma_blend_slider = QSlider(Qt.Horizontal)
+        self.chroma_blend_slider.setRange(0, 100)
+        chroma_form.addRow("Softness", self.chroma_blend_slider)
+
+        layout.addWidget(self.chroma_group)
+
         # ---- Text group ----
         self.text_group = QGroupBox("Text")
         text_form = QFormLayout(self.text_group)
@@ -173,6 +234,7 @@ class PropertiesPanel(QWidget):
 
         self._connect_signals()
         self._selected_color = QColor("#FFFFFF")
+        self._chroma_color = QColor("#00FF00")
 
     def _connect_signals(self) -> None:
         self.volume_slider.sliderPressed.connect(lambda: self._remember("volume", self.volume_slider.value() / 100.0))
@@ -187,6 +249,44 @@ class PropertiesPanel(QWidget):
         self.speed_spin.editingFinished.connect(lambda: self._commit_now("speed", self.speed_spin.value(), "Edit Speed"))
         self.fade_in_spin.editingFinished.connect(lambda: self._commit_now("fade_in", self.fade_in_spin.value(), "Edit Fade In"))
         self.fade_out_spin.editingFinished.connect(lambda: self._commit_now("fade_out", self.fade_out_spin.value(), "Edit Fade Out"))
+
+        self.crossfade_checkbox.toggled.connect(self._on_crossfade_toggled)
+        self.transition_duration_spin.editingFinished.connect(
+            lambda: self._commit_now("transition_duration", self.transition_duration_spin.value(), "Edit Transition Duration")
+        )
+
+        self.brightness_slider.sliderPressed.connect(lambda: self._remember("brightness", self.brightness_slider.value() / 100.0))
+        self.brightness_slider.valueChanged.connect(lambda v: self._apply_live("brightness", v / 100.0))
+        self.brightness_slider.sliderReleased.connect(lambda: self._commit("brightness", self.brightness_slider.value() / 100.0, "Edit Brightness"))
+
+        self.contrast_slider.sliderPressed.connect(lambda: self._remember("contrast", self.contrast_slider.value() / 100.0))
+        self.contrast_slider.valueChanged.connect(lambda v: self._apply_live("contrast", v / 100.0))
+        self.contrast_slider.sliderReleased.connect(lambda: self._commit("contrast", self.contrast_slider.value() / 100.0, "Edit Contrast"))
+
+        self.saturation_slider.sliderPressed.connect(lambda: self._remember("saturation", self.saturation_slider.value() / 100.0))
+        self.saturation_slider.valueChanged.connect(lambda v: self._apply_live("saturation", v / 100.0))
+        self.saturation_slider.sliderReleased.connect(lambda: self._commit("saturation", self.saturation_slider.value() / 100.0, "Edit Saturation"))
+
+        self.gamma_slider.sliderPressed.connect(lambda: self._remember("gamma", self.gamma_slider.value() / 100.0))
+        self.gamma_slider.valueChanged.connect(lambda v: self._apply_live("gamma", v / 100.0))
+        self.gamma_slider.sliderReleased.connect(lambda: self._commit("gamma", self.gamma_slider.value() / 100.0, "Edit Gamma"))
+
+        self.chroma_enabled_checkbox.toggled.connect(lambda checked: self._commit_now("chroma_key_enabled", checked, "Toggle Chroma Key"))
+        self.chroma_color_btn.clicked.connect(self._pick_chroma_color)
+
+        self.chroma_similarity_slider.sliderPressed.connect(
+            lambda: self._remember("chroma_key_similarity", self.chroma_similarity_slider.value() / 100.0)
+        )
+        self.chroma_similarity_slider.valueChanged.connect(lambda v: self._apply_live("chroma_key_similarity", v / 100.0))
+        self.chroma_similarity_slider.sliderReleased.connect(
+            lambda: self._commit("chroma_key_similarity", self.chroma_similarity_slider.value() / 100.0, "Edit Chroma Key Similarity")
+        )
+
+        self.chroma_blend_slider.sliderPressed.connect(lambda: self._remember("chroma_key_blend", self.chroma_blend_slider.value() / 100.0))
+        self.chroma_blend_slider.valueChanged.connect(lambda v: self._apply_live("chroma_key_blend", v / 100.0))
+        self.chroma_blend_slider.sliderReleased.connect(
+            lambda: self._commit("chroma_key_blend", self.chroma_blend_slider.value() / 100.0, "Edit Chroma Key Softness")
+        )
 
         self.color_btn.clicked.connect(self._pick_color)
         for widget, signal_name in (
@@ -210,6 +310,9 @@ class PropertiesPanel(QWidget):
         self.empty_label.setVisible(True)
         self.name_label.setVisible(False)
         self.clip_group.setVisible(False)
+        self.transition_group.setVisible(False)
+        self.color_group.setVisible(False)
+        self.chroma_group.setVisible(False)
         self.text_group.setVisible(False)
 
     def set_selected_clip(self, clip_id: Optional[str]) -> None:
@@ -229,8 +332,12 @@ class PropertiesPanel(QWidget):
         self.name_label.setText(f"{clip.name}  ·  {MEDIA_TYPE_LABEL.get(clip.media_type, 'Clip')}")
 
         is_text = clip.media_type == MediaType.TEXT
+        is_visual = clip.media_type in (MediaType.VIDEO, MediaType.IMAGE)
         self.text_group.setVisible(is_text)
         self.clip_group.setVisible(not is_text)
+        self.transition_group.setVisible(is_visual)
+        self.color_group.setVisible(is_visual)
+        self.chroma_group.setVisible(is_visual)
 
         self.volume_slider.setValue(int(clip.volume * 100))
         self.mute_checkbox.setChecked(clip.muted)
@@ -238,6 +345,21 @@ class PropertiesPanel(QWidget):
         self.opacity_slider.setValue(int(clip.opacity * 100))
         self.fade_in_spin.setValue(clip.fade_in)
         self.fade_out_spin.setValue(clip.fade_out)
+
+        if is_visual:
+            self.crossfade_checkbox.setChecked(clip.transition_out == TransitionType.CROSSFADE)
+            self.transition_duration_spin.setValue(clip.transition_duration)
+            self.transition_duration_spin.setEnabled(clip.transition_out == TransitionType.CROSSFADE)
+
+            self.brightness_slider.setValue(int(clip.brightness * 100))
+            self.contrast_slider.setValue(int(clip.contrast * 100))
+            self.saturation_slider.setValue(int(clip.saturation * 100))
+            self.gamma_slider.setValue(int(clip.gamma * 100))
+
+            self.chroma_enabled_checkbox.setChecked(clip.chroma_key_enabled)
+            self._chroma_color = QColor(clip.chroma_key_color)
+            self.chroma_similarity_slider.setValue(int(clip.chroma_key_similarity * 100))
+            self.chroma_blend_slider.setValue(int(clip.chroma_key_blend * 100))
 
         if is_text and clip.text_style is not None:
             style = clip.text_style
@@ -291,6 +413,17 @@ class PropertiesPanel(QWidget):
             return
         self.history.execute(UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label))
         self.project_modified.emit()
+
+    def _on_crossfade_toggled(self, checked: bool) -> None:
+        self.transition_duration_spin.setEnabled(checked)
+        new_value = TransitionType.CROSSFADE if checked else TransitionType.NONE
+        self._commit_now("transition_out", new_value, "Toggle Crossfade")
+
+    def _pick_chroma_color(self) -> None:
+        color = QColorDialog.getColor(self._chroma_color, self, "Chroma Key Color")
+        if color.isValid():
+            self._chroma_color = color
+            self._commit_now("chroma_key_color", color.name(), "Edit Chroma Key Color")
 
     def _pick_color(self) -> None:
         color = QColorDialog.getColor(self._selected_color, self, "Text Color")

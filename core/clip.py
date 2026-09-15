@@ -97,6 +97,22 @@ class Clip:
     fade_out: float = 0.0
     transition_in: TransitionType = TransitionType.NONE
     transition_out: TransitionType = TransitionType.NONE
+    # Crossfade duration used when transition_out == CROSSFADE, in seconds.
+    # Independent of fade_out (which remains a simple fade to transparent).
+    transition_duration: float = 0.5
+
+    # Color correction (video/image clips only). Neutral values match
+    # FFmpeg's ``eq`` filter defaults, so an unedited clip never emits it.
+    brightness: float = 0.0  # -1.0 .. 1.0
+    contrast: float = 1.0  # 0.0 .. 2.0
+    saturation: float = 1.0  # 0.0 .. 3.0
+    gamma: float = 1.0  # 0.1 .. 3.0
+
+    # Chroma key (video/image clips only), via FFmpeg's ``colorkey`` filter.
+    chroma_key_enabled: bool = False
+    chroma_key_color: str = "#00FF00"
+    chroma_key_similarity: float = 0.2  # 0.0 .. 1.0
+    chroma_key_blend: float = 0.1  # 0.0 .. 1.0
 
     # Text overlay data (only used when media_type == TEXT)
     text_style: Optional[TextStyle] = None
@@ -160,6 +176,15 @@ class Clip:
             "fade_out": self.fade_out,
             "transition_in": self.transition_in.value,
             "transition_out": self.transition_out.value,
+            "transition_duration": self.transition_duration,
+            "brightness": self.brightness,
+            "contrast": self.contrast,
+            "saturation": self.saturation,
+            "gamma": self.gamma,
+            "chroma_key_enabled": self.chroma_key_enabled,
+            "chroma_key_color": self.chroma_key_color,
+            "chroma_key_similarity": self.chroma_key_similarity,
+            "chroma_key_blend": self.chroma_key_blend,
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
         }
@@ -184,6 +209,15 @@ class Clip:
             fade_out=data.get("fade_out", 0.0),
             transition_in=TransitionType(data.get("transition_in", "none")),
             transition_out=TransitionType(data.get("transition_out", "none")),
+            transition_duration=data.get("transition_duration", 0.5),
+            brightness=data.get("brightness", 0.0),
+            contrast=data.get("contrast", 1.0),
+            saturation=data.get("saturation", 1.0),
+            gamma=data.get("gamma", 1.0),
+            chroma_key_enabled=data.get("chroma_key_enabled", False),
+            chroma_key_color=data.get("chroma_key_color", "#00FF00"),
+            chroma_key_similarity=data.get("chroma_key_similarity", 0.2),
+            chroma_key_blend=data.get("chroma_key_blend", 0.1),
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
         )

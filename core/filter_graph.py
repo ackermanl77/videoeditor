@@ -17,13 +17,19 @@ easy to extend with new effects later.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from core.clip import Clip, MediaType
+from core.clip import Clip, MediaType, TransitionType
 from core.project import Project, ProjectSettings
 from core.track import TrackType
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".gif"}
+
+# Minimum overlap FFmpeg's xfade is allowed to use for a crossfade — below
+# this it's not worth the extra filter graph complexity over a hard cut.
+MIN_CROSSFADE_SECONDS = 0.05
+
+_NEUTRAL_COLOR = (0.0, 1.0, 1.0, 1.0)  # brightness, contrast, saturation, gamma
 
 
 def _clip_has_audio(project: Project, clip: Clip, probe_cache: Dict[str, bool]) -> bool:
@@ -101,6 +107,99 @@ class GraphResult:
     has_audio: bool
 
 
+def _register_video_input(clip: Clip, fps: float, input_specs: List[InputSpec]) -> int:
+    """Add clip's ``-i`` input (looped for a still image, seeked for video) and return its index."""
+    idx = len(input_specs)
+    if clip.media_type == MediaType.IMAGE:
+        pre_args = ["-loop", "1", "-framerate", str(fps), "-t", f"{clip.source_length:.3f}"]
+    else:
+        pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}"]
+    input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
+    return idx
+
+
+def _build_video_clip_chain(
+    idx: int,
+    clip: Clip,
+    width: int,
+    height: int,
+    skip_fade_in: bool = False,
+    skip_fade_out: bool = False,
+) -> str:
+    """Build a clip's local-time (pre-``tpad``) video filter chain, ending unbracketed.
+
+    Shared by both standalone clips and crossfade pairs — a crossfade needs
+    each side's chain up to (but not including) the timeline-position
+    ``tpad`` step, so the two can be combined with ``xfade`` first and
+    ``tpad``-shifted only once, as a single merged layer.
+    """
+    if clip.media_type == MediaType.IMAGE:
+        chain = f"[{idx}:v]setpts=PTS-STARTPTS"
+    else:
+        chain = f"[{idx}:v]trim=duration={clip.source_length:.3f},setpts=PTS-STARTPTS"
+
+    speed = clip.speed if clip.speed > 0 else 1.0
+    if abs(speed - 1.0) > 1e-6:
+        chain += f",setpts=PTS/{speed:.6f}"
+
+    chain += (
+        f",scale={width}:{height}:force_original_aspect_ratio=decrease"
+        f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        ",format=yuva420p"
+    )
+
+    if clip.chroma_key_enabled:
+        key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
+        chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
+
+    if (clip.brightness, clip.contrast, clip.saturation, clip.gamma) != _NEUTRAL_COLOR:
+        chain += (
+            f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
+            f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
+        )
+
+    clip_len = clip.duration
+    if clip.fade_in > 0 and not skip_fade_in:
+        chain += f",fade=t=in:st=0:d={clip.fade_in:.3f}:alpha=1"
+    if clip.fade_out > 0 and not skip_fade_out:
+        fade_start = max(0.0, clip_len - clip.fade_out)
+        chain += f",fade=t=out:st={fade_start:.3f}:d={clip.fade_out:.3f}:alpha=1"
+
+    if clip.opacity < 1.0:
+        chain += f",colorchannelmixer=aa={clip.opacity:.3f}"
+
+    return chain
+
+
+def _crossfade_duration(clip: Clip, next_clip: Clip) -> float:
+    """Clamp a requested crossfade to what both clips can actually provide."""
+    return min(clip.transition_duration, clip.duration, next_clip.duration)
+
+
+def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
+    """Return the index of ``clips[i]``'s crossfade partner, if a valid one follows it.
+
+    Valid means: ``clips[i]`` requests a crossfade out, the next clip is a
+    video/image clip touching its tail (no gap — clips can't overlap per
+    ``Track.has_overlap``), and the clamped crossfade duration is meaningful.
+    Only one pair is ever formed per clip — chaining three or more
+    consecutive crossfades on the same track isn't supported.
+    """
+    clip = clips[i]
+    if clip.transition_out != TransitionType.CROSSFADE:
+        return None
+    if i + 1 >= len(clips):
+        return None
+    nxt = clips[i + 1]
+    if nxt.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
+        return None
+    if abs(nxt.timeline_start - clip.timeline_end) > 0.02:
+        return None
+    if _crossfade_duration(clip, nxt) <= MIN_CROSSFADE_SECONDS:
+        return None
+    return i + 1
+
+
 def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResult:
     """Construct the full FFmpeg input list + filter graph for ``project``."""
 
@@ -129,61 +228,70 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
     for track_order, track in enumerate(video_tracks):
         if track.hidden:
             continue
-        for clip in track.sorted_clips():
+        sorted_clips = track.sorted_clips()
+        consumed_as_partner = set()
+
+        for i, clip in enumerate(sorted_clips):
+            if i in consumed_as_partner:
+                continue
             if clip.media_type == MediaType.TEXT:
                 text_clips.append(clip)
                 continue
             if clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
                 continue
 
-            idx = len(input_specs)
-            is_image = clip.media_type == MediaType.IMAGE
+            partner_i = _find_crossfade_partner(sorted_clips, i)
 
-            if is_image:
-                pre_args = ["-loop", "1", "-framerate", str(fps), "-t", f"{clip.source_length:.3f}"]
-                input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
-                vsrc = f"[{idx}:v]"
-                chain = f"{vsrc}setpts=PTS-STARTPTS"
+            if partner_i is None:
+                idx = _register_video_input(clip, fps, input_specs)
+                chain = _build_video_clip_chain(idx, clip, width, height)
+                if clip.timeline_start > 0:
+                    chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
+                label = f"v{clip_counter}"
+                filter_lines.append(f"{chain}[{label}]")
+                video_layer_labels.append((track_order, clip.timeline_start, label))
+                _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
+                clip_counter += 1
             else:
-                pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}"]
-                input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
-                vsrc = f"[{idx}:v]"
-                chain = (
-                    f"{vsrc}trim=duration={clip.source_length:.3f},setpts=PTS-STARTPTS"
+                # Crossfade pair: build each side's chain up to (not including)
+                # its own fade in/out — the xfade transition replaces those —
+                # then merge and shift into position as a single layer.
+                partner = sorted_clips[partner_i]
+                d = _crossfade_duration(clip, partner)
+
+                idx_a = _register_video_input(clip, fps, input_specs)
+                chain_a = _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True)
+                idx_b = _register_video_input(partner, fps, input_specs)
+                chain_b = _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True)
+
+                label_a = f"xf{clip_counter}a"
+                label_b = f"xf{clip_counter}b"
+                filter_lines.append(f"{chain_a}[{label_a}]")
+                filter_lines.append(f"{chain_b}[{label_b}]")
+
+                merged_label = f"xf{clip_counter}"
+                offset = max(0.0, clip.duration - d)
+                filter_lines.append(
+                    f"[{label_a}][{label_b}]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
                 )
 
-            speed = clip.speed if clip.speed > 0 else 1.0
-            if abs(speed - 1.0) > 1e-6:
-                chain += f",setpts=PTS/{speed:.6f}"
+                final_label = f"v{clip_counter}"
+                if clip.timeline_start > 0:
+                    filter_lines.append(
+                        f"[{merged_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{final_label}]"
+                    )
+                else:
+                    final_label = merged_label
+                video_layer_labels.append((track_order, clip.timeline_start, final_label))
 
-            chain += (
-                f",scale={width}:{height}:force_original_aspect_ratio=decrease"
-                f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-                ",format=yuva420p"
-            )
-
-            clip_len = clip.duration
-            if clip.fade_in > 0:
-                chain += f",fade=t=in:st=0:d={clip.fade_in:.3f}:alpha=1"
-            if clip.fade_out > 0:
-                fade_start = max(0.0, clip_len - clip.fade_out)
-                chain += f",fade=t=out:st={fade_start:.3f}:d={clip.fade_out:.3f}:alpha=1"
-
-            if clip.opacity < 1.0:
-                chain += f",colorchannelmixer=aa={clip.opacity:.3f}"
-
-            if clip.timeline_start > 0:
-                chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
-
-            label = f"v{clip_counter}"
-            filter_lines.append(f"{chain}[{label}]")
-            video_layer_labels.append((track_order, clip.timeline_start, label))
-
-            clip_has_audio = not is_image and _clip_has_audio(project, clip, probe_cache)
-            if clip_has_audio and not clip.muted and clip.volume > 0:
-                audio_labels.append(_build_audio_chain(idx, clip, filter_lines, clip_counter))
-
-            clip_counter += 1
+                # Audio stays independent of the video crossfade (see
+                # _find_crossfade_partner's docstring) — each side keeps its
+                # own volume/fade/timeline position, meeting at a clean cut.
+                _maybe_add_audio(project, clip, idx_a, filter_lines, audio_labels, clip_counter, probe_cache)
+                clip_counter += 1
+                _maybe_add_audio(project, partner, idx_b, filter_lines, audio_labels, clip_counter, probe_cache)
+                clip_counter += 1
+                consumed_as_partner.add(partner_i)
 
     # ---- Composite video layers onto the base canvas, bottom to top ----
     current = "base"
@@ -253,6 +361,30 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
     )
 
 
+def _maybe_add_audio(
+    project: Project,
+    clip: Clip,
+    input_index: int,
+    filter_lines: List[str],
+    audio_labels: List[str],
+    counter: int,
+    probe_cache: Dict[str, bool],
+) -> None:
+    """Append clip's audio chain to ``audio_labels`` if it's actually audible.
+
+    Shared by every place a video/image clip's own audio needs handling
+    (standalone clips and both sides of a crossfade pair) so the has-audio /
+    muted / volume checks can't drift out of sync between them.
+    """
+    if clip.media_type == MediaType.IMAGE:
+        return
+    if clip.muted or clip.volume <= 0:
+        return
+    if not _clip_has_audio(project, clip, probe_cache):
+        return
+    audio_labels.append(_build_audio_chain(input_index, clip, filter_lines, counter))
+
+
 def _build_audio_chain(
     input_index: int,
     clip: Clip,
@@ -266,6 +398,16 @@ def _build_audio_chain(
     if abs(speed - 1.0) > 1e-6:
         for f in _atempo_chain(speed):
             chain += f",{f}"
+
+    # Fade in/out apply to a clip's audio too, not just its video alpha —
+    # otherwise the Properties panel's Fade sliders silently do nothing for
+    # an audio-only clip (and don't duck a video clip's own audio either).
+    clip_len = clip.duration
+    if clip.fade_in > 0:
+        chain += f",afade=t=in:st=0:d={clip.fade_in:.3f}"
+    if clip.fade_out > 0:
+        fade_start = max(0.0, clip_len - clip.fade_out)
+        chain += f",afade=t=out:st={fade_start:.3f}:d={clip.fade_out:.3f}"
 
     if abs(clip.volume - 1.0) > 1e-6:
         chain += f",volume={clip.volume:.3f}"

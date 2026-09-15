@@ -8,7 +8,7 @@ media files. They protect against regressions in the graph-building logic
 
 import unittest
 
-from core.clip import Clip, MediaType, TextStyle
+from core.clip import Clip, MediaType, TextStyle, TransitionType
 from core.filter_graph import _escape_text, build_filter_graph
 from core.media_asset import MediaAsset
 from core.project import Project, ProjectSettings
@@ -101,6 +101,165 @@ class TextEscapingTests(unittest.TestCase):
         self.assertNotIn("100%", escaped)  # % must be escaped
         self.assertIn("\\:", escaped)
         self.assertIn("\\'", escaped)
+
+
+class CrossfadeTransitionTests(unittest.TestCase):
+    def test_crossfade_between_adjacent_clips_produces_one_merged_layer(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=5)
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("xfade=transition=fade:duration=1.000:offset=4.000", graph.filter_complex)
+        # The pair becomes a single composited layer, not two.
+        self.assertEqual(graph.filter_complex.count("overlay=0:0"), 1)
+        # Each clip's own fade (superseded by the crossfade) is skipped.
+        self.assertNotIn(":alpha=1", graph.filter_complex)
+
+    def test_no_gap_means_no_crossfade(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+            )
+        )
+        # A gap before the next clip means there's nothing to overlap.
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=6)
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("xfade", graph.filter_complex)
+        self.assertEqual(graph.filter_complex.count("overlay=0:0"), 2)
+
+    def test_crossfade_duration_clamped_to_the_shorter_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=2.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, transition_out=TransitionType.CROSSFADE, transition_duration=10.0,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=2, timeline_start=5)
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("duration=2.000", graph.filter_complex)
+
+    def test_crossfade_not_applied_into_a_text_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.TEXT, source_in=0, source_out=3, timeline_start=5, text_style=TextStyle(content="Hi"))
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("xfade", graph.filter_complex)
+        self.assertIn("drawtext", graph.filter_complex)
+
+
+class ColorCorrectionTests(unittest.TestCase):
+    def test_eq_filter_added_when_color_correction_is_non_neutral(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, brightness=0.2, contrast=1.5, saturation=0.5, gamma=1.1,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("eq=brightness=0.200:contrast=1.500:saturation=0.500:gamma=1.100", graph.filter_complex)
+
+    def test_eq_filter_omitted_for_an_unedited_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("eq=", graph.filter_complex)
+
+
+class ChromaKeyTests(unittest.TestCase):
+    def test_colorkey_filter_added_when_enabled(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                chroma_key_enabled=True, chroma_key_color="#00FF00", chroma_key_similarity=0.3, chroma_key_blend=0.15,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("colorkey=0x00FF00:0.300:0.150", graph.filter_complex)
+
+    def test_colorkey_filter_omitted_when_disabled(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("colorkey", graph.filter_complex)
+
+
+class AudioFadeTests(unittest.TestCase):
+    def test_fade_in_and_out_applied_to_an_audio_only_clip(self):
+        project = Project()
+        audio_track = [t for t in project.tracks if t.track_type == TrackType.AUDIO][0]
+        audio_track.clips.append(
+            Clip(
+                media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8,
+                timeline_start=0, fade_in=1.0, fade_out=2.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("afade=t=in:st=0:d=1.000", graph.filter_complex)
+        self.assertIn("afade=t=out:st=6.000:d=2.000", graph.filter_complex)
+
+    def test_fade_also_applies_to_a_video_clips_own_audio(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, fade_in=1.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("afade=t=in:st=0:d=1.000", graph.filter_complex)
+        self.assertIn("fade=t=in:st=0:d=1.000:alpha=1", graph.filter_complex)
 
 
 if __name__ == "__main__":

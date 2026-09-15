@@ -16,10 +16,11 @@ Render the full, composited multi-track timeline to a single MP4/MOV/MKV/WebM fi
 
 `core/filter_graph.py::build_filter_graph()` walks every non-hidden video track bottom-to-top and every non-muted audio track, producing:
 - One `-i` input per clip (trimmed with `-ss`/`trim`, or `-loop 1` for a still image).
-- A `scale` + `pad` + `format=yuva420p` chain per video/image clip onto the target resolution, with fade-in/out and opacity (`colorchannelmixer=aa=...`) applied per clip.
+- A `scale` + `pad` + `format=yuva420p` chain per video/image clip onto the target resolution, with chroma key, color correction, fade-in/out, and opacity (`colorchannelmixer=aa=...`) applied per clip — see [color-and-effects/workflow.md](../color-and-effects/workflow.md) for the chroma key/color correction/crossfade filters specifically.
+- Adjacent clips with a crossfade transition enabled are merged with `xfade` into a single layer instead of two independent ones (see [color-and-effects/workflow.md](../color-and-effects/workflow.md)).
 - Every video layer composited bottom-to-top onto a black base canvas via `overlay`.
 - Text clips drawn last, on top of the composited video, via `drawtext` (see [text-overlays/workflow.md](../text-overlays/workflow.md)).
-- Every audible clip's audio trimmed, tempo-adjusted (`atempo`, chained for speeds outside FFmpeg's native 0.5-2.0 range), volume-adjusted, delayed to its timeline position, and mixed via `amix`. If nothing is audible, a silent `anullsrc` track is emitted so the output always has an audio stream.
+- Every audible clip's audio trimmed, tempo-adjusted (`atempo`, chained for speeds outside FFmpeg's native 0.5-2.0 range), fade-adjusted (`afade`), volume-adjusted, delayed to its timeline position, and mixed via `amix`. If nothing is audible, a silent `anullsrc` track is emitted so the output always has an audio stream.
 
 A clip's audio-mapping decision (`_clip_has_audio()`) prefers the matching media-pool asset's probed `has_audio`; if no pool entry matches the clip's source path, it falls back to probing the file directly rather than assuming audio is present — this avoids FFmpeg failing the whole export by mapping a non-existent audio stream.
 
