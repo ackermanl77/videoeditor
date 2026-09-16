@@ -1,8 +1,24 @@
-# Color Correction, Chroma Key, and Transitions Workflow
+# Transform, Color Correction, Chroma Key, and Transitions Workflow
 
 ## Goal
 
-Grade a video/image clip's color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg, none of it visible in the live preview.
+Position/scale/rotate a video/image clip, grade its color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg, none of it visible in the live preview.
+
+## Transform (position, scale, rotation)
+
+1. Select a video or image clip.
+2. In the Properties panel's **Transform** group, drag **Position X**/**Position Y** to move the clip, **Scale** to resize it, and **Rotation** to rotate it. **Reset Transform** restores all four to their defaults in one click.
+3. The clip is first fit inside the canvas preserving aspect ratio (as always), then this additional scale/rotation is applied, and the result is positioned by its *center* at (Position X, Position Y) via FFmpeg's `overlay=x:y` — replacing the old unconditional `pad`-to-canvas step. At the defaults (X/Y 0.5, Scale 1.0, Rotation 0°) this evaluates to exactly the same centered, full-canvas result as before Transform existed — an unedited clip's exported position is unchanged.
+
+| Control | Range | Default | Notes |
+|---|---|---|---|
+| Position X / Y | 0.0 .. 1.0 | 0.5, 0.5 | 0 = left/top edge, 1 = right/bottom edge; positions the clip's *center*. |
+| Scale | 0.1 .. 3.0 | 1.0 | Multiplies the already-fit-to-canvas size — 0.5 halves it, 2.0 doubles it (can exceed canvas bounds; `overlay` naturally crops anything outside the frame, so zooming in and cropping "off-screen" both work as expected). |
+| Rotation | -180 .. 180° | 0.0 | Via FFmpeg's `rotate` filter; the output bounding box (`ow=rotw(...)`, `oh=roth(...)`) expands to fit the rotated frame, filled transparent (`c=none`) rather than cropped. |
+
+This is what makes picture-in-picture, split-screen, and off-center framing possible — put a second video/image clip on a track above another, scale it down, and position it in a corner.
+
+**Known limit: Transform is a no-op on a clip while it's crossfading into the next one.** `xfade` (used for crossfade transitions, below) requires both its inputs to be exactly the same frame size; Transform's overlay-based positioning deliberately allows a clip's frame to be smaller or larger than the canvas, which the two sides of a crossfade pair can't reconcile against each other. A crossfading clip's chain falls back to the old fixed-size, centered `pad` step instead — documented, not silent: `core/filter_graph.py::_build_video_clip_chain`'s `apply_transform` parameter is `False` for both sides of a crossfade pair.
 
 ## Color correction
 
@@ -37,4 +53,6 @@ Grade a video/image clip's color, key out a solid-color background, and/or cross
 
 ## Validation
 
-`tests/test_filter_graph.py` covers all three features without invoking FFmpeg (`ColorCorrectionTests`, `ChromaKeyTests`, `CrossfadeTransitionTests`, plus `AudioFadeTests` for the related audio-fade fix): the `eq`/`colorkey` filters appear only when non-neutral/enabled, a valid adjacent pair produces one merged `xfade` layer instead of two `overlay` layers, a gap or a text-clip partner correctly disables crossfading, and the duration is clamped to the shorter clip. There is no automated test that renders real pixels through FFmpeg — verify visually by exporting a short project exercising each feature (a graded clip, a green-screen clip over a background track, and two adjacent clips crossfading).
+`tests/test_filter_graph.py` covers all four features without invoking FFmpeg (`TransformTests`, `ColorCorrectionTests`, `ChromaKeyTests`, `CrossfadeTransitionTests`, plus `AudioFadeTests` for the related audio-fade fix): the `eq`/`colorkey` filters appear only when non-neutral/enabled, a default-transform clip's overlay expression evaluates to the same 0:0 position as before Transform existed, a valid adjacent crossfade pair produces one merged `xfade` layer instead of two `overlay` layers (and correctly falls back to the old `pad` step, ignoring Transform, while doing so), a gap or a text-clip partner correctly disables crossfading, and the duration is clamped to the shorter clip.
+
+Unlike the other export-only features, Transform was also verified against **real FFmpeg execution**, not just these text-based tests — a picture-in-picture composite (a small, repositioned clip on top of a full-frame background clip) confirmed the background is visible everywhere the foreground doesn't cover (proving `overlay` positioning, not the old `pad`, is what's compositing it), plus default-transform-reproduces-old-behavior, rotation, and transform+crossfade-together checks. This matters because two earlier features in this same file (crossfade's `fps=` requirement, GIF export's unconnected-audio-pad error) were bugs that only real FFmpeg execution caught — the text-only tests structurally can't catch a rejected filtergraph.

@@ -4,6 +4,18 @@
 
 Bring video, audio, and image files into the project's media bin so they can be dragged onto the timeline.
 
+## Supported formats
+
+`ui/media_bin.py::SUPPORTED_EXTENSIONS` drives the file-picker's filter, but decoding itself is generic — any container/codec the installed FFmpeg build can decode works, whether or not its extension is explicitly listed (the filter can always be switched to "All Files").
+
+| Kind | Extensions |
+|---|---|
+| Video | `.mp4 .mov .mkv .avi .webm .m4v .flv .wmv .mpg .mpeg .3gp .3g2 .ts .mts .m2ts .ogv .vob` |
+| Audio | `.mp3 .wav .aac .flac .ogg .m4a .opus .wma .aiff .aif` |
+| Image | `.png .jpg .jpeg .bmp .webp .tiff .tif .gif` |
+
+Still-image extensions are the one place format matters beyond the picker filter: `core/media_probe.py::IMAGE_EXTENSIONS` overrides ffprobe's "1-frame video stream" reading for these specific extensions so they're treated as `MediaType.IMAGE` (looped for a set duration) rather than `MediaType.VIDEO`. An image format not in that set would still import and decode, but would be misclassified as a very-short video clip.
+
 ## Steps
 
 1. Click **Import** in the Media Bin panel, use **File > Import Media...** (`Ctrl+I`), or drag files directly onto the Media Bin.

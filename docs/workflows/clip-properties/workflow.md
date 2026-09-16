@@ -7,7 +7,7 @@ Adjust a selected clip's volume, mute state, playback speed, opacity, and fade i
 ## Steps
 
 1. Select a clip on the timeline (click it, or double-click).
-2. The Properties panel (`ui/properties_panel.py`) shows the relevant controls: audio/video clips get Volume/Mute/Speed/Opacity/Fade In/Fade Out; video/image clips additionally get the Transition, Color Correction, and Chroma Key groups (see [color-and-effects/workflow.md](../color-and-effects/workflow.md)); text clips get the text-styling controls instead (see [text-overlays/workflow.md](../text-overlays/workflow.md)).
+2. The Properties panel (`ui/properties_panel.py`) shows the relevant controls: audio/video clips get Volume/Mute/Speed/Opacity/Fade In/Fade Out; video/image clips additionally get the Transform, Transition, Color Correction, and Chroma Key groups (see [color-and-effects/workflow.md](../color-and-effects/workflow.md)); text clips get the text-styling controls instead (see [text-overlays/workflow.md](../text-overlays/workflow.md)).
 3. Drag a slider (Volume, Opacity, Brightness/Contrast/Saturation/Gamma, Chroma Key Similarity/Softness) — the change previews live on the clip immediately; releasing the slider commits one undo step for the whole drag, not one per intermediate value.
 4. Change Speed/Fade In/Fade Out/Mute/Crossfade/Transition Duration/Chroma Key Enable — these commit immediately (spin box `editingFinished`, checkbox `toggled`).
 

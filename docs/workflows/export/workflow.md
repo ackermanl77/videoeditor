@@ -2,15 +2,31 @@
 
 ## Goal
 
-Render the full, composited multi-track timeline to a single MP4/MOV/MKV/WebM file via FFmpeg.
+Render the full, composited multi-track timeline to a single video file via FFmpeg.
+
+## Formats
+
+| Format | Video codec | Audio | Notes |
+|---|---|---|---|
+| `.mp4` | libx264 | aac | Default; `+faststart` for streaming-friendly playback. |
+| `.mov` | libx264 | aac | |
+| `.mkv` | libx264 | aac | |
+| `.avi` | libx264 | aac | |
+| `.flv` | libx264 | aac | |
+| `.webm` | libvpx-vp9 | libopus | |
+| `.gif` | gif (palette-based) | none | See below — a fundamentally different encode. |
 
 ## Steps
 
 1. **File > Export Video...** or `Ctrl+E` (disabled with a message if the timeline is empty).
 2. Choose the output path, container format, resolution (a preset or Custom), frame rate, and quality.
-3. Optionally check **Two-pass, target file size** and enter a target size in MB instead of picking a CRF quality preset.
+3. Optionally check **Two-pass, target file size** and enter a target size in MB instead of picking a CRF quality preset (not available for GIF — see below).
 4. Click **Export**. If the output file already exists, you're asked to confirm overwriting it first.
 5. Progress and status are shown live; **Cancel** stops the render (FFmpeg is terminated immediately, not just flagged).
+
+## Animated GIF export
+
+Selecting `.gif` disables the Quality and Two-pass controls (a GIF has no CRF/bitrate concept) and shows a note explaining why. `Exporter._export_gif()` uses FFmpeg's two-stage palette workflow — `palettegen` (one 256-color palette for the whole clip) into `paletteuse` (Bayer-dithered) — which looks substantially better than FFmpeg's default per-frame GIF quantizer. The output has no audio track at all; the base filter graph's `[aout]` pad (always present, even as silent `anullsrc` — see below) is fed into an `anullsink` so FFmpeg doesn't complain about an unmapped output. Loops infinitely (`-loop 0`).
 
 ## How the filter graph is built
 
@@ -35,4 +51,4 @@ A clip's audio-mapping decision (`_clip_has_audio()`) prefers the matching media
 
 ## Validation
 
-`tests/test_filter_graph.py` covers input/label construction, muted-clip audio exclusion, image `-loop` inputs, text `drawtext` generation, multi-clip mixing, and the empty-project fallback — all without invoking FFmpeg (they assert on the generated command/graph text). There is no automated test that actually runs FFmpeg end-to-end; verify a real export manually with a project containing at least one video clip, one audio clip, one text overlay, and a clip with no matching media-pool asset (to exercise the audio-mapping fallback).
+`tests/test_filter_graph.py` covers input/label construction, muted-clip audio exclusion, image `-loop` inputs, text `drawtext` generation, multi-clip mixing, and the empty-project fallback — all without invoking FFmpeg (they assert on the generated command/graph text). There is no automated test that actually runs FFmpeg end-to-end (`core/exporter.py` has no unit tests, by design — see `Exporter`'s docstring history in `docs/PROJECT_STATUS.md`); every format (mp4/mov/mkv/avi/flv/webm/gif) was verified manually with a real FFmpeg install against a real imported media file, including two bugs real execution caught that text-only tests couldn't: `xfade` silently requiring constant-frame-rate inputs (see [color-and-effects/workflow.md](../color-and-effects/workflow.md)), and GIF export failing with "output unconnected" until the base graph's always-present `[aout]` pad was routed into `anullsink`.

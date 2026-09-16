@@ -36,7 +36,8 @@ RESOLUTION_PRESETS = {
 }
 
 FPS_OPTIONS = ["24", "25", "30", "50", "60"]
-CONTAINER_OPTIONS = [".mp4", ".mov", ".mkv", ".webm"]
+CONTAINER_OPTIONS = [".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".gif"]
+GIF_EXTENSION = ".gif"
 
 
 class ExportWorker(QObject):
@@ -92,6 +93,7 @@ class ExportDialog(QDialog):
 
         self.container_combo = QComboBox()
         self.container_combo.addItems(CONTAINER_OPTIONS)
+        self.container_combo.currentTextChanged.connect(self._on_container_changed)
         form.addRow("Format", self.container_combo)
 
         self.resolution_combo = QComboBox()
@@ -137,6 +139,12 @@ class ExportDialog(QDialog):
         two_pass_row.addWidget(self.target_size_spin)
         form.addRow("", two_pass_row)
 
+        self.gif_note_label = QLabel("Animated GIF: no audio track; quality comes from palette dithering, not the setting above.")
+        self.gif_note_label.setWordWrap(True)
+        self.gif_note_label.setStyleSheet("color: #9aa1ad; font-size: 11px;")
+        self.gif_note_label.setVisible(False)
+        form.addRow("", self.gif_note_label)
+
         layout.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -162,6 +170,16 @@ class ExportDialog(QDialog):
     def _on_two_pass_toggled(self, checked: bool) -> None:
         self.target_size_spin.setEnabled(checked)
         self.quality_combo.setEnabled(not checked)
+
+    def _on_container_changed(self, text: str) -> None:
+        is_gif = text == GIF_EXTENSION
+        if is_gif:
+            # Uncheck first: this fires _on_two_pass_toggled(False), which
+            # would otherwise re-enable quality_combo after we disable it below.
+            self.two_pass_checkbox.setChecked(False)
+        self.quality_combo.setEnabled(not is_gif)
+        self.two_pass_checkbox.setEnabled(not is_gif)
+        self.gif_note_label.setVisible(is_gif)
 
     def _on_resolution_changed(self, text: str) -> None:
         preset = RESOLUTION_PRESETS.get(text)

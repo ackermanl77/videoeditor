@@ -136,6 +136,32 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(self.clip_group)
 
+        # ---- Transform group (video/image only) ----
+        self.transform_group = QGroupBox("Transform")
+        transform_form = QFormLayout(self.transform_group)
+
+        self.transform_x_slider = QSlider(Qt.Horizontal)
+        self.transform_x_slider.setRange(0, 100)
+        transform_form.addRow("Position X", self.transform_x_slider)
+
+        self.transform_y_slider = QSlider(Qt.Horizontal)
+        self.transform_y_slider.setRange(0, 100)
+        transform_form.addRow("Position Y", self.transform_y_slider)
+
+        self.transform_scale_slider = QSlider(Qt.Horizontal)
+        self.transform_scale_slider.setRange(10, 300)
+        transform_form.addRow("Scale", self.transform_scale_slider)
+
+        self.transform_rotation_slider = QSlider(Qt.Horizontal)
+        self.transform_rotation_slider.setRange(-180, 180)
+        transform_form.addRow("Rotation", self.transform_rotation_slider)
+
+        reset_transform_btn = QPushButton("Reset Transform")
+        reset_transform_btn.clicked.connect(self._reset_transform)
+        transform_form.addRow("", reset_transform_btn)
+
+        layout.addWidget(self.transform_group)
+
         # ---- Transition group (video/image only) ----
         self.transition_group = QGroupBox("Transition")
         transition_form = QFormLayout(self.transition_group)
@@ -250,6 +276,22 @@ class PropertiesPanel(QWidget):
         self.fade_in_spin.editingFinished.connect(lambda: self._commit_now("fade_in", self.fade_in_spin.value(), "Edit Fade In"))
         self.fade_out_spin.editingFinished.connect(lambda: self._commit_now("fade_out", self.fade_out_spin.value(), "Edit Fade Out"))
 
+        self.transform_x_slider.sliderPressed.connect(lambda: self._remember("transform_x", self.transform_x_slider.value() / 100.0))
+        self.transform_x_slider.valueChanged.connect(lambda v: self._apply_live("transform_x", v / 100.0))
+        self.transform_x_slider.sliderReleased.connect(lambda: self._commit("transform_x", self.transform_x_slider.value() / 100.0, "Edit Transform Position"))
+
+        self.transform_y_slider.sliderPressed.connect(lambda: self._remember("transform_y", self.transform_y_slider.value() / 100.0))
+        self.transform_y_slider.valueChanged.connect(lambda v: self._apply_live("transform_y", v / 100.0))
+        self.transform_y_slider.sliderReleased.connect(lambda: self._commit("transform_y", self.transform_y_slider.value() / 100.0, "Edit Transform Position"))
+
+        self.transform_scale_slider.sliderPressed.connect(lambda: self._remember("transform_scale", self.transform_scale_slider.value() / 100.0))
+        self.transform_scale_slider.valueChanged.connect(lambda v: self._apply_live("transform_scale", v / 100.0))
+        self.transform_scale_slider.sliderReleased.connect(lambda: self._commit("transform_scale", self.transform_scale_slider.value() / 100.0, "Edit Transform Scale"))
+
+        self.transform_rotation_slider.sliderPressed.connect(lambda: self._remember("transform_rotation", float(self.transform_rotation_slider.value())))
+        self.transform_rotation_slider.valueChanged.connect(lambda v: self._apply_live("transform_rotation", float(v)))
+        self.transform_rotation_slider.sliderReleased.connect(lambda: self._commit("transform_rotation", float(self.transform_rotation_slider.value()), "Edit Transform Rotation"))
+
         self.crossfade_checkbox.toggled.connect(self._on_crossfade_toggled)
         self.transition_duration_spin.editingFinished.connect(
             lambda: self._commit_now("transition_duration", self.transition_duration_spin.value(), "Edit Transition Duration")
@@ -310,6 +352,7 @@ class PropertiesPanel(QWidget):
         self.empty_label.setVisible(True)
         self.name_label.setVisible(False)
         self.clip_group.setVisible(False)
+        self.transform_group.setVisible(False)
         self.transition_group.setVisible(False)
         self.color_group.setVisible(False)
         self.chroma_group.setVisible(False)
@@ -335,6 +378,7 @@ class PropertiesPanel(QWidget):
         is_visual = clip.media_type in (MediaType.VIDEO, MediaType.IMAGE)
         self.text_group.setVisible(is_text)
         self.clip_group.setVisible(not is_text)
+        self.transform_group.setVisible(is_visual)
         self.transition_group.setVisible(is_visual)
         self.color_group.setVisible(is_visual)
         self.chroma_group.setVisible(is_visual)
@@ -347,6 +391,11 @@ class PropertiesPanel(QWidget):
         self.fade_out_spin.setValue(clip.fade_out)
 
         if is_visual:
+            self.transform_x_slider.setValue(int(clip.transform_x * 100))
+            self.transform_y_slider.setValue(int(clip.transform_y * 100))
+            self.transform_scale_slider.setValue(int(clip.transform_scale * 100))
+            self.transform_rotation_slider.setValue(int(clip.transform_rotation))
+
             self.crossfade_checkbox.setChecked(clip.transition_out == TransitionType.CROSSFADE)
             self.transition_duration_spin.setValue(clip.transition_duration)
             self.transition_duration_spin.setEnabled(clip.transition_out == TransitionType.CROSSFADE)
@@ -413,6 +462,21 @@ class PropertiesPanel(QWidget):
             return
         self.history.execute(UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label))
         self.project_modified.emit()
+
+    def _reset_transform(self) -> None:
+        for attribute, value, slider in (
+            ("transform_x", 0.5, self.transform_x_slider),
+            ("transform_y", 0.5, self.transform_y_slider),
+            ("transform_scale", 1.0, self.transform_scale_slider),
+            ("transform_rotation", 0.0, self.transform_rotation_slider),
+        ):
+            self._commit_now(attribute, value, "Reset Transform")
+        self._loading = True
+        self.transform_x_slider.setValue(50)
+        self.transform_y_slider.setValue(50)
+        self.transform_scale_slider.setValue(100)
+        self.transform_rotation_slider.setValue(0)
+        self._loading = False
 
     def _on_crossfade_toggled(self, checked: bool) -> None:
         self.transition_duration_spin.setEnabled(checked)

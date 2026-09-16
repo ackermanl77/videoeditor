@@ -16,14 +16,13 @@ easy to extend with new effects later.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, TransitionType
 from core.project import Project, ProjectSettings
 from core.track import TrackType
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".gif"}
 
 # Minimum overlap FFmpeg's xfade is allowed to use for a crossfade — below
 # this it's not worth the extra filter graph complexity over a hard cut.
@@ -125,6 +124,7 @@ def _build_video_clip_chain(
     height: int,
     skip_fade_in: bool = False,
     skip_fade_out: bool = False,
+    apply_transform: bool = True,
 ) -> str:
     """Build a clip's local-time (pre-``tpad``) video filter chain, ending unbracketed.
 
@@ -132,6 +132,14 @@ def _build_video_clip_chain(
     each side's chain up to (but not including) the timeline-position
     ``tpad`` step, so the two can be combined with ``xfade`` first and
     ``tpad``-shifted only once, as a single merged layer.
+
+    ``apply_transform=False`` (used only for crossfade-pair sides) skips
+    Transform and instead pads the fitted frame to the full canvas size —
+    ``xfade`` requires both its inputs to be the same size, and Transform's
+    overlay-based positioning (see ``build_filter_graph``) deliberately
+    allows a clip's frame to end up smaller (or larger, when zoomed in)
+    than the canvas, which ``xfade`` can't reconcile between two different
+    clips. Transform is a documented no-op on a clip while it's crossfading.
     """
     if clip.media_type == MediaType.IMAGE:
         chain = f"[{idx}:v]setpts=PTS-STARTPTS"
@@ -142,11 +150,13 @@ def _build_video_clip_chain(
     if abs(speed - 1.0) > 1e-6:
         chain += f",setpts=PTS/{speed:.6f}"
 
-    chain += (
-        f",scale={width}:{height}:force_original_aspect_ratio=decrease"
-        f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-        ",format=yuva420p"
-    )
+    # Fit inside the canvas preserving aspect ratio. format=yuva420p happens
+    # here (rather than after pad, as before) so alpha exists for every step
+    # that follows, including the now-conditional pad and Transform's rotate.
+    chain += f",scale={width}:{height}:force_original_aspect_ratio=decrease,format=yuva420p"
+
+    if not apply_transform:
+        chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
 
     if clip.chroma_key_enabled:
         key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
@@ -157,6 +167,13 @@ def _build_video_clip_chain(
             f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
             f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
         )
+
+    if apply_transform:
+        if abs(clip.transform_scale - 1.0) > 1e-6:
+            chain += f",scale=iw*{clip.transform_scale:.4f}:ih*{clip.transform_scale:.4f}"
+        if abs(clip.transform_rotation) > 1e-6:
+            radians = math.radians(clip.transform_rotation)
+            chain += f",rotate={radians:.6f}:c=none:ow=rotw({radians:.6f}):oh=roth({radians:.6f})"
 
     clip_len = clip.duration
     if clip.fade_in > 0 and not skip_fade_in:
@@ -209,7 +226,8 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
     input_specs: List[InputSpec] = []
     filter_lines: List[str] = []
 
-    video_layer_labels: List[Tuple[int, float, str]] = []  # (track_order, start, label)
+    # (track_order, start, label, (transform_x, transform_y))
+    video_layer_labels: List[Tuple[int, float, str, Tuple[float, float]]] = []
     audio_labels: List[str] = []
     text_clips: List[Clip] = []
 
@@ -249,7 +267,7 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
                     chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
                 label = f"v{clip_counter}"
                 filter_lines.append(f"{chain}[{label}]")
-                video_layer_labels.append((track_order, clip.timeline_start, label))
+                video_layer_labels.append((track_order, clip.timeline_start, label, (clip.transform_x, clip.transform_y)))
                 _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
                 clip_counter += 1
             else:
@@ -267,9 +285,15 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
                 # has no such requirement, and the exporter's -r already
                 # fixes the final output rate.
                 idx_a = _register_video_input(clip, fps, input_specs)
-                chain_a = _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True) + f",fps={fps}"
+                chain_a = (
+                    _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True, apply_transform=False)
+                    + f",fps={fps}"
+                )
                 idx_b = _register_video_input(partner, fps, input_specs)
-                chain_b = _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True) + f",fps={fps}"
+                chain_b = (
+                    _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True, apply_transform=False)
+                    + f",fps={fps}"
+                )
 
                 label_a = f"xf{clip_counter}a"
                 label_b = f"xf{clip_counter}b"
@@ -289,7 +313,10 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
                     )
                 else:
                     final_label = merged_label
-                video_layer_labels.append((track_order, clip.timeline_start, final_label))
+                # Transform doesn't apply mid-crossfade (see
+                # _build_video_clip_chain's docstring) — the merged output is
+                # always full-canvas, so center it same as the old behavior.
+                video_layer_labels.append((track_order, clip.timeline_start, final_label, (0.5, 0.5)))
 
                 # Audio stays independent of the video crossfade (see
                 # _find_crossfade_partner's docstring) — each side keeps its
@@ -301,11 +328,19 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
                 consumed_as_partner.add(partner_i)
 
     # ---- Composite video layers onto the base canvas, bottom to top ----
+    # Position is expressed relative to the *canvas* (main_w/main_h) and the
+    # layer's own (possibly Transform-scaled/rotated, so not necessarily
+    # canvas-sized) frame (w/h), centering it at (transform_x, transform_y).
+    # For a layer at the default (0.5, 0.5) with no Transform applied, this
+    # expression evaluates to exactly 0:0 — identical to the old hardcoded
+    # overlay=0:0, so an unedited clip's composited position is unchanged.
     current = "base"
-    for i, (_track_order, _start, label) in enumerate(video_layer_labels):
+    for i, (_track_order, _start, label, (pos_x, pos_y)) in enumerate(video_layer_labels):
         out_label = f"comp{i}"
+        x_expr = f"(main_w*{pos_x:.4f})-(w/2)"
+        y_expr = f"(main_h*{pos_y:.4f})-(h/2)"
         filter_lines.append(
-            f"[{current}][{label}]overlay=0:0:shortest=0:eof_action=pass[{out_label}]"
+            f"[{current}][{label}]overlay=x='{x_expr}':y='{y_expr}':shortest=0:eof_action=pass[{out_label}]"
         )
         current = out_label
 

@@ -114,6 +114,17 @@ class Clip:
     chroma_key_similarity: float = 0.2  # 0.0 .. 1.0
     chroma_key_blend: float = 0.1  # 0.0 .. 1.0
 
+    # Transform (video/image clips only). The clip is first scaled to fit
+    # the canvas preserving aspect ratio (as always), then this additional
+    # scale/rotation is applied, and the result is positioned by its center
+    # at (transform_x, transform_y) — relative 0..1 of the canvas, same
+    # convention as TextStyle.position_x/y. Defaults reproduce the old,
+    # always-centered-and-padded-to-canvas behavior exactly.
+    transform_x: float = 0.5  # 0 = left edge, 1 = right edge
+    transform_y: float = 0.5  # 0 = top edge, 1 = bottom edge
+    transform_scale: float = 1.0  # multiplier on top of the fit-to-canvas size
+    transform_rotation: float = 0.0  # degrees, clockwise
+
     # Text overlay data (only used when media_type == TEXT)
     text_style: Optional[TextStyle] = None
 
@@ -185,6 +196,10 @@ class Clip:
             "chroma_key_color": self.chroma_key_color,
             "chroma_key_similarity": self.chroma_key_similarity,
             "chroma_key_blend": self.chroma_key_blend,
+            "transform_x": self.transform_x,
+            "transform_y": self.transform_y,
+            "transform_scale": self.transform_scale,
+            "transform_rotation": self.transform_rotation,
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
         }
@@ -218,6 +233,10 @@ class Clip:
             chroma_key_color=data.get("chroma_key_color", "#00FF00"),
             chroma_key_similarity=data.get("chroma_key_similarity", 0.2),
             chroma_key_blend=data.get("chroma_key_blend", 0.1),
+            transform_x=data.get("transform_x", 0.5),
+            transform_y=data.get("transform_y", 0.5),
+            transform_scale=data.get("transform_scale", 1.0),
+            transform_rotation=data.get("transform_rotation", 0.0),
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
         )

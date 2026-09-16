@@ -23,9 +23,10 @@ from core.media_asset import MediaAsset
 MEDIA_MIME_TYPE = "application/x-video-editor-asset"
 
 SUPPORTED_EXTENSIONS = (
-    "*.mp4 *.mov *.mkv *.avi *.webm *.m4v "  # video
-    "*.mp3 *.wav *.aac *.flac *.ogg *.m4a "  # audio
-    "*.png *.jpg *.jpeg *.bmp *.webp *.tiff"  # images
+    "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv *.wmv *.mpg *.mpeg "
+    "*.3gp *.3g2 *.ts *.mts *.m2ts *.ogv *.vob "  # video
+    "*.mp3 *.wav *.aac *.flac *.ogg *.m4a *.opus *.wma *.aiff *.aif "  # audio
+    "*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.tif *.gif"  # images
 )
 
 

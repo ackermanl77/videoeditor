@@ -8,7 +8,11 @@ deliberately layered and documented so it is easy to read, test and extend.
 
 ## Features
 
-- **Import** video, audio and image files (drag-and-drop or file dialog)
+- **Import** most common video (MP4, MOV, MKV, AVI, WebM, FLV, WMV, MPG,
+  3GP, TS/M2TS, OGV, ...), audio (MP3, WAV, AAC, FLAC, OGG, Opus, WMA,
+  AIFF, ...) and image (PNG, JPG, BMP, WebP, TIFF, GIF, ...) formats —
+  drag-and-drop or file dialog; anything the installed FFmpeg build can
+  decode works even beyond that list
 - **Media bin** with automatically generated thumbnails
 - **Multi-track timeline**: unlimited video and audio tracks, drag to move
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
@@ -16,6 +20,8 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Preview player** synced to the timeline playhead (play/pause/seek)
 - **Clip properties**: volume, mute, playback speed, opacity, fade in/out
   (video and audio both)
+- **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
+  split-screen, off-center framing
 - **Crossfade transitions** between adjacent clips on the same track
 - **Per-clip color correction**: brightness, contrast, saturation, gamma
 - **Chroma key** (green-screen) compositing per clip
@@ -24,9 +30,9 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Undo/redo** for every editing operation (command-pattern history)
 - **Project files** (`.vproj`, plain JSON) — save and reopen your edit, with
   autosave/crash recovery
-- **Export** to MP4 / MOV / MKV / WebM with resolution, frame-rate and
-  quality presets (or two-pass target-file-size encoding), rendered by
-  FFmpeg with a live progress bar
+- **Export** to MP4 / MOV / MKV / AVI / FLV / WebM / animated GIF with
+  resolution, frame-rate and quality presets (or two-pass
+  target-file-size encoding), rendered by FFmpeg with a live progress bar
 - **Keyboard shortcuts** for the operations you use most
 
 ## Project layout

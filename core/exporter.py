@@ -30,8 +30,14 @@ CONTAINER_CODECS = {
     ".mp4": ("libx264", "aac"),
     ".mov": ("libx264", "aac"),
     ".mkv": ("libx264", "aac"),
+    ".avi": ("libx264", "aac"),
+    ".flv": ("libx264", "aac"),
     ".webm": ("libvpx-vp9", "libopus"),
 }
+
+# Handled separately from CONTAINER_CODECS: GIF has no audio and uses its
+# own palette-based encode (see Exporter._export_gif), not a CRF video codec.
+GIF_EXTENSION = ".gif"
 
 AUDIO_BITRATE_KBPS = 192
 MIN_VIDEO_BITRATE_KBPS = 150
@@ -100,19 +106,24 @@ class Exporter:
         graph = build_filter_graph(self.project, project_settings)
 
         ext = os.path.splitext(settings.output_path)[1].lower()
-        video_codec, audio_codec = CONTAINER_CODECS.get(ext, ("libx264", "aac"))
         total_duration = max(self.project.total_duration, 0.01)
 
-        use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
-        if use_two_pass:
-            video_kbps = self._target_video_bitrate_kbps(settings.target_size_mb, total_duration, graph.has_audio)
-            output_path = self._export_two_pass(
-                settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration, on_progress
-            )
+        if ext == GIF_EXTENSION:
+            # No audio track, no CRF/bitrate concept, no two-pass — GIF is a
+            # fundamentally different (palette-based) encode.
+            output_path = self._export_gif(settings, graph, total_duration, on_progress)
         else:
-            output_path = self._export_single_pass(
-                settings, graph, ext, video_codec, audio_codec, total_duration, on_progress
-            )
+            video_codec, audio_codec = CONTAINER_CODECS.get(ext, ("libx264", "aac"))
+            use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
+            if use_two_pass:
+                video_kbps = self._target_video_bitrate_kbps(settings.target_size_mb, total_duration, graph.has_audio)
+                output_path = self._export_two_pass(
+                    settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration, on_progress
+                )
+            else:
+                output_path = self._export_single_pass(
+                    settings, graph, ext, video_codec, audio_codec, total_duration, on_progress
+                )
 
         if on_progress:
             on_progress(1.0, "Done")
@@ -165,6 +176,42 @@ class Exporter:
         args += ["-progress", "pipe:1", "-nostats", settings.output_path]
 
         self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering")
+        return settings.output_path
+
+    def _export_gif(
+        self,
+        settings: ExportSettings,
+        graph: GraphResult,
+        total_duration: float,
+        on_progress: Optional[ProgressCallback],
+    ) -> str:
+        """Encode to an animated GIF via FFmpeg's two-pass palette filters.
+
+        A GIF's 256-color palette makes the default per-frame quantizer look
+        noticeably banded; generating one palette for the whole clip
+        (``palettegen``) and dithering against it (``paletteuse``) is the
+        standard, much higher quality approach. GIF has no audio track and
+        no CRF/bitrate concept, so neither is touched here.
+        """
+        args = self._common_args(graph)
+        # _common_args() always appends exactly one "-filter_complex <value>"
+        # pair; splice the palette stage onto the end of that same value
+        # rather than adding a second -filter_complex (FFmpeg only honors
+        # the last one). build_filter_graph() always produces an audio pad
+        # (even a silent anullsrc one when nothing is audible) — since we
+        # only map [gifout], that pad would otherwise be "unconnected" and
+        # FFmpeg refuses to run at all; anullsink discards it cleanly.
+        filter_index = args.index("-filter_complex") + 1
+        args[filter_index] += (
+            f";[{graph.video_out_label}]split[gifsrc1][gifsrc2]"
+            ";[gifsrc1]palettegen=stats_mode=diff[gifpal]"
+            ";[gifsrc2][gifpal]paletteuse=dither=bayer:bayer_scale=3[gifout]"
+            f";[{graph.audio_out_label}]anullsink"
+        )
+        args += ["-map", "[gifout]", "-loop", "0", "-r", str(settings.fps)]
+        args += ["-progress", "pipe:1", "-nostats", settings.output_path]
+
+        self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering GIF")
         return settings.output_path
 
     def _export_two_pass(

@@ -10,6 +10,10 @@ from typing import Optional
 from core.ffmpeg_utils import find_binary, run
 from core.media_asset import MediaAsset
 
+# Extensions ffprobe would otherwise report as a single-frame "video" stream
+# (still images have no true duration/audio) — treated as images instead.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+
 
 def probe_file(path: str) -> MediaAsset:
     """Run ffprobe on ``path`` and return a populated :class:`MediaAsset`.
@@ -75,7 +79,7 @@ def probe_file(path: str) -> MediaAsset:
     # still image (e.g. imported via -loop). Treat near-zero duration
     # image formats as images.
     ext = os.path.splitext(path)[1].lower()
-    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}:
+    if ext in IMAGE_EXTENSIONS:
         asset.has_video = False
         asset.has_audio = False
 
@@ -118,7 +122,7 @@ def generate_thumbnail(path: str, cache_dir: str, timestamp: float = 1.0) -> Opt
         return None
 
     ext = os.path.splitext(path)[1].lower()
-    is_image = ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
+    is_image = ext in IMAGE_EXTENSIONS
 
     args = [ffmpeg, "-y"]
     if not is_image:

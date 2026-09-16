@@ -6,6 +6,7 @@ media files. They protect against regressions in the graph-building logic
 (labels, escaping, ordering) which is the trickiest part of the exporter.
 """
 
+import math
 import unittest
 
 from core.clip import Clip, MediaType, TextStyle, TransitionType
@@ -28,7 +29,7 @@ class FilterGraphTests(unittest.TestCase):
         self.assertIn("[0:v]", graph.filter_complex)
         self.assertIn("[0:a]", graph.filter_complex)
         self.assertIn("color=c=black:s=1280x720", graph.filter_complex)
-        self.assertIn("overlay=0:0", graph.filter_complex)
+        self.assertIn("overlay=x=", graph.filter_complex)
         self.assertTrue(graph.has_audio)
 
     def test_muted_clip_has_no_audio_input(self):
@@ -53,7 +54,7 @@ class FilterGraphTests(unittest.TestCase):
 
         graph = build_filter_graph(project, ProjectSettings())
         self.assertEqual(graph.filter_complex.count("trim=duration="), 2)
-        self.assertEqual(graph.filter_complex.count("overlay=0:0"), 2)
+        self.assertEqual(graph.filter_complex.count("overlay=x="), 2)
 
     def test_text_clip_generates_drawtext(self):
         project = Project()
@@ -122,7 +123,7 @@ class CrossfadeTransitionTests(unittest.TestCase):
         graph = build_filter_graph(project, ProjectSettings())
         self.assertIn("xfade=transition=fade:duration=1.000:offset=4.000", graph.filter_complex)
         # The pair becomes a single composited layer, not two.
-        self.assertEqual(graph.filter_complex.count("overlay=0:0"), 1)
+        self.assertEqual(graph.filter_complex.count("overlay=x="), 1)
         # Each clip's own fade (superseded by the crossfade) is skipped.
         self.assertNotIn(":alpha=1", graph.filter_complex)
         # xfade hard-fails ("inputs needs to be a constant frame rate")
@@ -147,7 +148,7 @@ class CrossfadeTransitionTests(unittest.TestCase):
 
         graph = build_filter_graph(project, ProjectSettings())
         self.assertNotIn("xfade", graph.filter_complex)
-        self.assertEqual(graph.filter_complex.count("overlay=0:0"), 2)
+        self.assertEqual(graph.filter_complex.count("overlay=x="), 2)
 
     def test_crossfade_duration_clamped_to_the_shorter_clip(self):
         project = Project()
@@ -234,6 +235,78 @@ class ChromaKeyTests(unittest.TestCase):
         )
         graph = build_filter_graph(project, ProjectSettings())
         self.assertNotIn("colorkey", graph.filter_complex)
+
+
+class TransformTests(unittest.TestCase):
+    def test_default_transform_reproduces_the_old_centered_overlay(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        # An unedited clip's overlay position expression must evaluate to
+        # exactly 0:0 (same as the old hardcoded overlay=0:0) — (w/2 canceling
+        # against main_w*0.5 when the layer is full-canvas-sized).
+        self.assertIn("overlay=x='(main_w*0.5000)-(w/2)':y='(main_h*0.5000)-(h/2)'", graph.filter_complex)
+        self.assertNotIn("scale=iw*", graph.filter_complex)
+        self.assertNotIn("rotate=", graph.filter_complex)
+        # No pad step either: Transform's overlay-based positioning replaces it.
+        self.assertNotIn("pad=", graph.filter_complex)
+
+    def test_scale_and_position_are_reflected_in_the_chain(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                transform_x=0.25, transform_y=0.75, transform_scale=0.5,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("scale=iw*0.5000:ih*0.5000", graph.filter_complex)
+        self.assertIn("overlay=x='(main_w*0.2500)-(w/2)':y='(main_h*0.7500)-(h/2)'", graph.filter_complex)
+
+    def test_rotation_uses_radians_and_expands_the_output_box(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                transform_rotation=90.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        expected_radians = f"{math.radians(90.0):.6f}"
+        self.assertIn(f"rotate={expected_radians}:c=none:ow=rotw({expected_radians}):oh=roth({expected_radians})", graph.filter_complex)
+
+    def test_transform_is_ignored_for_a_crossfading_clip(self):
+        # xfade requires matching frame sizes between its two inputs, so a
+        # clip's Transform is a documented no-op while it's crossfading —
+        # it should fall back to the old full-canvas pad instead.
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+                transform_scale=0.5, transform_x=0.1, transform_y=0.1,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=5)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("pad=", graph.filter_complex)
+        self.assertNotIn("scale=iw*", graph.filter_complex)
+        # The merged crossfade layer is centered (0.5, 0.5), ignoring the
+        # transform_x/y set on the clip above.
+        self.assertIn("overlay=x='(main_w*0.5000)-(w/2)':y='(main_h*0.5000)-(h/2)'", graph.filter_complex)
 
 
 class AudioFadeTests(unittest.TestCase):
