@@ -1,8 +1,8 @@
-# Transform, Color Correction, Chroma Key, and Transitions Workflow
+# Transform, Keyframes, Color Correction, Chroma Key, and Transitions Workflow
 
 ## Goal
 
-Position/scale/rotate a video/image clip, grade its color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg, none of it visible in the live preview.
+Position/scale/rotate a video/image clip (optionally animated over time), grade its color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg, none of it visible in the live preview.
 
 ## Transform (position, scale, rotation)
 
@@ -19,6 +19,22 @@ Position/scale/rotate a video/image clip, grade its color, key out a solid-color
 This is what makes picture-in-picture, split-screen, and off-center framing possible — put a second video/image clip on a track above another, scale it down, and position it in a corner.
 
 **Known limit: Transform is a no-op on a clip while it's crossfading into the next one.** `xfade` (used for crossfade transitions, below) requires both its inputs to be exactly the same frame size; Transform's overlay-based positioning deliberately allows a clip's frame to be smaller or larger than the canvas, which the two sides of a crossfade pair can't reconcile against each other. A crossfading clip's chain falls back to the old fixed-size, centered `pad` step instead — documented, not silent: `core/filter_graph.py::_build_video_clip_chain`'s `apply_transform` parameter is `False` for both sides of a crossfade pair.
+
+## Keyframing (Opacity and Position)
+
+Both Opacity (Clip Adjustments group) and Transform's Position X/Y can be animated over time instead of held constant:
+
+1. Select a video or image clip and set the property's slider (Opacity, or Transform Position X/Y) to the value you want at a specific moment.
+2. In the Properties panel's **Keyframes** group, set **At** to that moment's time in seconds *from the clip's own start*, then click **+ Add** — it captures the slider's current value at that time. Repeat for other moments; the table lists every keyframe, and **- Remove Selected** deletes the highlighted row.
+3. With 2 or more keyframes, the plain slider is overridden: the value smoothly (linearly) interpolates between keyframes, holding the first/last value outside the keyframed range.
+
+Implementation differs by property, because FFmpeg's per-frame expression support isn't uniform across filters:
+- **Position** reuses the exact same `overlay=x:y` mechanism Transform already uses (see above) — the x/y expressions become piecewise-linear functions of `t` instead of plain numbers. Since `overlay` runs *after* each layer's `tpad` shift to its timeline position, the expression subtracts `timeline_start` to convert back to clip-local time before evaluating.
+- **Opacity** can't reuse `colorchannelmixer` (its options are plain floats, not per-frame expressions in this FFmpeg build) — animated opacity instead uses `geq`, re-sampling `lum`/`cb`/`cr` from the source frame unchanged and only recomputing alpha as `alpha(X,Y) * (piecewise-linear expression of T)`, preserving whatever transparency fades/rotate already introduced.
+
+Both were verified against real FFmpeg (a `geq` alpha ramp and an `overlay` position ramp, each sampled at multiple timestamps and confirmed to match the predicted linear-interpolation math almost exactly), not just the text-based unit tests — `geq`'s exact syntax in particular wasn't something this codebase had used before, so it was worth confirming end-to-end before relying on it.
+
+**Known limit**: like Transform's scale/rotation, position keyframes are a no-op on a clip while it's crossfading (same `xfade`-needs-matching-sizes reason).
 
 ## Color correction
 
@@ -53,6 +69,6 @@ This is what makes picture-in-picture, split-screen, and off-center framing poss
 
 ## Validation
 
-`tests/test_filter_graph.py` covers all four features without invoking FFmpeg (`TransformTests`, `ColorCorrectionTests`, `ChromaKeyTests`, `CrossfadeTransitionTests`, plus `AudioFadeTests` for the related audio-fade fix): the `eq`/`colorkey` filters appear only when non-neutral/enabled, a default-transform clip's overlay expression evaluates to the same 0:0 position as before Transform existed, a valid adjacent crossfade pair produces one merged `xfade` layer instead of two `overlay` layers (and correctly falls back to the old `pad` step, ignoring Transform, while doing so), a gap or a text-clip partner correctly disables crossfading, and the duration is clamped to the shorter clip.
+`tests/test_filter_graph.py` covers all five features without invoking FFmpeg (`TransformTests`, `KeyframeTests`, `ColorCorrectionTests`, `ChromaKeyTests`, `CrossfadeTransitionTests`, plus `AudioFadeTests` for the related audio-fade fix): the `eq`/`colorkey` filters appear only when non-neutral/enabled, a default-transform clip's overlay expression evaluates to the same 0:0 position as before Transform existed, a single keyframe behaves like no keyframes at all, 2+ keyframes produce the expected piecewise-linear expression text, a valid adjacent crossfade pair produces one merged `xfade` layer instead of two `overlay` layers (and correctly falls back to the old `pad` step, ignoring Transform/position-keyframes, while doing so), a gap or a text-clip partner correctly disables crossfading, and the duration is clamped to the shorter clip.
 
 Unlike the other export-only features, Transform was also verified against **real FFmpeg execution**, not just these text-based tests — a picture-in-picture composite (a small, repositioned clip on top of a full-frame background clip) confirmed the background is visible everywhere the foreground doesn't cover (proving `overlay` positioning, not the old `pad`, is what's compositing it), plus default-transform-reproduces-old-behavior, rotation, and transform+crossfade-together checks. This matters because two earlier features in this same file (crossfade's `fps=` requirement, GIF export's unconnected-audio-pad error) were bugs that only real FFmpeg execution caught — the text-only tests structurally can't catch a rejected filtergraph.

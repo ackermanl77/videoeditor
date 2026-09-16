@@ -27,6 +27,8 @@ from core.commands import (
     RemoveTrackCommand,
     SplitClipCommand,
     TrimClipCommand,
+    build_ripple_delete_command,
+    build_ripple_trim_command,
 )
 from core.history import History
 from core.media_asset import MediaAsset
@@ -130,6 +132,7 @@ class TimelineWidget(QWidget):
         self.get_thumbnail_for_clip = None  # injected callable: Clip -> Optional[QPixmap]
         self.get_waveform_for_clip = None  # injected callable: Clip -> Optional[WaveformData]
         self.snap_enabled = True
+        self.ripple_enabled = False
 
         self.signals = TimelineSignals()
         self._build_ui()
@@ -154,8 +157,17 @@ class TimelineWidget(QWidget):
         self.snap_btn.setCheckable(True)
         self.snap_btn.setChecked(True)
         self.snap_btn.setToolTip("Snap clips to the playhead, clip edges, and 0:00 while dragging or trimming")
+        self.ripple_btn = QPushButton("Ripple")
+        self.ripple_btn.setCheckable(True)
+        self.ripple_btn.setToolTip(
+            "When on, Delete and Trim also shift every later clip on the same track "
+            "to close (or open) the resulting gap, instead of leaving it."
+        )
 
-        for btn in (self.add_video_track_btn, self.add_audio_track_btn, self.split_btn, self.delete_btn, self.delete_track_btn, self.snap_btn):
+        for btn in (
+            self.add_video_track_btn, self.add_audio_track_btn, self.split_btn,
+            self.delete_btn, self.delete_track_btn, self.snap_btn, self.ripple_btn,
+        ):
             toolbar.addWidget(btn)
 
         toolbar.addStretch(1)
@@ -199,6 +211,7 @@ class TimelineWidget(QWidget):
         self.delete_track_btn.clicked.connect(self.delete_selected_track)
         self.zoom_slider.valueChanged.connect(self._on_zoom_slider)
         self.snap_btn.toggled.connect(self._on_snap_toggled)
+        self.ripple_btn.toggled.connect(self._on_ripple_toggled)
 
         self.view.seek_requested.connect(self.set_playhead)
         self.view.zoom_requested.connect(self._on_zoom_factor)
@@ -322,6 +335,9 @@ class TimelineWidget(QWidget):
         self.snap_enabled = checked
         if not checked:
             self._on_snap_guide_hide()
+
+    def _on_ripple_toggled(self, checked: bool) -> None:
+        self.ripple_enabled = checked
 
     def _add_clip_item(self, clip: Clip, row: int) -> None:
         thumb = self._get_thumbnail(clip)
@@ -510,7 +526,11 @@ class TimelineWidget(QWidget):
     def delete_selected(self) -> None:
         if self.project is None or self.history is None or self.selected_clip_id is None:
             return
-        self.history.execute(RemoveClipCommand(self.project, self.selected_clip_id))
+        if self.ripple_enabled:
+            command = build_ripple_delete_command(self.project, self.selected_clip_id)
+        else:
+            command = RemoveClipCommand(self.project, self.selected_clip_id)
+        self.history.execute(command)
         self.selected_clip_id = None
         self.rebuild()
         self._emit_modified()
@@ -555,10 +575,22 @@ class TimelineWidget(QWidget):
             source_out=source_out,
             speed=clip.speed,
         )
-        if track.has_overlap(probe, ignore_id=clip_id):
-            self.rebuild()
-            return
-        self.history.execute(TrimClipCommand(self.project, clip_id, source_in, source_out, timeline_start))
+        if self.ripple_enabled:
+            # Clips at/after the clip's OLD end shift in lockstep with this
+            # trim (see build_ripple_trim_command), so they can never newly
+            # overlap it — only clips that stay put need checking, e.g.
+            # trimming the left edge back past the previous clip.
+            old_end = clip.timeline_end
+            stationary = [c for c in track.clips if c.id != clip_id and c.timeline_start < old_end - 0.001]
+            if any(probe.timeline_start < c.timeline_end and c.timeline_start < probe.timeline_end for c in stationary):
+                self.rebuild()
+                return
+            self.history.execute(build_ripple_trim_command(self.project, clip_id, source_in, source_out, timeline_start))
+        else:
+            if track.has_overlap(probe, ignore_id=clip_id):
+                self.rebuild()
+                return
+            self.history.execute(TrimClipCommand(self.project, clip_id, source_in, source_out, timeline_start))
         self.rebuild()
         self._emit_modified()
 

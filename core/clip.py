@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class MediaType(str, Enum):
@@ -125,6 +125,26 @@ class Clip:
     transform_scale: float = 1.0  # multiplier on top of the fit-to-canvas size
     transform_rotation: float = 0.0  # degrees, clockwise
 
+    # Keyframes (video/image clips only). Empty or single-entry = constant
+    # value from the scalar field above (``opacity`` / ``transform_x``,
+    # ``transform_y``). 2+ entries enable smooth piecewise-linear animation
+    # between them (holding the first/last value outside the keyframed
+    # range). Times are seconds from the clip's own start on the timeline.
+    opacity_keyframes: List[Tuple[float, float]] = field(default_factory=list)  # (time, opacity 0..1)
+    position_keyframes: List[Tuple[float, float, float]] = field(default_factory=list)  # (time, x, y)
+
+    # Speed ramp. Empty or single-entry = constant ``speed`` above. 2+
+    # entries define speed *segments*, not a smooth continuous ramp: each
+    # keyframe (source_time, speed) sets the speed from that point in the
+    # SOURCE (source_in-relative) forward, until the next keyframe — a step
+    # change at each boundary. Affects Clip.duration (below) regardless of
+    # media type, but core/filter_graph.py only implements the actual
+    # segmented render for video/image clips — a standalone AUDIO-track
+    # clip's speed_keyframes are (for now) read for timing purposes only
+    # and don't yet get a segmented render of their own. See
+    # docs/workflows/speed-ramps/workflow.md for both of these scope calls.
+    speed_keyframes: List[Tuple[float, float]] = field(default_factory=list)  # (source_time, speed)
+
     # Text overlay data (only used when media_type == TEXT)
     text_style: Optional[TextStyle] = None
 
@@ -152,8 +172,47 @@ class Clip:
         return max(0.0, self.source_out - self.source_in)
 
     @property
+    def speed_segments(self) -> List[Tuple[float, float, float]]:
+        """``(source_in, source_out, speed)`` triples covering the trimmed region.
+
+        A single segment at the constant ``speed`` when there are fewer
+        than 2 speed keyframes (the common case, and exactly what
+        ``source_length``/``speed`` already implied before speed ramps
+        existed). 2+ keyframes split the region into the step-function
+        segments ``speed_keyframes`` describes: each keyframe sets the
+        speed from its (source-in-relative) time forward until the next
+        one. Extends the first/last keyframe's speed to cover the region's
+        actual edges when the keyframes don't already start/end exactly there.
+        """
+        span = self.source_length
+        if len(self.speed_keyframes) < 2:
+            return [(self.source_in, self.source_out, self.speed if self.speed > 0 else 1.0)]
+
+        boundaries: List[float] = []
+        speeds: List[float] = []
+        for t, s in sorted(self.speed_keyframes, key=lambda k: k[0]):
+            clamped_t = self.source_in + min(max(0.0, t), span)
+            s = s if s > 0 else 1.0
+            if boundaries and abs(boundaries[-1] - clamped_t) < 1e-6:
+                speeds[-1] = s  # same instant re-specified: last one wins
+            else:
+                boundaries.append(clamped_t)
+                speeds.append(s)
+
+        segments: List[Tuple[float, float, float]] = []
+        if boundaries[0] > self.source_in + 1e-6:
+            segments.append((self.source_in, boundaries[0], speeds[0]))
+        for i, start in enumerate(boundaries):
+            end = boundaries[i + 1] if i + 1 < len(boundaries) else self.source_out
+            if end - start > 1e-6:
+                segments.append((start, end, speeds[i]))
+        return segments or [(self.source_in, self.source_out, 1.0)]
+
+    @property
     def duration(self) -> float:
         """Length of the clip as it appears on the timeline (seconds)."""
+        if len(self.speed_keyframes) >= 2:
+            return sum((seg_out - seg_in) / seg_speed for seg_in, seg_out, seg_speed in self.speed_segments)
         speed = self.speed if self.speed > 0 else 1.0
         return self.source_length / speed
 
@@ -200,6 +259,9 @@ class Clip:
             "transform_y": self.transform_y,
             "transform_scale": self.transform_scale,
             "transform_rotation": self.transform_rotation,
+            "opacity_keyframes": [list(kf) for kf in self.opacity_keyframes],
+            "position_keyframes": [list(kf) for kf in self.position_keyframes],
+            "speed_keyframes": [list(kf) for kf in self.speed_keyframes],
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
         }
@@ -237,6 +299,9 @@ class Clip:
             transform_y=data.get("transform_y", 0.5),
             transform_scale=data.get("transform_scale", 1.0),
             transform_rotation=data.get("transform_rotation", 0.0),
+            opacity_keyframes=[tuple(kf) for kf in data.get("opacity_keyframes", [])],
+            position_keyframes=[tuple(kf) for kf in data.get("position_keyframes", [])],
+            speed_keyframes=[tuple(kf) for kf in data.get("speed_keyframes", [])],
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
         )

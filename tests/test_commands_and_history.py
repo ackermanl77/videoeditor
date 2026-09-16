@@ -10,6 +10,8 @@ from core.commands import (
     SplitClipCommand,
     TrimClipCommand,
     UpdateClipPropertyCommand,
+    build_ripple_delete_command,
+    build_ripple_trim_command,
 )
 from core.history import History
 from core.project import Project
@@ -111,6 +113,82 @@ class MoveAndPropertyCommandTests(unittest.TestCase):
         self.assertAlmostEqual(clip.volume, 1.5)
         history.undo()
         self.assertAlmostEqual(clip.volume, 1.0)
+
+
+class RippleEditTests(unittest.TestCase):
+    def _three_clip_track(self):
+        project = Project()
+        track = project.tracks[0]
+        a = Clip(media_type=MediaType.VIDEO, source_in=0, source_out=5, timeline_start=0)  # 0-5
+        b = Clip(media_type=MediaType.VIDEO, source_in=0, source_out=3, timeline_start=5)  # 5-8
+        c = Clip(media_type=MediaType.VIDEO, source_in=0, source_out=2, timeline_start=8)  # 8-10
+        track.clips.extend([a, b, c])
+        return project, track, a, b, c
+
+    def test_ripple_delete_shifts_only_later_same_track_clips(self):
+        project, track, a, b, c = self._three_clip_track()
+        other_track = project.add_track(TrackType.VIDEO)
+        other_clip = Clip(media_type=MediaType.VIDEO, source_in=0, source_out=5, timeline_start=8)
+        other_track.clips.append(other_clip)
+        history = History()
+
+        history.execute(build_ripple_delete_command(project, a.id))
+        self.assertEqual(len(track.clips), 2)
+        self.assertAlmostEqual(b.timeline_start, 0.0)  # was 5, shifted left by a's duration (5)
+        self.assertAlmostEqual(c.timeline_start, 3.0)  # was 8, shifted left by 5
+        self.assertAlmostEqual(other_clip.timeline_start, 8.0)  # different track: untouched
+
+    def test_ripple_delete_of_the_last_clip_shifts_nothing(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        history.execute(build_ripple_delete_command(project, c.id))
+        self.assertAlmostEqual(a.timeline_start, 0.0)
+        self.assertAlmostEqual(b.timeline_start, 5.0)
+
+    def test_ripple_delete_undo_restores_everything_in_one_step(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        history.execute(build_ripple_delete_command(project, a.id))
+        history.undo()
+        self.assertEqual(len(track.clips), 3)
+        restored = {clip.id: clip.timeline_start for clip in track.clips}
+        self.assertAlmostEqual(restored[b.id], 5.0)
+        self.assertAlmostEqual(restored[c.id], 8.0)
+
+    def test_ripple_trim_shortening_shifts_later_clips_left(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        # Shorten a's right edge from 5s to 3s duration (source_out 5 -> 3).
+        history.execute(build_ripple_trim_command(project, a.id, source_in=0.0, source_out=3.0, timeline_start=0.0))
+        self.assertAlmostEqual(a.timeline_end, 3.0)
+        self.assertAlmostEqual(b.timeline_start, 3.0)  # was 5, shifted left by 2 (the shortened amount)
+        self.assertAlmostEqual(c.timeline_start, 6.0)  # was 8, shifted left by 2
+
+    def test_ripple_trim_lengthening_shifts_later_clips_right(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        # Lengthen a's right edge from 5s to 7s duration (source_out 5 -> 7).
+        history.execute(build_ripple_trim_command(project, a.id, source_in=0.0, source_out=7.0, timeline_start=0.0))
+        self.assertAlmostEqual(b.timeline_start, 7.0)  # was 5, shifted right by 2
+        self.assertAlmostEqual(c.timeline_start, 10.0)  # was 8, shifted right by 2
+
+    def test_ripple_trim_undo_restores_everything_in_one_step(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        history.execute(build_ripple_trim_command(project, a.id, source_in=0.0, source_out=3.0, timeline_start=0.0))
+        history.undo()
+        self.assertAlmostEqual(a.timeline_end, 5.0)
+        self.assertAlmostEqual(b.timeline_start, 5.0)
+        self.assertAlmostEqual(c.timeline_start, 8.0)
+
+    def test_ripple_trim_with_no_net_duration_change_is_a_plain_trim(self):
+        project, track, a, b, c = self._three_clip_track()
+        history = History()
+        # Same net duration (5s), just a different in/out pair (e.g. sliding
+        # the trim window) — nothing downstream should move.
+        history.execute(build_ripple_trim_command(project, a.id, source_in=1.0, source_out=6.0, timeline_start=0.0))
+        self.assertAlmostEqual(b.timeline_start, 5.0)
+        self.assertAlmostEqual(c.timeline_start, 8.0)
 
 
 class HistoryStackTests(unittest.TestCase):

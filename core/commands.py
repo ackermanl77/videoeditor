@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 from core.clip import Clip
-from core.history import Command
+from core.history import CompositeCommand, Command
 from core.project import Project
 from core.track import Track, TrackType
 
@@ -254,3 +254,67 @@ class UpdateTextClipCommand(Command):
         clip = self.project.find_clip(self.clip_id)
         if clip is not None:
             clip.text_style = copy.deepcopy(self.old_style)
+
+
+def build_ripple_delete_command(project: Project, clip_id: str) -> Command:
+    """Delete a clip and shift every later clip on the *same track* left to close the gap.
+
+    Same-track only, deliberately — shifting other tracks too would risk
+    desyncing anything on them that was intentionally aligned to a specific
+    global time (matching the same scoping trade-off already made for
+    crossfade transitions: see docs/workflows/color-and-effects). Returns a
+    plain ``RemoveClipCommand`` (identical to non-ripple delete) if the clip
+    can't be found or nothing follows it on its track.
+    """
+    track = project.find_clip_track(clip_id)
+    clip = project.find_clip(clip_id)
+    remove_cmd = RemoveClipCommand(project, clip_id)
+    if track is None or clip is None:
+        return remove_cmd
+
+    shift = clip.duration
+    affected = [c for c in track.clips if c.id != clip_id and c.timeline_start > clip.timeline_start + 1e-6]
+    if not affected:
+        return remove_cmd
+
+    commands: List[Command] = [remove_cmd]
+    commands.extend(MoveClipCommand(project, c.id, c.timeline_start - shift, track.id) for c in affected)
+    return CompositeCommand(commands, remove_cmd.label)
+
+
+def build_ripple_trim_command(
+    project: Project,
+    clip_id: str,
+    source_in: float,
+    source_out: float,
+    timeline_start: float,
+) -> Command:
+    """Trim a clip and shift every later same-track clip by the resulting change in its end time.
+
+    Works for either edge: trimming the right edge changes ``source_out``
+    (and hence ``timeline_end``) directly; trimming the left edge changes
+    ``source_in``/``timeline_start`` together. Either way, what matters for
+    ripple is simply the net change in this clip's ``timeline_end`` — every
+    later clip on the track shifts by exactly that delta, positive or
+    negative, preserving whatever gap (usually zero) it had before.
+    """
+    track = project.find_clip_track(clip_id)
+    clip = project.find_clip(clip_id)
+    trim_cmd = TrimClipCommand(project, clip_id, source_in, source_out, timeline_start)
+    if track is None or clip is None:
+        return trim_cmd
+
+    old_end = clip.timeline_end
+    speed = clip.speed if clip.speed > 0 else 1.0
+    new_duration = max(0.0, source_out - source_in) / speed
+    delta = (timeline_start + new_duration) - old_end
+    if abs(delta) <= 1e-6:
+        return trim_cmd
+
+    affected = [c for c in track.clips if c.id != clip_id and c.timeline_start >= old_end - 1e-3]
+    if not affected:
+        return trim_cmd
+
+    commands: List[Command] = [trim_cmd]
+    commands.extend(MoveClipCommand(project, c.id, c.timeline_start + delta, track.id) for c in affected)
+    return CompositeCommand(commands, "Ripple Trim")

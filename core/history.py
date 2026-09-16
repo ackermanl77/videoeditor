@@ -31,6 +31,35 @@ class Command(ABC):
         self.do()
 
 
+class CompositeCommand(Command):
+    """Bundles several commands into one atomic undo step.
+
+    Used for operations that touch more than one clip at once (e.g. ripple
+    delete/trim shifting every downstream clip) but should still undo/redo
+    as a single unit rather than one step per affected clip. Each
+    sub-command is constructed as normal (capturing its own "before" state
+    in ``__init__``, before anything has run) and this class just sequences
+    their ``do``/``undo`` — ``undo`` runs them in reverse order, since a
+    later command may depend on state an earlier one changed.
+    """
+
+    def __init__(self, commands: List[Command], label: str):
+        self.commands = commands
+        self.label = label
+
+    def do(self) -> None:
+        for command in self.commands:
+            command.do()
+
+    def undo(self) -> None:
+        for command in reversed(self.commands):
+            command.undo()
+
+    def redo(self) -> None:
+        for command in self.commands:
+            command.redo()
+
+
 class History:
     """A bounded undo/redo stack of :class:`Command` objects."""
 

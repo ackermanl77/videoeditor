@@ -249,7 +249,7 @@ class TransformTests(unittest.TestCase):
         # An unedited clip's overlay position expression must evaluate to
         # exactly 0:0 (same as the old hardcoded overlay=0:0) — (w/2 canceling
         # against main_w*0.5 when the layer is full-canvas-sized).
-        self.assertIn("overlay=x='(main_w*0.5000)-(w/2)':y='(main_h*0.5000)-(h/2)'", graph.filter_complex)
+        self.assertIn("overlay=x='(main_w*(0.5000))-(w/2)':y='(main_h*(0.5000))-(h/2)'", graph.filter_complex)
         self.assertNotIn("scale=iw*", graph.filter_complex)
         self.assertNotIn("rotate=", graph.filter_complex)
         # No pad step either: Transform's overlay-based positioning replaces it.
@@ -267,7 +267,7 @@ class TransformTests(unittest.TestCase):
         )
         graph = build_filter_graph(project, ProjectSettings())
         self.assertIn("scale=iw*0.5000:ih*0.5000", graph.filter_complex)
-        self.assertIn("overlay=x='(main_w*0.2500)-(w/2)':y='(main_h*0.7500)-(h/2)'", graph.filter_complex)
+        self.assertIn("overlay=x='(main_w*(0.2500))-(w/2)':y='(main_h*(0.7500))-(h/2)'", graph.filter_complex)
 
     def test_rotation_uses_radians_and_expands_the_output_box(self):
         project = Project()
@@ -306,7 +306,158 @@ class TransformTests(unittest.TestCase):
         self.assertNotIn("scale=iw*", graph.filter_complex)
         # The merged crossfade layer is centered (0.5, 0.5), ignoring the
         # transform_x/y set on the clip above.
-        self.assertIn("overlay=x='(main_w*0.5000)-(w/2)':y='(main_h*0.5000)-(h/2)'", graph.filter_complex)
+        self.assertIn("overlay=x='(main_w*(0.5))-(w/2)':y='(main_h*(0.5))-(h/2)'", graph.filter_complex)
+
+
+class KeyframeTests(unittest.TestCase):
+    def test_single_opacity_keyframe_behaves_like_no_keyframes(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                opacity_keyframes=[(1.0, 0.5)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("geq=", graph.filter_complex)
+
+    def test_two_or_more_opacity_keyframes_produce_a_geq_alpha_ramp(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                opacity_keyframes=[(0.0, 0.2), (2.0, 1.0)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='alpha(X,Y)*(", graph.filter_complex)
+        # Piecewise expression: before t=0 hold 0.2, interpolate to 1.0 by t=2, hold 1.0 after.
+        self.assertIn("if(lt(T,0.000000),0.200000,if(lt(T,2.000000)", graph.filter_complex)
+
+    def test_position_keyframes_produce_a_time_varying_overlay_expression(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=3.0,
+                position_keyframes=[(0.0, 0.1, 0.2), (1.0, 0.9, 0.8)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        # The overlay step runs on the timeline-shifted (global-time) stream,
+        # so the keyframe expression must subtract the clip's timeline_start
+        # to convert overlay's `t` back to clip-local time.
+        self.assertIn("(t-3.000000)", graph.filter_complex)
+        self.assertIn("if(lt((t-3.000000),0.000000),0.100000,if(lt((t-3.000000),1.000000)", graph.filter_complex)
+
+    def test_position_keyframes_ignored_for_a_crossfading_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+                position_keyframes=[(0.0, 0.1, 0.1), (1.0, 0.9, 0.9)],
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=5)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("overlay=x='(main_w*(0.5))-(w/2)':y='(main_h*(0.5))-(h/2)'", graph.filter_complex)
+
+
+class SpeedRampTests(unittest.TestCase):
+    def test_single_speed_keyframe_behaves_like_a_normal_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                speed_keyframes=[(1.0, 3.0)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("concat=", graph.filter_complex)
+        self.assertEqual(len(graph.input_specs), 1)
+
+    def test_two_speed_keyframes_produce_segments_and_concat(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0,
+                speed_keyframes=[(0.0, 1.0), (4.0, 2.0)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        # Two segments -> two -i inputs, one for each speed zone.
+        self.assertEqual(len(graph.input_specs), 2)
+        self.assertIn("concat=n=2:v=1:a=0", graph.filter_complex)
+        self.assertIn("setpts=PTS/2.000000", graph.filter_complex)  # the 2x segment
+        # Only one overlay layer — the segments merge into a single clip layer.
+        self.assertEqual(graph.filter_complex.count("overlay=x="), 1)
+
+    def test_speed_ramped_clips_audio_is_segmented_and_concatenated_too(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0,
+                speed_keyframes=[(0.0, 1.0), (4.0, 2.0)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("concat=n=2:v=0:a=1", graph.filter_complex)
+        self.assertTrue(graph.has_audio)
+
+    def test_speed_ramped_audio_with_fade_has_no_stray_leading_comma(self):
+        # Regression: a bracket reference immediately followed by a comma
+        # (e.g. "[label],afade=...") is invalid FFmpeg syntax ("No such
+        # filter: ''") — confirmed against real FFmpeg. _video_fade_and_
+        # opacity_suffix's leading comma is correctly stripped when it
+        # starts a fresh filter_lines entry rather than continuing one.
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0,
+                speed_keyframes=[(0.0, 1.0), (4.0, 2.0)], fade_in=0.5, fade_out=0.5,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("],afade", graph.filter_complex)
+        self.assertNotIn("],fade", graph.filter_complex)
+        self.assertIn("afade=t=in", graph.filter_complex)
+
+    def test_speed_ramped_clip_cannot_be_a_crossfade_partner(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0,
+                transition_out=TransitionType.CROSSFADE, transition_duration=1.0,
+                speed_keyframes=[(0.0, 1.0), (4.0, 2.0)],
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=track.clips[0].timeline_end)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("xfade", graph.filter_complex)
 
 
 class AudioFadeTests(unittest.TestCase):

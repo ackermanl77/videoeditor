@@ -7,18 +7,23 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -70,6 +75,18 @@ class PropertiesPanel(QWidget):
         self.show_empty_state()
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _make_keyframe_table(headers: list) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setMaximumHeight(110)
+        return table
+
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(3, 3, 3, 3)
@@ -161,6 +178,70 @@ class PropertiesPanel(QWidget):
         transform_form.addRow("", reset_transform_btn)
 
         layout.addWidget(self.transform_group)
+
+        # ---- Keyframes group (video/image only) ----
+        self.keyframes_group = QGroupBox("Keyframes")
+        kf_layout = QVBoxLayout(self.keyframes_group)
+
+        kf_layout.addWidget(QLabel("Opacity (2+ keyframes override the Opacity slider above)"))
+        self.opacity_kf_table = self._make_keyframe_table(["Time (s)", "Opacity %"])
+        kf_layout.addWidget(self.opacity_kf_table)
+
+        opacity_kf_row = QHBoxLayout()
+        self.opacity_kf_time_spin = QDoubleSpinBox()
+        self.opacity_kf_time_spin.setRange(0.0, 3600.0)
+        self.opacity_kf_time_spin.setSuffix(" s")
+        opacity_kf_row.addWidget(QLabel("At"))
+        opacity_kf_row.addWidget(self.opacity_kf_time_spin)
+        add_opacity_kf_btn = QPushButton("+ Add (uses Opacity slider)")
+        add_opacity_kf_btn.clicked.connect(self._add_opacity_keyframe)
+        remove_opacity_kf_btn = QPushButton("- Remove Selected")
+        remove_opacity_kf_btn.clicked.connect(self._remove_selected_opacity_keyframe)
+        opacity_kf_row.addWidget(add_opacity_kf_btn)
+        opacity_kf_row.addWidget(remove_opacity_kf_btn)
+        kf_layout.addLayout(opacity_kf_row)
+
+        kf_layout.addWidget(QLabel("Position (2+ keyframes override Transform Position above)"))
+        self.position_kf_table = self._make_keyframe_table(["Time (s)", "X %", "Y %"])
+        kf_layout.addWidget(self.position_kf_table)
+
+        position_kf_row = QHBoxLayout()
+        self.position_kf_time_spin = QDoubleSpinBox()
+        self.position_kf_time_spin.setRange(0.0, 3600.0)
+        self.position_kf_time_spin.setSuffix(" s")
+        position_kf_row.addWidget(QLabel("At"))
+        position_kf_row.addWidget(self.position_kf_time_spin)
+        add_position_kf_btn = QPushButton("+ Add (uses Transform Position)")
+        add_position_kf_btn.clicked.connect(self._add_position_keyframe)
+        remove_position_kf_btn = QPushButton("- Remove Selected")
+        remove_position_kf_btn.clicked.connect(self._remove_selected_position_keyframe)
+        position_kf_row.addWidget(add_position_kf_btn)
+        position_kf_row.addWidget(remove_position_kf_btn)
+        kf_layout.addLayout(position_kf_row)
+
+        kf_layout.addWidget(QLabel(
+            "Speed Ramp — 2+ keyframes override the Speed field above with step changes "
+            "(not a smooth ramp); time is seconds from the clip's SOURCE start, not its "
+            "timeline position"
+        ))
+        self.speed_kf_table = self._make_keyframe_table(["Time (s)", "Speed x"])
+        kf_layout.addWidget(self.speed_kf_table)
+
+        speed_kf_row = QHBoxLayout()
+        self.speed_kf_time_spin = QDoubleSpinBox()
+        self.speed_kf_time_spin.setRange(0.0, 3600.0)
+        self.speed_kf_time_spin.setSuffix(" s")
+        speed_kf_row.addWidget(QLabel("At"))
+        speed_kf_row.addWidget(self.speed_kf_time_spin)
+        add_speed_kf_btn = QPushButton("+ Add (uses Speed field)")
+        add_speed_kf_btn.clicked.connect(self._add_speed_keyframe)
+        remove_speed_kf_btn = QPushButton("- Remove Selected")
+        remove_speed_kf_btn.clicked.connect(self._remove_selected_speed_keyframe)
+        speed_kf_row.addWidget(add_speed_kf_btn)
+        speed_kf_row.addWidget(remove_speed_kf_btn)
+        kf_layout.addLayout(speed_kf_row)
+
+        layout.addWidget(self.keyframes_group)
 
         # ---- Transition group (video/image only) ----
         self.transition_group = QGroupBox("Transition")
@@ -353,6 +434,7 @@ class PropertiesPanel(QWidget):
         self.name_label.setVisible(False)
         self.clip_group.setVisible(False)
         self.transform_group.setVisible(False)
+        self.keyframes_group.setVisible(False)
         self.transition_group.setVisible(False)
         self.color_group.setVisible(False)
         self.chroma_group.setVisible(False)
@@ -379,6 +461,7 @@ class PropertiesPanel(QWidget):
         self.text_group.setVisible(is_text)
         self.clip_group.setVisible(not is_text)
         self.transform_group.setVisible(is_visual)
+        self.keyframes_group.setVisible(is_visual)
         self.transition_group.setVisible(is_visual)
         self.color_group.setVisible(is_visual)
         self.chroma_group.setVisible(is_visual)
@@ -395,6 +478,10 @@ class PropertiesPanel(QWidget):
             self.transform_y_slider.setValue(int(clip.transform_y * 100))
             self.transform_scale_slider.setValue(int(clip.transform_scale * 100))
             self.transform_rotation_slider.setValue(int(clip.transform_rotation))
+
+            self._refresh_opacity_keyframe_table(clip.opacity_keyframes)
+            self._refresh_position_keyframe_table(clip.position_keyframes)
+            self._refresh_speed_keyframe_table(clip.speed_keyframes)
 
             self.crossfade_checkbox.setChecked(clip.transition_out == TransitionType.CROSSFADE)
             self.transition_duration_spin.setValue(clip.transition_duration)
@@ -477,6 +564,113 @@ class PropertiesPanel(QWidget):
         self.transform_scale_slider.setValue(100)
         self.transform_rotation_slider.setValue(0)
         self._loading = False
+
+    # ------------------------------------------------------------------
+    # Keyframes
+    # ------------------------------------------------------------------
+    def _refresh_opacity_keyframe_table(self, keyframes) -> None:
+        table = self.opacity_kf_table
+        table.setRowCount(0)
+        for t, value in sorted(keyframes):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(f"{t:.2f}"))
+            table.setItem(row, 1, QTableWidgetItem(f"{value * 100:.0f}"))
+
+    def _refresh_position_keyframe_table(self, keyframes) -> None:
+        table = self.position_kf_table
+        table.setRowCount(0)
+        for t, x, y in sorted(keyframes):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(f"{t:.2f}"))
+            table.setItem(row, 1, QTableWidgetItem(f"{x * 100:.0f}"))
+            table.setItem(row, 2, QTableWidgetItem(f"{y * 100:.0f}"))
+
+    def _add_opacity_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        t = self.opacity_kf_time_spin.value()
+        value = self.opacity_slider.value() / 100.0
+        keyframes = [kf for kf in clip.opacity_keyframes if abs(kf[0] - t) > 1e-6]
+        keyframes.append((t, value))
+        keyframes.sort()
+        self._commit_now("opacity_keyframes", keyframes, "Add Opacity Keyframe")
+        self._refresh_opacity_keyframe_table(keyframes)
+
+    def _remove_selected_opacity_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        row = self.opacity_kf_table.currentRow()
+        if row < 0:
+            return
+        keyframes = sorted(clip.opacity_keyframes)
+        if row < len(keyframes):
+            del keyframes[row]
+        self._commit_now("opacity_keyframes", keyframes, "Remove Opacity Keyframe")
+        self._refresh_opacity_keyframe_table(keyframes)
+
+    def _add_position_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        t = self.position_kf_time_spin.value()
+        x = self.transform_x_slider.value() / 100.0
+        y = self.transform_y_slider.value() / 100.0
+        keyframes = [kf for kf in clip.position_keyframes if abs(kf[0] - t) > 1e-6]
+        keyframes.append((t, x, y))
+        keyframes.sort()
+        self._commit_now("position_keyframes", keyframes, "Add Position Keyframe")
+        self._refresh_position_keyframe_table(keyframes)
+
+    def _remove_selected_position_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        row = self.position_kf_table.currentRow()
+        if row < 0:
+            return
+        keyframes = sorted(clip.position_keyframes)
+        if row < len(keyframes):
+            del keyframes[row]
+        self._commit_now("position_keyframes", keyframes, "Remove Position Keyframe")
+        self._refresh_position_keyframe_table(keyframes)
+
+    def _refresh_speed_keyframe_table(self, keyframes) -> None:
+        table = self.speed_kf_table
+        table.setRowCount(0)
+        for t, speed in sorted(keyframes):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(f"{t:.2f}"))
+            table.setItem(row, 1, QTableWidgetItem(f"{speed:.2f}"))
+
+    def _add_speed_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        t = self.speed_kf_time_spin.value()
+        speed = self.speed_spin.value()
+        keyframes = [kf for kf in clip.speed_keyframes if abs(kf[0] - t) > 1e-6]
+        keyframes.append((t, speed))
+        keyframes.sort()
+        self._commit_now("speed_keyframes", keyframes, "Add Speed Keyframe")
+        self._refresh_speed_keyframe_table(keyframes)
+
+    def _remove_selected_speed_keyframe(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        row = self.speed_kf_table.currentRow()
+        if row < 0:
+            return
+        keyframes = sorted(clip.speed_keyframes)
+        if row < len(keyframes):
+            del keyframes[row]
+        self._commit_now("speed_keyframes", keyframes, "Remove Speed Keyframe")
+        self._refresh_speed_keyframe_table(keyframes)
 
     def _on_crossfade_toggled(self, checked: bool) -> None:
         self.transition_duration_spin.setEnabled(checked)

@@ -16,12 +16,17 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Media bin** with automatically generated thumbnails
 - **Multi-track timeline**: unlimited video and audio tracks, drag to move
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
-  hide per track
+  hide per track, with an optional **Ripple** mode so Delete/Trim shift
+  later same-track clips to close (or open) the gap
 - **Preview player** synced to the timeline playhead (play/pause/seek)
 - **Clip properties**: volume, mute, playback speed, opacity, fade in/out
   (video and audio both)
+- **Speed ramps**: vary a clip's playback speed within itself (e.g.
+  normal → slow-motion → normal) via speed keyframes
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
   split-screen, off-center framing
+- **Keyframing** for Opacity and Position — animate them smoothly over a
+  clip's duration instead of one constant value
 - **Crossfade transitions** between adjacent clips on the same track
 - **Per-clip color correction**: brightness, contrast, saturation, gamma
 - **Chroma key** (green-screen) compositing per clip

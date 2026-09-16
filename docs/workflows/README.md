@@ -11,7 +11,8 @@ These guides document current application behavior, the code paths behind each f
 - [Timeline editing](timeline-editing/workflow.md)
 - [Text overlays](text-overlays/workflow.md)
 - [Clip properties](clip-properties/workflow.md)
-- [Transform, color correction, chroma key, and transitions](color-and-effects/workflow.md)
+- [Transform, keyframes, color correction, chroma key, and transitions](color-and-effects/workflow.md)
+- [Speed ramps](speed-ramps/workflow.md)
 
 ## Preview
 
