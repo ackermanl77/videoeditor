@@ -15,7 +15,7 @@ Arrange imported media on a multi-track timeline: move, trim, split, and delete 
 
 ## Snapping
 
-Toggle **Snap** in the timeline toolbar. When enabled, dragging or trimming a clip snaps its edges to: `0:00`, the playhead, and every other clip's start/end across all tracks (`TimelineWidget._snap_targets()`), within `SNAP_THRESHOLD_PX` (8px) of the pointer. A dashed guide line shows the active snap target while dragging.
+Toggle **Snap** in the timeline toolbar. When enabled, dragging or trimming a clip snaps its edges to: `0:00`, the playhead, every marker (see [markers-and-chapters/workflow.md](../markers-and-chapters/workflow.md)), and every other clip's start/end across all tracks (`TimelineWidget._snap_targets()`), within `SNAP_THRESHOLD_PX` (8px) of the pointer. A dashed guide line shows the active snap target while dragging.
 
 ## Overlap prevention
 

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsObject,
     QGraphicsSceneMouseEvent,
+    QMenu,
     QStyleOptionGraphicsItem,
     QWidget,
 )
@@ -58,6 +59,9 @@ class TimelineSignals(QObject):
     track_hidden_toggled = Signal(int)
     snap_guide_show = Signal(float)  # timeline seconds where the guide should be drawn
     snap_guide_hide = Signal()
+    marker_clicked = Signal(str)  # marker_id -> seek the playhead there
+    marker_rename_requested = Signal(str, str)  # marker_id, new_name
+    marker_delete_requested = Signal(str)  # marker_id
 
 
 class ClipItem(QGraphicsObject):
@@ -534,6 +538,74 @@ class PlayheadItem(QGraphicsObject):
         painter.setPen(Qt.NoPen)
         points = [(-6, 0), (6, 0), (0, 10)]
         painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+
+
+class MarkerItem(QGraphicsObject):
+    """A named point on the shared timeline: a small flag in the ruler band
+    plus a thin dashed line threading down through the tracks so its
+    position is easy to line up against clips.
+
+    Left-click seeks the playhead there; right-click opens a Rename/Delete
+    context menu. Both go through ``TimelineSignals`` rather than mutating
+    the project directly, so the caller (``TimelineWidget``) can route them
+    through ``core.history.History`` for undo/redo, same as every other
+    timeline edit.
+    """
+
+    _FLAG_HALF_WIDTH = 6
+    _FLAG_HEIGHT = 10
+
+    def __init__(self, marker_id: str, time: float, name: str, color: str, height: float, signals: TimelineSignals):
+        super().__init__()
+        self.marker_id = marker_id
+        self.time = time
+        self.name = name
+        self.color = color
+        self._height = height
+        self.signals = signals
+        self.setZValue(44)
+        self.setAcceptHoverEvents(True)
+        self.setToolTip(name)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def boundingRect(self) -> QRectF:
+        w = self._FLAG_HALF_WIDTH
+        return QRectF(-w, 0, 2 * w, self._height)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        color = QColor(self.color)
+
+        # Thin line down through the tracks so the marker's exact position
+        # is easy to line up against clip edges below the ruler.
+        line_pen = QPen(color)
+        line_pen.setWidth(1)
+        line_pen.setStyle(Qt.DashLine)
+        painter.setPen(line_pen)
+        painter.drawLine(0, RULER_HEIGHT, 0, int(self._height))
+
+        # A small downward-pointing flag within the ruler band.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        w, h = self._FLAG_HALF_WIDTH, self._FLAG_HEIGHT
+        points = [(-w, 0), (w, 0), (w, h * 0.5), (0, h), (-w, h * 0.5)]
+        painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+
+    def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.signals.marker_clicked.emit(self.marker_id)
+        event.accept()
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu()
+        rename_action = menu.addAction("Rename...")
+        delete_action = menu.addAction("Delete Marker")
+        chosen = menu.exec(event.screenPos())
+        if chosen == rename_action:
+            self.signals.marker_rename_requested.emit(self.marker_id, self.name)
+        elif chosen == delete_action:
+            self.signals.marker_delete_requested.emit(self.marker_id)
+        event.accept()
 
 
 class RulerItem(QGraphicsObject):

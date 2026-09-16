@@ -9,6 +9,7 @@ These guides document current application behavior, the code paths behind each f
 ## Timeline Editing
 
 - [Timeline editing](timeline-editing/workflow.md)
+- [Markers and chapters](markers-and-chapters/workflow.md)
 - [Text overlays](text-overlays/workflow.md)
 - [Clip properties](clip-properties/workflow.md)
 - [Transform, keyframes, color correction, chroma key, and transitions](color-and-effects/workflow.md)

@@ -13,7 +13,7 @@ from typing import Any, List, Optional, Tuple
 
 from core.clip import Clip
 from core.history import CompositeCommand, Command
-from core.project import Project
+from core.project import Marker, Project
 from core.track import Track, TrackType
 
 
@@ -318,3 +318,61 @@ def build_ripple_trim_command(
     commands: List[Command] = [trim_cmd]
     commands.extend(MoveClipCommand(project, c.id, c.timeline_start + delta, track.id) for c in affected)
     return CompositeCommand(commands, "Ripple Trim")
+
+
+class AddMarkerCommand(Command):
+    """Add a marker to the project's shared timeline."""
+
+    def __init__(self, project: Project, time: float, name: Optional[str] = None):
+        self.project = project
+        self.time = time
+        self.name = name
+        self._marker: Optional[Marker] = None
+        self.label = "Add Marker"
+
+    def do(self) -> None:
+        self._marker = self.project.add_marker(self.time, self.name)
+
+    def undo(self) -> None:
+        if self._marker is not None:
+            self.project.remove_marker(self._marker.id)
+
+
+class RemoveMarkerCommand(Command):
+    """Remove a marker from the project."""
+
+    def __init__(self, project: Project, marker_id: str):
+        self.project = project
+        self.marker_id = marker_id
+        marker = project.find_marker(marker_id)
+        self._snapshot: Optional[Marker] = copy.deepcopy(marker) if marker else None
+        self.label = f"Delete {self._snapshot.name if self._snapshot else 'Marker'}"
+
+    def do(self) -> None:
+        self.project.remove_marker(self.marker_id)
+
+    def undo(self) -> None:
+        if self._snapshot is not None:
+            self.project.markers.append(copy.deepcopy(self._snapshot))
+
+
+class RenameMarkerCommand(Command):
+    """Rename an existing marker."""
+
+    def __init__(self, project: Project, marker_id: str, new_name: str):
+        self.project = project
+        self.marker_id = marker_id
+        self.new_name = new_name
+        marker = project.find_marker(marker_id)
+        self.old_name = marker.name if marker else ""
+        self.label = "Rename Marker"
+
+    def do(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.name = self.new_name
+
+    def undo(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.name = self.old_name

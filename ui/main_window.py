@@ -168,6 +168,8 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Add Text Clip", self.add_text_clip, "T", icon="text")
 
         timeline_menu = menu_bar.addMenu("&Timeline")
+        self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
+        timeline_menu.addSeparator()
         self._add_action(timeline_menu, "Add Video Track", lambda: self.timeline.add_track(TrackType.VIDEO))
         self._add_action(timeline_menu, "Add Audio Track", lambda: self.timeline.add_track(TrackType.AUDIO))
         self._add_action(timeline_menu, "Zoom In", self.timeline.zoom_in, "Ctrl+=")

@@ -5,8 +5,11 @@ import unittest
 from core.clip import Clip, MediaType
 from core.commands import (
     AddClipCommand,
+    AddMarkerCommand,
     MoveClipCommand,
     RemoveClipCommand,
+    RemoveMarkerCommand,
+    RenameMarkerCommand,
     SplitClipCommand,
     TrimClipCommand,
     UpdateClipPropertyCommand,
@@ -189,6 +192,38 @@ class RippleEditTests(unittest.TestCase):
         history.execute(build_ripple_trim_command(project, a.id, source_in=1.0, source_out=6.0, timeline_start=0.0))
         self.assertAlmostEqual(b.timeline_start, 5.0)
         self.assertAlmostEqual(c.timeline_start, 8.0)
+
+
+class MarkerCommandTests(unittest.TestCase):
+    def test_add_marker_and_undo(self):
+        project = Project()
+        history = History()
+        history.execute(AddMarkerCommand(project, 5.0, "Chorus"))
+        self.assertEqual(len(project.markers), 1)
+        self.assertEqual(project.markers[0].name, "Chorus")
+        history.undo()
+        self.assertEqual(len(project.markers), 0)
+        history.redo()
+        self.assertEqual(len(project.markers), 1)
+
+    def test_remove_marker_and_undo_restores_it(self):
+        project = Project()
+        marker = project.add_marker(3.0, "Verse")
+        history = History()
+        history.execute(RemoveMarkerCommand(project, marker.id))
+        self.assertEqual(len(project.markers), 0)
+        history.undo()
+        self.assertEqual(len(project.markers), 1)
+        self.assertEqual(project.markers[0].name, "Verse")
+
+    def test_rename_marker_and_undo(self):
+        project = Project()
+        marker = project.add_marker(1.0, "Old Name")
+        history = History()
+        history.execute(RenameMarkerCommand(project, marker.id, "New Name"))
+        self.assertEqual(project.find_marker(marker.id).name, "New Name")
+        history.undo()
+        self.assertEqual(project.find_marker(marker.id).name, "Old Name")
 
 
 class HistoryStackTests(unittest.TestCase):

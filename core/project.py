@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,33 @@ from core.media_asset import MediaAsset
 from core.track import Track, TrackType
 
 PROJECT_FILE_VERSION = 1
+
+
+@dataclass
+class Marker:
+    """A named point on the project's shared timeline (a "chapter" point).
+
+    Independent of any track/clip — deleting or moving clips around never
+    moves a marker. Rendered on the timeline ruler; also embeddable as real
+    chapter metadata in the exported file (see core/exporter.py).
+    """
+
+    time: float
+    name: str = "Marker"
+    color: str = "#3b82f6"
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "time": self.time, "name": self.name, "color": self.color}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Marker":
+        return cls(
+            id=data.get("id", uuid.uuid4().hex[:12]),
+            time=data.get("time", 0.0),
+            name=data.get("name", "Marker"),
+            color=data.get("color", "#3b82f6"),
+        )
 
 
 @dataclass
@@ -48,6 +76,7 @@ class Project:
     settings: ProjectSettings = field(default_factory=ProjectSettings)
     tracks: List[Track] = field(default_factory=list)
     media_pool: List[MediaAsset] = field(default_factory=list)
+    markers: List[Marker] = field(default_factory=list)
     file_path: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -116,6 +145,26 @@ class Project:
         return max((t.duration for t in self.tracks), default=0.0)
 
     # ------------------------------------------------------------------
+    # Markers
+    # ------------------------------------------------------------------
+    def add_marker(self, time: float, name: Optional[str] = None) -> Marker:
+        marker = Marker(time=max(0.0, time), name=name or f"Marker {len(self.markers) + 1}")
+        self.markers.append(marker)
+        return marker
+
+    def remove_marker(self, marker_id: str) -> None:
+        self.markers = [m for m in self.markers if m.id != marker_id]
+
+    def find_marker(self, marker_id: str) -> Optional[Marker]:
+        for m in self.markers:
+            if m.id == marker_id:
+                return m
+        return None
+
+    def sorted_markers(self) -> List[Marker]:
+        return sorted(self.markers, key=lambda m: m.time)
+
+    # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -125,6 +174,7 @@ class Project:
             "settings": self.settings.to_dict(),
             "tracks": [t.to_dict() for t in self.tracks],
             "media_pool": [a.to_dict() for a in self.media_pool],
+            "markers": [m.to_dict() for m in self.markers],
         }
 
     @classmethod
@@ -135,6 +185,7 @@ class Project:
         )
         project.tracks = [Track.from_dict(t) for t in data.get("tracks", [])] or project.tracks
         project.media_pool = [MediaAsset.from_dict(a) for a in data.get("media_pool", [])]
+        project.markers = [Marker.from_dict(m) for m in data.get("markers", [])]
         return project
 
     def save(self, path: str) -> None:

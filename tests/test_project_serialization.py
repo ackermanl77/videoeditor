@@ -46,6 +46,31 @@ class ProjectSerializationTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found.id, asset.id)
 
+    def test_markers_round_trip(self):
+        project = Project(name="Marker Test")
+        m1 = project.add_marker(2.5, "Intro")
+        m2 = project.add_marker(10.0)  # auto-named
+        self.assertEqual(m2.name, "Marker 2")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "markers.vproj")
+            project.save(path)
+            loaded = Project.load(path)
+
+        self.assertEqual(len(loaded.markers), 2)
+        loaded_m1 = loaded.find_marker(m1.id)
+        self.assertIsNotNone(loaded_m1)
+        self.assertEqual(loaded_m1.name, "Intro")
+        self.assertAlmostEqual(loaded_m1.time, 2.5)
+        self.assertEqual([m.time for m in loaded.sorted_markers()], [2.5, 10.0])
+
+    def test_remove_marker(self):
+        project = Project()
+        marker = project.add_marker(5.0, "Cut")
+        project.remove_marker(marker.id)
+        self.assertEqual(len(project.markers), 0)
+        self.assertIsNone(project.find_marker(marker.id))
+
 
 if __name__ == "__main__":
     unittest.main()

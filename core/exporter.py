@@ -6,8 +6,9 @@ import glob
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from core.ffmpeg_utils import find_binary, popen
 from core.filter_graph import GraphResult, build_filter_graph
@@ -109,21 +110,32 @@ class Exporter:
         total_duration = max(self.project.total_duration, 0.01)
 
         if ext == GIF_EXTENSION:
-            # No audio track, no CRF/bitrate concept, no two-pass — GIF is a
-            # fundamentally different (palette-based) encode.
+            # No audio track, no CRF/bitrate concept, no two-pass, and no
+            # chapters — GIF is a fundamentally different (palette-based)
+            # encode with no real concept of chapter markers.
             output_path = self._export_gif(settings, graph, total_duration, on_progress)
         else:
             video_codec, audio_codec = CONTAINER_CODECS.get(ext, ("libx264", "aac"))
-            use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
-            if use_two_pass:
-                video_kbps = self._target_video_bitrate_kbps(settings.target_size_mb, total_duration, graph.has_audio)
-                output_path = self._export_two_pass(
-                    settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration, on_progress
-                )
-            else:
-                output_path = self._export_single_pass(
-                    settings, graph, ext, video_codec, audio_codec, total_duration, on_progress
-                )
+            chapters_args, chapters_index, chapters_path = self._build_chapters_args(graph, total_duration)
+            try:
+                use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
+                if use_two_pass:
+                    video_kbps = self._target_video_bitrate_kbps(settings.target_size_mb, total_duration, graph.has_audio)
+                    output_path = self._export_two_pass(
+                        settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration, on_progress,
+                        chapters_args, chapters_index,
+                    )
+                else:
+                    output_path = self._export_single_pass(
+                        settings, graph, ext, video_codec, audio_codec, total_duration, on_progress,
+                        chapters_args, chapters_index,
+                    )
+            finally:
+                if chapters_path is not None:
+                    try:
+                        os.remove(chapters_path)
+                    except OSError:
+                        pass
 
         if on_progress:
             on_progress(1.0, "Done")
@@ -136,14 +148,56 @@ class Exporter:
         audio_kbps = AUDIO_BITRATE_KBPS if has_audio else 0
         return max(MIN_VIDEO_BITRATE_KBPS, int(total_kbps - audio_kbps))
 
-    def _common_args(self, graph: GraphResult) -> List[str]:
+    def _common_args(self, graph: GraphResult, chapters_args: Optional[List[str]] = None) -> List[str]:
         ffmpeg = find_binary("ffmpeg")
         args = [ffmpeg, "-y"]
         for spec in graph.input_specs:
             args += spec.pre_args
             args += ["-i", spec.path]
+        if chapters_args:
+            # The chapters ffmetadata pseudo-input (see _build_chapters_args)
+            # must be declared alongside the real inputs, before
+            # -filter_complex — it has no A/V streams of its own, so it
+            # doesn't shift any [N:v]/[N:a] index the filter graph already
+            # references.
+            args += chapters_args
         args += ["-filter_complex", graph.filter_complex]
         return args
+
+    def _write_chapters_file(self, total_duration: float) -> str:
+        """Write an FFMETADATA chapters file from the project's markers.
+
+        Each marker becomes one chapter spanning from its own time to the
+        next marker's time (or the project's end, for the last one).
+        """
+        lines = [";FFMETADATA1"]
+        markers = self.project.sorted_markers()
+        for i, marker in enumerate(markers):
+            start_ms = int(max(0.0, marker.time) * 1000)
+            end_time = markers[i + 1].time if i + 1 < len(markers) else total_duration
+            end_ms = max(start_ms, int(end_time * 1000))
+            # FFMETADATA is a plain key=value text format — '=', ';', '#',
+            # and a literal backslash are its own escape-worthy metacharacters.
+            title = re.sub(r"([=;#\\])", r"\\\1", marker.name.replace("\n", " ")) or "Chapter"
+            lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start_ms}", f"END={end_ms}", f"title={title}"]
+
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="ve_chapters_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def _build_chapters_args(
+        self, graph: GraphResult, total_duration: float
+    ) -> Tuple[List[str], Optional[int], Optional[str]]:
+        """Returns (extra -i args for the chapters pseudo-input, its input
+        index for -map_metadata, and the temp file path to delete
+        afterward) — ``([], None, None)`` when the project has no markers.
+        """
+        if not self.project.markers:
+            return [], None, None
+        chapters_path = self._write_chapters_file(total_duration)
+        chapters_index = len(graph.input_specs)
+        return ["-f", "ffmetadata", "-i", chapters_path], chapters_index, chapters_path
 
     def _export_single_pass(
         self,
@@ -154,10 +208,12 @@ class Exporter:
         audio_codec: str,
         total_duration: float,
         on_progress: Optional[ProgressCallback],
+        chapters_args: Optional[List[str]] = None,
+        chapters_index: Optional[int] = None,
     ) -> str:
         crf = QUALITY_PRESETS.get(settings.quality_preset, "23")
 
-        args = self._common_args(graph)
+        args = self._common_args(graph, chapters_args)
         args += ["-map", f"[{graph.video_out_label}]"]
         if graph.has_audio:
             args += ["-map", f"[{graph.audio_out_label}]"]
@@ -171,6 +227,8 @@ class Exporter:
         if graph.has_audio:
             args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
 
+        if chapters_index is not None:
+            args += ["-map_metadata", str(chapters_index)]
         args += ["-r", str(settings.fps)]
         args += ["-movflags", "+faststart"] if ext == ".mp4" else []
         args += ["-progress", "pipe:1", "-nostats", settings.output_path]
@@ -224,6 +282,8 @@ class Exporter:
         video_kbps: int,
         total_duration: float,
         on_progress: Optional[ProgressCallback],
+        chapters_args: Optional[List[str]] = None,
+        chapters_index: Optional[int] = None,
     ) -> str:
         passlog_prefix = os.path.join(
             os.path.dirname(os.path.abspath(settings.output_path)) or ".",
@@ -234,6 +294,20 @@ class Exporter:
         try:
             # ---- Pass 1: analyze only, no audio, discard the output ----
             pass1_args = self._common_args(graph)
+            if graph.has_audio:
+                # build_filter_graph() always produces an audio pad (even a
+                # silent anullsrc one when nothing is audible), and pass 1
+                # never maps it (-an, video only) — an unconsumed named
+                # filtergraph output makes FFmpeg refuse to run at all
+                # ("Filter ... has output ... unconnected"). Same class of
+                # bug as GIF export's anullsink fix; anullsink discards it
+                # cleanly here too. (This was a real, pre-existing bug: two-
+                # pass export was broken for every project, not just ones
+                # with markers — caught while separately verifying that
+                # chapter embedding didn't break two-pass, not by a test
+                # aimed at two-pass itself.)
+                filter_index = pass1_args.index("-filter_complex") + 1
+                pass1_args[filter_index] += f";[{graph.audio_out_label}]anullsink"
             pass1_args += ["-map", f"[{graph.video_out_label}]"]
             pass1_args += [
                 "-c:v", video_codec,
@@ -251,7 +325,7 @@ class Exporter:
             )
 
             # ---- Pass 2: real encode at the bitrate computed for the target size ----
-            pass2_args = self._common_args(graph)
+            pass2_args = self._common_args(graph, chapters_args)
             pass2_args += ["-map", f"[{graph.video_out_label}]"]
             if graph.has_audio:
                 pass2_args += ["-map", f"[{graph.audio_out_label}]"]
@@ -260,6 +334,8 @@ class Exporter:
                 pass2_args += ["-preset", "medium", "-pix_fmt", "yuv420p"]
             if graph.has_audio:
                 pass2_args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
+            if chapters_index is not None:
+                pass2_args += ["-map_metadata", str(chapters_index)]
             pass2_args += ["-r", str(settings.fps)]
             pass2_args += ["-movflags", "+faststart"] if ext == ".mp4" else []
             pass2_args += ["-progress", "pipe:1", "-nostats", settings.output_path]

@@ -11,7 +11,9 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -21,10 +23,13 @@ from PySide6.QtWidgets import (
 from core.clip import Clip, MediaType
 from core.commands import (
     AddClipCommand,
+    AddMarkerCommand,
     AddTrackCommand,
     MoveClipCommand,
     RemoveClipCommand,
+    RemoveMarkerCommand,
     RemoveTrackCommand,
+    RenameMarkerCommand,
     SplitClipCommand,
     TrimClipCommand,
     build_ripple_delete_command,
@@ -43,6 +48,7 @@ from ui.widgets.timeline_items import (
     TRACK_HEIGHT,
     ClipItem,
     CornerItem,
+    MarkerItem,
     PlayheadItem,
     RulerItem,
     TimelineSignals,
@@ -163,10 +169,13 @@ class TimelineWidget(QWidget):
             "When on, Delete and Trim also shift every later clip on the same track "
             "to close (or open) the resulting gap, instead of leaving it."
         )
+        self.add_marker_btn = QPushButton("+ Marker")
+        self.add_marker_btn.setToolTip("Add a named marker at the playhead (M)")
 
         for btn in (
             self.add_video_track_btn, self.add_audio_track_btn, self.split_btn,
             self.delete_btn, self.delete_track_btn, self.snap_btn, self.ripple_btn,
+            self.add_marker_btn,
         ):
             toolbar.addWidget(btn)
 
@@ -212,6 +221,7 @@ class TimelineWidget(QWidget):
         self.zoom_slider.valueChanged.connect(self._on_zoom_slider)
         self.snap_btn.toggled.connect(self._on_snap_toggled)
         self.ripple_btn.toggled.connect(self._on_ripple_toggled)
+        self.add_marker_btn.clicked.connect(self.add_marker_at_playhead)
 
         self.view.seek_requested.connect(self.set_playhead)
         self.view.zoom_requested.connect(self._on_zoom_factor)
@@ -225,6 +235,9 @@ class TimelineWidget(QWidget):
         self.signals.track_hidden_toggled.connect(self._on_track_hidden_toggled)
         self.signals.snap_guide_show.connect(self._on_snap_guide_show)
         self.signals.snap_guide_hide.connect(self._on_snap_guide_hide)
+        self.signals.marker_clicked.connect(self._on_marker_clicked)
+        self.signals.marker_rename_requested.connect(self._on_marker_rename_requested)
+        self.signals.marker_delete_requested.connect(self._on_marker_delete_requested)
 
     # ------------------------------------------------------------------
     def set_project(self, project: Project, history: History) -> None:
@@ -287,6 +300,11 @@ class TimelineWidget(QWidget):
 
         self.snap_guide_item = self._make_snap_guide_item(scene_height)
         self.scene.addItem(self.snap_guide_item)
+
+        for marker in self.project.markers:
+            marker_item = MarkerItem(marker.id, marker.time, marker.name, marker.color, scene_height, self.signals)
+            marker_item.setX(HEADER_WIDTH + marker.time * self.pixels_per_second)
+            self.scene.addItem(marker_item)
 
         self._highlight_selection()
         self._pin_header_items()
@@ -371,12 +389,14 @@ class TimelineWidget(QWidget):
     def _snap_targets(self, exclude_clip_id: str) -> List[float]:
         """Timeline positions (seconds) a dragged/trimmed clip should snap to.
 
-        Includes 0:00, the playhead, and every other clip's start/end across
-        all tracks. Returns an empty list when snapping is switched off.
+        Includes 0:00, the playhead, every marker, and every other clip's
+        start/end across all tracks. Returns an empty list when snapping is
+        switched off.
         """
         if not self.snap_enabled or self.project is None:
             return []
         targets = [0.0, self.playhead_time]
+        targets.extend(marker.time for marker in self.project.markers)
         for track in self.project.tracks:
             for clip in track.clips:
                 if clip.id == exclude_clip_id:
@@ -497,6 +517,41 @@ class TimelineWidget(QWidget):
         self._emit_modified()
         self.selection_changed.emit(clip.id)
         return clip.id
+
+    def add_marker_at_playhead(self) -> None:
+        if self.project is None or self.history is None:
+            return
+        default_name = f"Marker {len(self.project.markers) + 1}"
+        name, ok = QInputDialog.getText(self, "Add Marker", "Marker name:", QLineEdit.Normal, default_name)
+        if not ok:
+            return
+        self.history.execute(AddMarkerCommand(self.project, self.playhead_time, name.strip() or default_name))
+        self.rebuild()
+        self._emit_modified()
+
+    def _on_marker_clicked(self, marker_id: str) -> None:
+        if self.project is None:
+            return
+        marker = self.project.find_marker(marker_id)
+        if marker is not None:
+            self.set_playhead(marker.time)
+
+    def _on_marker_rename_requested(self, marker_id: str, current_name: str) -> None:
+        if self.project is None or self.history is None:
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Marker", "Marker name:", QLineEdit.Normal, current_name)
+        if not ok or not new_name.strip() or new_name.strip() == current_name:
+            return
+        self.history.execute(RenameMarkerCommand(self.project, marker_id, new_name.strip()))
+        self.rebuild()
+        self._emit_modified()
+
+    def _on_marker_delete_requested(self, marker_id: str) -> None:
+        if self.project is None or self.history is None:
+            return
+        self.history.execute(RemoveMarkerCommand(self.project, marker_id))
+        self.rebuild()
+        self._emit_modified()
 
     def add_track(self, track_type: TrackType) -> None:
         if self.project is None or self.history is None:
@@ -627,5 +682,7 @@ class TimelineWidget(QWidget):
             self.delete_selected()
         elif event.key() == Qt.Key_S and not (event.modifiers() & Qt.ControlModifier):
             self.split_selected()
+        elif event.key() == Qt.Key_M and not (event.modifiers() & Qt.ControlModifier):
+            self.add_marker_at_playhead()
         else:
             super().keyPressEvent(event)

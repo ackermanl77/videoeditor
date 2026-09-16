@@ -18,6 +18,9 @@ deliberately layered and documented so it is easy to read, test and extend.
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
   later same-track clips to close (or open) the gap
+- **Markers/chapters**: bookmark points on the timeline, click to seek,
+  snap clips to them, and have them embedded as real player-navigable
+  chapters on export
 - **Preview player** synced to the timeline playhead (play/pause/seek)
 - **Clip properties**: volume, mute, playback speed, opacity, fade in/out
   (video and audio both)
@@ -179,6 +182,7 @@ cross-compile (build on Windows for a `.exe`, on macOS for a macOS app).
 | Split clip at playhead            | S |
 | Delete selected clip                | Delete |
 | Add text clip                         | T |
+| Add marker at playhead                   | M |
 | Zoom timeline in / out                   | Ctrl+= / Ctrl+- (or Ctrl+scroll) |
 
 ## How editing works
