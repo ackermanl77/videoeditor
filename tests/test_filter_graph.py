@@ -9,7 +9,7 @@ media files. They protect against regressions in the graph-building logic
 import math
 import unittest
 
-from core.clip import Clip, MediaType, TextStyle, TransitionType
+from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
 from core.filter_graph import _escape_text, build_filter_graph
 from core.media_asset import MediaAsset
 from core.project import Project, ProjectSettings
@@ -487,6 +487,126 @@ class AudioFadeTests(unittest.TestCase):
         graph = build_filter_graph(project, ProjectSettings())
         self.assertIn("afade=t=in:st=0:d=1.000", graph.filter_complex)
         self.assertIn("fade=t=in:st=0:d=1.000:alpha=1", graph.filter_complex)
+
+
+class ReframeTests(unittest.TestCase):
+    def test_fit_is_the_default_and_unchanged(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings(width=1080, height=1920))
+        self.assertIn("force_original_aspect_ratio=decrease", graph.filter_complex)
+        self.assertNotIn("force_original_aspect_ratio=increase", graph.filter_complex)
+        self.assertNotIn("crop=", graph.filter_complex)
+
+    def test_fill_mode_crops_instead_of_padding(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                reframe_mode=ReframeMode.FILL, crop_focus_x=0.25, crop_focus_y=0.75,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings(width=1080, height=1920))
+        self.assertIn("force_original_aspect_ratio=increase", graph.filter_complex)
+        self.assertNotIn("force_original_aspect_ratio=decrease", graph.filter_complex)
+        self.assertNotIn("pad=1080:1920", graph.filter_complex)
+        self.assertIn("crop=1080:1920:'(iw-1080)*0.2500':'(ih-1920)*0.7500'", graph.filter_complex)
+
+    def test_transform_scale_and_rotation_are_skipped_in_fill_mode(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                reframe_mode=ReframeMode.FILL, transform_scale=0.5, transform_rotation=45.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("scale=iw*", graph.filter_complex)
+        self.assertNotIn("rotate=", graph.filter_complex)
+
+    def test_transform_position_is_centered_in_fill_mode(self):
+        # The cropped frame already exactly fills the canvas, so Transform's
+        # position (transform_x/y) is a documented no-op in FILL mode.
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0,
+                reframe_mode=ReframeMode.FILL, transform_x=0.1, transform_y=0.9,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("overlay=x='(main_w*(0.5))-(w/2)':y='(main_h*(0.5))-(h/2)'", graph.filter_complex)
+
+    def test_reframe_override_forces_fill_without_mutating_the_clip(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        clip = Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        track.clips.append(clip)
+
+        graph = build_filter_graph(project, ProjectSettings(width=1080, height=1920), reframe_override=ReframeMode.FILL)
+        self.assertIn("force_original_aspect_ratio=increase", graph.filter_complex)
+        # The override only affects this export's graph — the original
+        # project's clip must still report its own stored FIT setting.
+        self.assertEqual(clip.reframe_mode, ReframeMode.FIT)
+
+    def test_reframe_override_does_not_affect_audio_only_clips(self):
+        project = Project()
+        audio_track = [t for t in project.tracks if t.track_type == TrackType.AUDIO][0]
+        audio_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8, timeline_start=0)
+        )
+        # Should not raise even though AUDIO clips have no reframe_mode use.
+        graph = build_filter_graph(project, ProjectSettings(), reframe_override=ReframeMode.FILL)
+        self.assertIn("amix=inputs=1", graph.filter_complex)
+
+
+class TrimRangeTests(unittest.TestCase):
+    def test_no_trim_range_leaves_output_labels_unwrapped(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("trim=start=", graph.filter_complex)
+        self.assertNotIn("atrim=start=", graph.filter_complex)
+
+    def test_trim_range_wraps_video_and_audio_output(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings(), trim_range=(2.0, 7.0))
+        self.assertIn(
+            f"[{'comp0'}]trim=start=2.000:end=7.000,setpts=PTS-STARTPTS[trimout_v]", graph.filter_complex
+        )
+        self.assertIn("atrim=start=2.000:end=7.000,asetpts=PTS-STARTPTS[trimout_a]", graph.filter_complex)
+        self.assertEqual(graph.video_out_label, "trimout_v")
+        self.assertEqual(graph.audio_out_label, "trimout_a")
+
+    def test_trim_end_none_defaults_to_project_duration(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings(), trim_range=(1.0, None))
+        self.assertIn("trim=start=1.000:end=10.000,setpts=PTS-STARTPTS[trimout_v]", graph.filter_complex)
 
 
 if __name__ == "__main__":

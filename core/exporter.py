@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
+from core.clip import ReframeMode
 from core.ffmpeg_utils import find_binary, popen
 from core.filter_graph import GraphResult, build_filter_graph
 from core.project import Project, ProjectSettings
@@ -56,6 +57,15 @@ class ExportSettings:
     # the export falls back to the normal single-pass CRF encode.
     two_pass: bool = False
     target_size_mb: Optional[float] = None
+    # Shorts/vertical export support. `reframe_override`, when set, forces
+    # every video/image clip's reframe mode for this export only (see
+    # core.filter_graph._project_with_reframe_override) instead of requiring
+    # each clip's own Fill Frame setting to be turned on individually.
+    # `trim_start`/`trim_end` cut the rendered output down to that range
+    # (`trim_end=None` means "to the end") — used for the ≤60s duration cap.
+    reframe_override: Optional[ReframeMode] = None
+    trim_start: float = 0.0
+    trim_end: Optional[float] = None
 
 
 class ExportError(RuntimeError):
@@ -104,10 +114,21 @@ class Exporter:
             fps=settings.fps,
             sample_rate=self.project.settings.sample_rate,
         )
-        graph = build_filter_graph(self.project, project_settings)
+        full_duration = max(self.project.total_duration, 0.01)
+        trim_start = max(0.0, settings.trim_start)
+        trim_end = full_duration if settings.trim_end is None else min(settings.trim_end, full_duration)
+        is_trimmed = trim_start > 0.0 or trim_end < full_duration
+        trim_range = (trim_start, trim_end) if is_trimmed else None
+
+        graph = build_filter_graph(
+            self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range
+        )
 
         ext = os.path.splitext(settings.output_path)[1].lower()
-        total_duration = max(self.project.total_duration, 0.01)
+        # The output's actual rendered length — used for FFmpeg progress
+        # fraction, distinct from `full_duration` (the untrimmed project
+        # length chapters are anchored against).
+        total_duration = max(trim_end - trim_start, 0.01) if is_trimmed else full_duration
 
         if ext == GIF_EXTENSION:
             # No audio track, no CRF/bitrate concept, no two-pass, and no
@@ -116,7 +137,9 @@ class Exporter:
             output_path = self._export_gif(settings, graph, total_duration, on_progress)
         else:
             video_codec, audio_codec = CONTAINER_CODECS.get(ext, ("libx264", "aac"))
-            chapters_args, chapters_index, chapters_path = self._build_chapters_args(graph, total_duration)
+            chapters_args, chapters_index, chapters_path = self._build_chapters_args(
+                graph, full_duration, trim_start, trim_end if is_trimmed else None
+            )
             try:
                 use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
                 if use_two_pass:
@@ -164,18 +187,31 @@ class Exporter:
         args += ["-filter_complex", graph.filter_complex]
         return args
 
-    def _write_chapters_file(self, total_duration: float) -> str:
+    def _write_chapters_file(
+        self, total_duration: float, trim_start: float = 0.0, trim_end: Optional[float] = None
+    ) -> str:
         """Write an FFMETADATA chapters file from the project's markers.
 
         Each marker becomes one chapter spanning from its own time to the
-        next marker's time (or the project's end, for the last one).
+        next marker's time (or the project's end, for the last one). Marker
+        times are in the untrimmed project's own timeline; when
+        ``trim_start``/``trim_end`` narrow the actual rendered output (e.g.
+        the Shorts duration cap), each chapter is clipped to that range and
+        re-anchored to it (so a chapter starting before the trim point
+        starts at 0 in the output, not at a negative time), and any chapter
+        that falls entirely outside the range is dropped.
         """
         lines = [";FFMETADATA1"]
         markers = self.project.sorted_markers()
+        effective_end = total_duration if trim_end is None else trim_end
         for i, marker in enumerate(markers):
-            start_ms = int(max(0.0, marker.time) * 1000)
-            end_time = markers[i + 1].time if i + 1 < len(markers) else total_duration
-            end_ms = max(start_ms, int(end_time * 1000))
+            marker_end = markers[i + 1].time if i + 1 < len(markers) else effective_end
+            seg_start = max(marker.time, trim_start)
+            seg_end = min(marker_end, effective_end)
+            if seg_end <= seg_start:
+                continue
+            start_ms = int((seg_start - trim_start) * 1000)
+            end_ms = max(start_ms, int((seg_end - trim_start) * 1000))
             # FFMETADATA is a plain key=value text format — '=', ';', '#',
             # and a literal backslash are its own escape-worthy metacharacters.
             title = re.sub(r"([=;#\\])", r"\\\1", marker.name.replace("\n", " ")) or "Chapter"
@@ -187,7 +223,7 @@ class Exporter:
         return path
 
     def _build_chapters_args(
-        self, graph: GraphResult, total_duration: float
+        self, graph: GraphResult, total_duration: float, trim_start: float = 0.0, trim_end: Optional[float] = None
     ) -> Tuple[List[str], Optional[int], Optional[str]]:
         """Returns (extra -i args for the chapters pseudo-input, its input
         index for -map_metadata, and the temp file path to delete
@@ -195,7 +231,7 @@ class Exporter:
         """
         if not self.project.markers:
             return [], None, None
-        chapters_path = self._write_chapters_file(total_duration)
+        chapters_path = self._write_chapters_file(total_duration, trim_start, trim_end)
         chapters_index = len(graph.input_specs)
         return ["-f", "ffmetadata", "-i", chapters_path], chapters_index, chapters_path
 

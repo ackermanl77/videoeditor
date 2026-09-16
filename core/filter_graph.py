@@ -16,11 +16,12 @@ easy to extend with new effects later.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from core.clip import Clip, MediaType, TransitionType
+from core.clip import Clip, MediaType, ReframeMode, TransitionType
 from core.project import Project, ProjectSettings
 from core.track import TrackType
 
@@ -29,6 +30,21 @@ from core.track import TrackType
 MIN_CROSSFADE_SECONDS = 0.05
 
 _NEUTRAL_COLOR = (0.0, 1.0, 1.0, 1.0)  # brightness, contrast, saturation, gamma
+
+
+def _project_with_reframe_override(project: Project, mode: ReframeMode) -> Project:
+    """Return a deep copy of ``project`` with every video/image clip forced to ``mode``.
+
+    Used for a one-off export-wide reframe override (e.g. a Shorts/vertical
+    preset's "auto-fill vertical frame" option) without persisting the
+    change to any clip's own stored ``reframe_mode``.
+    """
+    cloned = copy.deepcopy(project)
+    for track in cloned.tracks:
+        for clip in track.clips:
+            if clip.media_type in (MediaType.VIDEO, MediaType.IMAGE):
+                clip.reframe_mode = mode
+    return cloned
 
 
 def _clip_has_audio(project: Project, clip: Clip, probe_cache: Dict[str, bool]) -> bool:
@@ -104,7 +120,14 @@ def _position_expr(clip: Clip) -> Tuple[str, str]:
     there is project time, not the clip-local time keyframes are specified
     in; ``(t-timeline_start)`` converts back to clip-local time.
 
+    In FILL reframe mode, Transform's position (static or keyframed) is
+    ignored — the cropped frame already exactly covers the canvas, so
+    positioning it anywhere but centered would just clip parts of an
+    already-full frame. Centered (0.5, 0.5) is the correct, only sensible
+    placement there.
     """
+    if clip.reframe_mode == ReframeMode.FILL:
+        return "0.5", "0.5"
     if len(clip.position_keyframes) < 2:
         return f"{clip.transform_x:.4f}", f"{clip.transform_y:.4f}"
     t_local = f"(t-{clip.timeline_start:.6f})"
@@ -191,13 +214,28 @@ def _build_video_clip_chain(
     if abs(speed - 1.0) > 1e-6:
         chain += f",setpts=PTS/{speed:.6f}"
 
-    # Fit inside the canvas preserving aspect ratio. format=yuva420p happens
-    # here (rather than after pad, as before) so alpha exists for every step
-    # that follows, including the now-conditional pad and Transform's rotate.
-    chain += f",scale={width}:{height}:force_original_aspect_ratio=decrease,format=yuva420p"
-
-    if not apply_transform:
-        chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    # format=yuva420p happens right after the fit/fill step (rather than
+    # after pad, as originally) so alpha exists for every step that
+    # follows, including the now-conditional pad and Transform's rotate.
+    if clip.reframe_mode == ReframeMode.FILL:
+        # Scale to fully COVER the canvas (the opposite of "decrease" below)
+        # and crop the overflow, centered on the clip's crop focus point —
+        # fills a differently-shaped canvas (e.g. 16:9 source into a 9:16
+        # vertical export) with no letterboxing. The cropped frame is
+        # already exactly canvas-sized, so no pad step is needed either way
+        # (`apply_transform` doesn't affect this branch at all) — see
+        # docs/workflows/shorts-export/workflow.md.
+        chain += (
+            f",scale={width}:{height}:force_original_aspect_ratio=increase,format=yuva420p"
+            f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
+            f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
+        )
+    else:
+        # Fit entirely inside the canvas preserving aspect ratio (may leave
+        # black bars, filled in below when this clip isn't Transform-positioned).
+        chain += f",scale={width}:{height}:force_original_aspect_ratio=decrease,format=yuva420p"
+        if not apply_transform:
+            chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
 
     if clip.chroma_key_enabled:
         key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
@@ -209,7 +247,7 @@ def _build_video_clip_chain(
             f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
         )
 
-    if apply_transform:
+    if apply_transform and clip.reframe_mode != ReframeMode.FILL:
         if abs(clip.transform_scale - 1.0) > 1e-6:
             chain += f",scale=iw*{clip.transform_scale:.4f}:ih*{clip.transform_scale:.4f}"
         if abs(clip.transform_rotation) > 1e-6:
@@ -290,11 +328,18 @@ def _build_speed_ramp_video_chain(
         seg_chain = f"[{idx}:v]trim=duration={(seg_out - seg_in):.3f},setpts=PTS-STARTPTS"
         if abs(seg_speed - 1.0) > 1e-6:
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
-        seg_chain += (
-            f",scale={width}:{height}:force_original_aspect_ratio=decrease"
-            f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-            ",format=yuva420p"
-        )
+        if clip.reframe_mode == ReframeMode.FILL:
+            seg_chain += (
+                f",scale={width}:{height}:force_original_aspect_ratio=increase,format=yuva420p"
+                f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
+                f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
+            )
+        else:
+            seg_chain += (
+                f",scale={width}:{height}:force_original_aspect_ratio=decrease"
+                f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+                ",format=yuva420p"
+            )
         if clip.chroma_key_enabled:
             key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
             seg_chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
@@ -415,8 +460,25 @@ def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
     return i + 1
 
 
-def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResult:
-    """Construct the full FFmpeg input list + filter graph for ``project``."""
+def build_filter_graph(
+    project: Project,
+    settings: ProjectSettings,
+    reframe_override: Optional[ReframeMode] = None,
+    trim_range: Optional[Tuple[float, Optional[float]]] = None,
+) -> GraphResult:
+    """Construct the full FFmpeg input list + filter graph for ``project``.
+
+    ``reframe_override``, when given, forces every video/image clip's
+    reframe mode for this export only (see ``_project_with_reframe_override``)
+    — used by the "auto-fill vertical frame" Shorts option so it doesn't have
+    to be set per-clip. ``trim_range`` (start, end), when given, cuts the
+    final composited output down to that range (end defaults to the
+    project's total duration when ``None``) — used for the Shorts duration
+    cap and general export-range trimming.
+    """
+
+    if reframe_override is not None:
+        project = _project_with_reframe_override(project, reframe_override)
 
     duration = max(project.total_duration, 0.1)
     width, height, fps = settings.width, settings.height, settings.fps
@@ -612,6 +674,24 @@ def build_filter_graph(project: Project, settings: ProjectSettings) -> GraphResu
         filter_lines.append(f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration:.3f}[aout]")
         audio_out_label = "aout"
         has_audio = True  # we always emit a (possibly silent) audio track
+
+    if trim_range is not None:
+        trim_start, trim_end = trim_range
+        trim_start = max(0.0, trim_start)
+        trim_end = duration if trim_end is None else min(trim_end, duration)
+        if trim_end > trim_start:
+            trimmed_video = "trimout_v"
+            trimmed_audio = "trimout_a"
+            filter_lines.append(
+                f"[{video_out_label}]trim=start={trim_start:.3f}:end={trim_end:.3f},"
+                f"setpts=PTS-STARTPTS[{trimmed_video}]"
+            )
+            filter_lines.append(
+                f"[{audio_out_label}]atrim=start={trim_start:.3f}:end={trim_end:.3f},"
+                f"asetpts=PTS-STARTPTS[{trimmed_audio}]"
+            )
+            video_out_label = trimmed_video
+            audio_out_label = trimmed_audio
 
     filter_complex = ";".join(filter_lines)
 

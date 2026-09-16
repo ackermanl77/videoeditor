@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.clip import Clip, MediaType, TextStyle, TransitionType
+from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
 from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand
 from core.history import History
 from core.project import Project
@@ -178,6 +178,23 @@ class PropertiesPanel(QWidget):
         transform_form.addRow("", reset_transform_btn)
 
         layout.addWidget(self.transform_group)
+
+        # ---- Reframe group (video/image only) ----
+        self.reframe_group = QGroupBox("Reframe (Vertical / Shorts)")
+        reframe_form = QFormLayout(self.reframe_group)
+
+        self.fill_frame_checkbox = QCheckBox("Fill Frame (crop instead of letterbox)")
+        reframe_form.addRow("", self.fill_frame_checkbox)
+
+        self.crop_focus_x_slider = QSlider(Qt.Horizontal)
+        self.crop_focus_x_slider.setRange(0, 100)
+        reframe_form.addRow("Crop Focus X", self.crop_focus_x_slider)
+
+        self.crop_focus_y_slider = QSlider(Qt.Horizontal)
+        self.crop_focus_y_slider.setRange(0, 100)
+        reframe_form.addRow("Crop Focus Y", self.crop_focus_y_slider)
+
+        layout.addWidget(self.reframe_group)
 
         # ---- Keyframes group (video/image only) ----
         self.keyframes_group = QGroupBox("Keyframes")
@@ -373,6 +390,16 @@ class PropertiesPanel(QWidget):
         self.transform_rotation_slider.valueChanged.connect(lambda v: self._apply_live("transform_rotation", float(v)))
         self.transform_rotation_slider.sliderReleased.connect(lambda: self._commit("transform_rotation", float(self.transform_rotation_slider.value()), "Edit Transform Rotation"))
 
+        self.fill_frame_checkbox.toggled.connect(self._toggle_fill_frame)
+
+        self.crop_focus_x_slider.sliderPressed.connect(lambda: self._remember("crop_focus_x", self.crop_focus_x_slider.value() / 100.0))
+        self.crop_focus_x_slider.valueChanged.connect(lambda v: self._apply_live("crop_focus_x", v / 100.0))
+        self.crop_focus_x_slider.sliderReleased.connect(lambda: self._commit("crop_focus_x", self.crop_focus_x_slider.value() / 100.0, "Edit Crop Focus"))
+
+        self.crop_focus_y_slider.sliderPressed.connect(lambda: self._remember("crop_focus_y", self.crop_focus_y_slider.value() / 100.0))
+        self.crop_focus_y_slider.valueChanged.connect(lambda v: self._apply_live("crop_focus_y", v / 100.0))
+        self.crop_focus_y_slider.sliderReleased.connect(lambda: self._commit("crop_focus_y", self.crop_focus_y_slider.value() / 100.0, "Edit Crop Focus"))
+
         self.crossfade_checkbox.toggled.connect(self._on_crossfade_toggled)
         self.transition_duration_spin.editingFinished.connect(
             lambda: self._commit_now("transition_duration", self.transition_duration_spin.value(), "Edit Transition Duration")
@@ -434,6 +461,7 @@ class PropertiesPanel(QWidget):
         self.name_label.setVisible(False)
         self.clip_group.setVisible(False)
         self.transform_group.setVisible(False)
+        self.reframe_group.setVisible(False)
         self.keyframes_group.setVisible(False)
         self.transition_group.setVisible(False)
         self.color_group.setVisible(False)
@@ -461,6 +489,7 @@ class PropertiesPanel(QWidget):
         self.text_group.setVisible(is_text)
         self.clip_group.setVisible(not is_text)
         self.transform_group.setVisible(is_visual)
+        self.reframe_group.setVisible(is_visual)
         self.keyframes_group.setVisible(is_visual)
         self.transition_group.setVisible(is_visual)
         self.color_group.setVisible(is_visual)
@@ -478,6 +507,13 @@ class PropertiesPanel(QWidget):
             self.transform_y_slider.setValue(int(clip.transform_y * 100))
             self.transform_scale_slider.setValue(int(clip.transform_scale * 100))
             self.transform_rotation_slider.setValue(int(clip.transform_rotation))
+
+            is_fill = clip.reframe_mode == ReframeMode.FILL
+            self.fill_frame_checkbox.setChecked(is_fill)
+            self.crop_focus_x_slider.setValue(int(clip.crop_focus_x * 100))
+            self.crop_focus_y_slider.setValue(int(clip.crop_focus_y * 100))
+            self.crop_focus_x_slider.setEnabled(is_fill)
+            self.crop_focus_y_slider.setEnabled(is_fill)
 
             self._refresh_opacity_keyframe_table(clip.opacity_keyframes)
             self._refresh_position_keyframe_table(clip.position_keyframes)
@@ -549,6 +585,12 @@ class PropertiesPanel(QWidget):
             return
         self.history.execute(UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label))
         self.project_modified.emit()
+
+    def _toggle_fill_frame(self, checked: bool) -> None:
+        mode = ReframeMode.FILL if checked else ReframeMode.FIT
+        self._commit_now("reframe_mode", mode, "Toggle Fill Frame")
+        self.crop_focus_x_slider.setEnabled(checked)
+        self.crop_focus_y_slider.setEnabled(checked)
 
     def _reset_transform(self) -> None:
         for attribute, value, slider in (

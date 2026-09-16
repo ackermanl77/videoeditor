@@ -22,6 +22,7 @@ These guides document current application behavior, the code paths behind each f
 ## Export
 
 - [Export](export/workflow.md)
+- [Shorts / vertical video export](shorts-export/workflow.md)
 
 ## Projects
 

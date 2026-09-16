@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.clip import ReframeMode
 from core.exporter import ExportCancelled, ExportError, ExportSettings, Exporter, QUALITY_PRESETS
 from core.project import Project
 
@@ -32,12 +33,25 @@ RESOLUTION_PRESETS = {
     "1920 x 1080 (Full HD)": (1920, 1080),
     "1280 x 720 (HD)": (1280, 720),
     "854 x 480 (SD)": (854, 480),
+    "1080 x 1920 (Vertical, 9:16)": (1080, 1920),
     "Custom": None,
 }
 
 FPS_OPTIONS = ["24", "25", "30", "50", "60"]
 CONTAINER_OPTIONS = [".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".gif"]
 GIF_EXTENSION = ".gif"
+
+VERTICAL_RESOLUTION_PRESET = "1080 x 1920 (Vertical, 9:16)"
+SHORTS_PLATFORM_NONE = "None (custom settings)"
+# Approximate, adjustable defaults for each platform's short-form vertical
+# video slot — not a legal or contractual limit, just a sensible starting
+# point the user can override via Trim Range. None means "no automatic cap".
+PLATFORM_DURATION_CAPS = {
+    "YouTube Shorts": 60.0,
+    "TikTok": None,
+    "Instagram Reels": 90.0,
+}
+SHORTS_PLATFORM_OPTIONS = [SHORTS_PLATFORM_NONE] + list(PLATFORM_DURATION_CAPS.keys())
 
 
 class ExportWorker(QObject):
@@ -145,6 +159,40 @@ class ExportDialog(QDialog):
         self.gif_note_label.setVisible(False)
         form.addRow("", self.gif_note_label)
 
+        # ---- Shorts / vertical video ----
+        self.platform_combo = QComboBox()
+        self.platform_combo.addItems(SHORTS_PLATFORM_OPTIONS)
+        self.platform_combo.currentTextChanged.connect(self._on_platform_changed)
+        form.addRow("Shorts Platform", self.platform_combo)
+
+        self.autofill_checkbox = QCheckBox("Auto-fill vertical frame (crop instead of letterbox)")
+        form.addRow("", self.autofill_checkbox)
+
+        trim_row = QHBoxLayout()
+        self.trim_checkbox = QCheckBox("Limit duration")
+        self.trim_checkbox.toggled.connect(self._on_trim_toggled)
+        self.trim_start_spin = QDoubleSpinBox()
+        self.trim_start_spin.setRange(0.0, 36000.0)
+        self.trim_start_spin.setSuffix(" s")
+        self.trim_start_spin.setEnabled(False)
+        self.trim_end_spin = QDoubleSpinBox()
+        self.trim_end_spin.setRange(0.1, 36000.0)
+        self.trim_end_spin.setSuffix(" s")
+        self.trim_end_spin.setValue(max(self.project.total_duration, 0.1))
+        self.trim_end_spin.setEnabled(False)
+        trim_row.addWidget(self.trim_checkbox)
+        trim_row.addWidget(QLabel("Start"))
+        trim_row.addWidget(self.trim_start_spin)
+        trim_row.addWidget(QLabel("End"))
+        trim_row.addWidget(self.trim_end_spin)
+        form.addRow("Trim Range", trim_row)
+
+        self.shorts_note_label = QLabel("")
+        self.shorts_note_label.setWordWrap(True)
+        self.shorts_note_label.setStyleSheet("color: #9aa1ad; font-size: 11px;")
+        self.shorts_note_label.setVisible(False)
+        form.addRow("", self.shorts_note_label)
+
         layout.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -190,6 +238,40 @@ class ExportDialog(QDialog):
             self.width_spin.setValue(preset[0])
             self.height_spin.setValue(preset[1])
 
+    def _on_trim_toggled(self, checked: bool) -> None:
+        self.trim_start_spin.setEnabled(checked)
+        self.trim_end_spin.setEnabled(checked)
+
+    def _on_platform_changed(self, text: str) -> None:
+        if text == SHORTS_PLATFORM_NONE:
+            self.shorts_note_label.setVisible(False)
+            return
+
+        self.resolution_combo.setCurrentText(VERTICAL_RESOLUTION_PRESET)
+        self.fps_combo.setCurrentText("30")
+        self.autofill_checkbox.setChecked(True)
+
+        cap = PLATFORM_DURATION_CAPS.get(text)
+        if cap is not None:
+            # Enforce the cap by clamping the End spinbox's own range, so a
+            # manual edit afterward can't exceed it while this platform is
+            # still selected — not just a one-time default value.
+            self.trim_end_spin.setMaximum(cap)
+            self.trim_checkbox.setChecked(True)
+            self.trim_start_spin.setValue(0.0)
+            self.trim_end_spin.setValue(min(cap, max(self.project.total_duration, 0.1)))
+            self.shorts_note_label.setText(
+                f"{text} preset applied: 1080x1920 vertical, auto-fill crop, capped at {cap:.0f}s "
+                "(adjust Trim Range End down if you want it shorter)."
+            )
+        else:
+            self.trim_end_spin.setMaximum(36000.0)
+            self.shorts_note_label.setText(
+                f"{text} preset applied: 1080x1920 vertical, auto-fill crop. No automatic duration cap "
+                "— use Trim Range to limit it yourself."
+            )
+        self.shorts_note_label.setVisible(True)
+
     def _browse(self) -> None:
         ext = self.container_combo.currentText()
         path, _ = QFileDialog.getSaveFileName(self, "Export Video", self.path_edit.text(), f"Video (*{ext})")
@@ -217,6 +299,11 @@ class ExportDialog(QDialog):
             if result != QMessageBox.Yes:
                 return
 
+        trim_enabled = self.trim_checkbox.isChecked()
+        if trim_enabled and self.trim_start_spin.value() >= self.trim_end_spin.value():
+            QMessageBox.warning(self, "Export Video", "Trim Range Start must be less than End.")
+            return
+
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         settings = ExportSettings(
@@ -227,6 +314,9 @@ class ExportDialog(QDialog):
             quality_preset=self.quality_combo.currentText(),
             two_pass=self.two_pass_checkbox.isChecked(),
             target_size_mb=self.target_size_spin.value() if self.two_pass_checkbox.isChecked() else None,
+            reframe_override=ReframeMode.FILL if self.autofill_checkbox.isChecked() else None,
+            trim_start=self.trim_start_spin.value() if trim_enabled else 0.0,
+            trim_end=self.trim_end_spin.value() if trim_enabled else None,
         )
 
         self.export_btn.setEnabled(False)

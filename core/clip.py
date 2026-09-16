@@ -30,6 +30,18 @@ class TransitionType(str, Enum):
     CROSSFADE = "crossfade"
 
 
+class ReframeMode(str, Enum):
+    """How a clip's frame is fit into a canvas of a different aspect ratio."""
+
+    #: Scale to fit entirely inside the canvas, letterboxing with black —
+    #: the long-standing default behavior.
+    FIT = "fit"
+    #: Scale to fully cover the canvas and crop the excess, centered on
+    #: (crop_focus_x, crop_focus_y) — for reframing e.g. 16:9 source into a
+    #: 9:16 vertical export without black bars.
+    FILL = "fill"
+
+
 @dataclass
 class TextStyle:
     """Styling options for a text overlay clip."""
@@ -144,6 +156,19 @@ class Clip:
     # and don't yet get a segmented render of their own. See
     # docs/workflows/speed-ramps/workflow.md for both of these scope calls.
     speed_keyframes: List[Tuple[float, float]] = field(default_factory=list)  # (source_time, speed)
+
+    # Reframe (video/image clips only) — how this clip fits a canvas whose
+    # aspect ratio differs from its own, e.g. cropping 16:9 source to fill a
+    # 9:16 vertical export instead of letterboxing it. crop_focus_x/y (0..1)
+    # only matter in FILL mode: which part of the now-overflowing frame to
+    # keep, same 0=left/top, 1=right/bottom, 0.5=center convention as
+    # Transform's position. FILL mode supersedes Transform's scale/rotation
+    # /position entirely for this clip (the frame already exactly fills the
+    # canvas after cropping, so there's nothing left for Transform to do) —
+    # see docs/workflows/shorts-export/workflow.md.
+    reframe_mode: ReframeMode = ReframeMode.FIT
+    crop_focus_x: float = 0.5
+    crop_focus_y: float = 0.5
 
     # Text overlay data (only used when media_type == TEXT)
     text_style: Optional[TextStyle] = None
@@ -262,6 +287,9 @@ class Clip:
             "opacity_keyframes": [list(kf) for kf in self.opacity_keyframes],
             "position_keyframes": [list(kf) for kf in self.position_keyframes],
             "speed_keyframes": [list(kf) for kf in self.speed_keyframes],
+            "reframe_mode": self.reframe_mode.value,
+            "crop_focus_x": self.crop_focus_x,
+            "crop_focus_y": self.crop_focus_y,
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
         }
@@ -302,6 +330,9 @@ class Clip:
             opacity_keyframes=[tuple(kf) for kf in data.get("opacity_keyframes", [])],
             position_keyframes=[tuple(kf) for kf in data.get("position_keyframes", [])],
             speed_keyframes=[tuple(kf) for kf in data.get("speed_keyframes", [])],
+            reframe_mode=ReframeMode(data.get("reframe_mode", "fit")),
+            crop_focus_x=data.get("crop_focus_x", 0.5),
+            crop_focus_y=data.get("crop_focus_y", 0.5),
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
         )

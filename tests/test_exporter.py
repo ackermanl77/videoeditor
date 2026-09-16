@@ -15,7 +15,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from core.clip import Clip, MediaType
+from core.clip import Clip, MediaType, ReframeMode
 from core.exporter import ExportSettings, Exporter
 from core.media_asset import MediaAsset
 from core.project import Project
@@ -70,6 +70,48 @@ class ChaptersFileTests(unittest.TestCase):
         # Every FFMETADATA metacharacter must be backslash-escaped so the
         # rest of the name doesn't get parsed as a new key/comment.
         self.assertIn("title=Weird\\=Name\\;\\#test\\\\end", content)
+
+    def test_trim_range_shifts_and_clips_chapters(self):
+        # A Shorts export trimming the output to [3, 8) should re-anchor
+        # chapter times to that window (0-based in the trimmed output), not
+        # the untrimmed project's own timeline.
+        project = Project()
+        project.add_marker(0.0, "Intro")
+        project.add_marker(4.0, "Middle")
+        project.add_marker(9.0, "Outro")
+        exporter = Exporter(project)
+
+        path = exporter._write_chapters_file(total_duration=12.0, trim_start=3.0, trim_end=8.0)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        finally:
+            os.remove(path)
+
+        # "Intro" (0-4) overlaps [3, 8) as [3, 4) -> re-anchored to [0, 1000ms).
+        self.assertIn("title=Intro", content)
+        self.assertIn("START=0\nEND=1000", content)
+        # "Middle" (4-9) overlaps [3, 8) as [4, 8) -> re-anchored to [1000, 5000ms).
+        self.assertIn("title=Middle", content)
+        self.assertIn("START=1000\nEND=5000", content)
+        # "Outro" starts at 9, entirely after the trim window -> dropped.
+        self.assertNotIn("title=Outro", content)
+
+    def test_chapter_entirely_before_trim_range_is_dropped(self):
+        project = Project()
+        project.add_marker(0.0, "TooEarly")  # spans (0, 2) -- entirely before the trim start
+        project.add_marker(2.0, "Kept")
+        exporter = Exporter(project)
+
+        path = exporter._write_chapters_file(total_duration=10.0, trim_start=4.0, trim_end=10.0)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        finally:
+            os.remove(path)
+
+        self.assertNotIn("TooEarly", content)
+        self.assertIn("title=Kept", content)
 
     def test_build_chapters_args_uses_the_next_available_input_index(self):
         project = Project()
@@ -153,6 +195,45 @@ class TwoPassArgsTests(unittest.TestCase):
         filter_index = pass1_args.index("-filter_complex") + 1
         self.assertIn("anullsink", pass1_args[filter_index])
         self.assertIn("-an", pass1_args)
+
+
+class ShortsExportSettingsTests(unittest.TestCase):
+    """ExportSettings.reframe_override/trim_start/trim_end must actually
+    reach build_filter_graph() and shape the real FFmpeg command line, not
+    just exist as unused dataclass fields.
+    """
+
+    def test_reframe_override_and_trim_reach_the_filter_graph_and_command_line(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=False))
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
+        )
+
+        captured_args = []
+
+        def fake_popen(args, **kwargs):
+            captured_args.append(list(args))
+            return _FakeProcess()
+
+        with patch("core.exporter.find_binary", return_value="ffmpeg"), patch("core.exporter.popen", fake_popen):
+            exporter = Exporter(project)
+            settings = ExportSettings(
+                output_path="/tmp/out.mp4", width=1080, height=1920, fps=30.0,
+                reframe_override=ReframeMode.FILL, trim_start=0.0, trim_end=6.0,
+            )
+            exporter.export(settings)
+
+        self.assertEqual(len(captured_args), 1)  # single-pass export
+        args = captured_args[0]
+        filter_index = args.index("-filter_complex") + 1
+        filter_complex = args[filter_index]
+        self.assertIn("force_original_aspect_ratio=increase", filter_complex)
+        self.assertIn("trim=start=0.000:end=6.000,setpts=PTS-STARTPTS", filter_complex)
+        # The trimmed labels must be what actually gets mapped to the output.
+        self.assertIn("-map", args)
+        map_index = args.index("-map")
+        self.assertIn(args[map_index + 1], ("[trimout_v]",))
 
 
 if __name__ == "__main__":

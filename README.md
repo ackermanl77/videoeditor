@@ -28,6 +28,9 @@ deliberately layered and documented so it is easy to read, test and extend.
   normal → slow-motion → normal) via speed keyframes
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
   split-screen, off-center framing
+- **Shorts / vertical video export**: crop-to-fill reframing (with a manual
+  focus point) into a 9:16 canvas instead of letterboxing, a duration cap,
+  and ready-made YouTube Shorts / TikTok / Instagram Reels presets
 - **Keyframing** for Opacity and Position — animate them smoothly over a
   clip's duration instead of one constant value
 - **Crossfade transitions** between adjacent clips on the same track
