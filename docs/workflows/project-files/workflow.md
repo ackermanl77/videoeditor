@@ -6,7 +6,7 @@ Save and reopen a complete editing session — media pool, tracks, clips, and se
 
 ## What it contains
 
-`.vproj` is plain, human-readable JSON (`core/project.py::Project.to_dict()`/`from_dict()`): a file version number, project settings (resolution/fps/sample rate), every track with its clips (including trim points, timeline position, volume/speed/opacity/fades, and text style where applicable), and the media pool (each imported asset's path and probed metadata). Source media itself is **not** embedded — only paths — so moving or deleting a source file breaks the clips that reference it (see the "Missing / unreadable files" section in [media-import/workflow.md](../media-import/workflow.md)).
+`.vproj` is plain, human-readable JSON (`core/project.py::Project.to_dict()`/`from_dict()`): a file version number, project settings (resolution/fps/sample rate), every track with its clips (including trim points, timeline position, volume/speed/opacity/fades, Transform/reframe/keyframe/speed-ramp fields, and text style where applicable), every marker (see [markers-and-chapters/workflow.md](../markers-and-chapters/workflow.md)), and the media pool (each imported asset's path and probed metadata). Source media itself is **not** embedded — only paths — so moving or deleting a source file breaks the clips that reference it (see the "Missing / unreadable files" section in [media-import/workflow.md](../media-import/workflow.md)).
 
 ## Steps
 
@@ -23,4 +23,4 @@ On startup, if a recovery file exists, the user is asked whether to recover it. 
 
 ## Validation
 
-`tests/test_project_serialization.py` covers the default two-track project, `find_asset_by_path()` path-normalization, and a full round-trip through `to_dict()`/`from_dict()`. The autosave/recovery flow (file I/O against `~/.video_editor/autosave/`, the recovery prompt) has no automated test — it was verified manually with an isolated `HOME`/`USERPROFILE` pointing at a scratch directory, confirming a written autosave is correctly offered and restored by a fresh `MainWindow` instance, and that `_dirty` is set to `True` on the recovered project.
+`tests/test_project_serialization.py` covers the default two-track project, `find_asset_by_path()` path-normalization, a full round-trip through `to_dict()`/`from_dict()`, and markers (round-tripping through save/load, including an auto-generated name, and removal). The autosave/recovery flow (file I/O against `~/.video_editor/autosave/`, the recovery prompt) has no automated test — it was verified manually with an isolated `HOME`/`USERPROFILE` pointing at a scratch directory, confirming a written autosave is correctly offered and restored by a fresh `MainWindow` instance, and that `_dirty` is set to `True` on the recovered project.
