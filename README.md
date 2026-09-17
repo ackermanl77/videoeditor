@@ -1,5 +1,7 @@
 # Open Video Editor
 
+[![CI](https://github.com/ackermanl77/videoeditor/actions/workflows/ci.yml/badge.svg)](https://github.com/ackermanl77/videoeditor/actions/workflows/ci.yml)
+
 A desktop, non-linear video editor built with **Python**, **PySide6** (Qt)
 and **FFmpeg**. It has a professional-looking dark UI, a multi-track
 timeline, a media bin, a live preview, an undo/redo history, and exports
@@ -124,6 +126,8 @@ anywhere Python does, without a display:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package.
 
 ## Building a standalone executable
 
