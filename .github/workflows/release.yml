@@ -1,0 +1,96 @@
+name: Release
+
+# Builds VideoEditor.exe and publishes it as a public GitHub Release asset --
+# a release asset is directly downloadable by anyone (no GitHub login
+# required, unlike a workflow-run artifact, and it doesn't expire after 90
+# days), which is the point of this workflow: "a build others can download".
+#
+# Triggered by pushing a version tag (git tag v0.1.0 && git push origin
+# v0.1.0), or manually via workflow_dispatch for a one-off/test build from
+# whatever branch is checked out -- that path tags the build "build-<sha>"
+# and marks it a prerelease instead of a real numbered release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Never publish a build the test suite doesn't pass. Duplicates ci.yml's
+  # own test job (rather than sharing it via a reusable workflow) since it's
+  # only two steps -- ci.yml itself doesn't run on a tag push (it triggers on
+  # branches, not tags), so this can't just depend on that run having already
+  # happened.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  build-and-release:
+    needs: test
+    # PyInstaller does not cross-compile -- a Windows .exe has to be built on
+    # a Windows runner (see docs/workflows/packaging/workflow.md).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Bundles the "essentials" FFmpeg build, not "full" -- see
+      # docs/workflows/packaging/workflow.md for the size trade-off (full's
+      # ffmpeg.exe/ffprobe.exe are ~222MB each; essentials' are ~98MB each
+      # and cover every codec this app uses). build.spec auto-detects
+      # anything named ffmpeg*/ffprobe* placed in bin/ and bundles it.
+      - name: Download and bundle FFmpeg (essentials build)
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          $binSrc = Get-ChildItem -Path ffmpeg-extracted -Recurse -Directory -Filter "bin" | Select-Object -First 1
+          Copy-Item (Join-Path $binSrc.FullName "ffmpeg.exe") -Destination "bin\ffmpeg.exe"
+          Copy-Item (Join-Path $binSrc.FullName "ffprobe.exe") -Destination "bin\ffprobe.exe"
+
+      - name: Build the executable
+        run: python build.py
+
+      - name: Verify the exe was produced
+        run: |
+          if (-not (Test-Path "dist\VideoEditor.exe")) {
+            Write-Error "dist\VideoEditor.exe was not produced by the build"
+            exit 1
+          }
+          Get-Item "dist\VideoEditor.exe" | Select-Object Name, Length
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tagName = "${{ github.ref_name }}"
+            $isPrerelease = $false
+          } else {
+            $shortSha = "${{ github.sha }}".Substring(0, 7)
+            $tagName = "build-$shortSha"
+            $isPrerelease = $true
+          }
+
+          gh release view $tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tagName "dist/VideoEditor.exe" --clobber
+          } else {
+            $createArgs = @($tagName, "dist/VideoEditor.exe", "--title", "Open Video Editor $tagName", "--generate-notes")
+            if ($isPrerelease) { $createArgs += "--prerelease" }
+            gh release create @createArgs
+          }

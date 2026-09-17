@@ -176,6 +176,17 @@ The output is `dist/VideoEditor` (no extension).
 Always build on the same OS you're targeting — PyInstaller does not
 cross-compile (build on Windows for a `.exe`, on macOS for a macOS app).
 
+### Automated builds
+
+Push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) and
+`.github/workflows/release.yml` builds `VideoEditor.exe` on GitHub's own
+Windows runner (FFmpeg bundled) and publishes it as a
+[GitHub Release](https://github.com/ackermanl77/videoeditor/releases) asset
+— no local build needed, and anyone can download it without a GitHub
+account. Running the workflow manually (Actions tab → Release → Run
+workflow) instead of pushing a tag builds from the current branch and
+publishes it as a prerelease, for a one-off test build.
+
 ## Keyboard shortcuts
 
 | Action              | Shortcut       |
