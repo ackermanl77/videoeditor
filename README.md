@@ -182,8 +182,11 @@ Push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) and
 `.github/workflows/release.yml` builds `VideoEditor.exe` on GitHub's own
 Windows runner (FFmpeg bundled) and publishes it as a
 [GitHub Release](https://github.com/ackermanl77/videoeditor/releases) asset
-— no local build needed, and anyone can download it without a GitHub
-account. Running the workflow manually (Actions tab → Release → Run
+— no local build needed. This repo is currently **private**, so downloading
+it still needs a GitHub account with access to the repo (that becomes a
+plain, no-login download only if the repo's visibility is ever changed to
+public — a separate, deliberate decision, since that also exposes the
+source/history). Running the workflow manually (Actions tab → Release → Run
 workflow) instead of pushing a tag builds from the current branch and
 publishes it as a prerelease, for a one-off test build.
 

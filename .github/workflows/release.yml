@@ -1,9 +1,12 @@
 name: Release
 
-# Builds VideoEditor.exe and publishes it as a public GitHub Release asset --
-# a release asset is directly downloadable by anyone (no GitHub login
-# required, unlike a workflow-run artifact, and it doesn't expire after 90
-# days), which is the point of this workflow: "a build others can download".
+# Builds VideoEditor.exe and publishes it as a GitHub Release asset -- unlike
+# a workflow-run artifact, it doesn't expire after 90 days. Note: this only
+# means "download without a GitHub login" on a PUBLIC repo. As long as this
+# repository stays private, downloading a release asset still requires a
+# GitHub account with access to the repo (confirmed live: an unauthenticated
+# request for a release asset URL on this repo returns a plain 404, not the
+# file) -- collaborators can still download it, just not an anonymous visitor.
 #
 # Triggered by pushing a version tag (git tag v0.1.0 && git push origin
 # v0.1.0), or manually via workflow_dispatch for a one-off/test build from
