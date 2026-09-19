@@ -50,6 +50,42 @@ class _PlainTextEdit(QTextEdit):
         self.editingFinished.emit()
 
 
+class CollapsibleGroupBox(QGroupBox):
+    """A ``QGroupBox`` whose content can be collapsed to just its title bar.
+
+    Plain ``QGroupBox.setCheckable()`` only disables its children when
+    unchecked — they stay visible at full size, still taking up the exact
+    same vertical space. That doesn't help: with every group always fully
+    expanded, selecting a video/image clip renders ~1,300px of stacked
+    controls (Clip Adjustments through Chroma Key) against a Properties
+    panel that typically only has ~500px of actual height, forcing several
+    screens' worth of scrolling just to reach the last group. This
+    subclass instead makes the checkbox an explicit expand/collapse
+    control: unchecking it ``setVisible(False)``s every direct child
+    widget, shrinking the group to just its title bar. The checkbox stays
+    visible (rather than styling it away) so there's always a guaranteed,
+    native, always-clickable hit target — a "▼"/"▶" prefix on the title
+    text is the second, clearer visual cue that this is about
+    showing/hiding the section, not enabling/disabling a feature (a real
+    ambiguity risk for e.g. "Chroma Key," which already has its own
+    internal "Enable" checkbox).
+    """
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None, start_expanded: bool = True):
+        super().__init__(parent)
+        self._base_title = title
+        self.setCheckable(True)
+        self.toggled.connect(self._apply_expanded_state)
+        self.setChecked(start_expanded)
+        self._apply_expanded_state(start_expanded)
+
+    def _apply_expanded_state(self, expanded: bool) -> None:
+        self.setTitle(f"{'▼' if expanded else '▶'} {self._base_title}")
+        for child in self.findChildren(QWidget):
+            if child.parentWidget() is self:
+                child.setVisible(expanded)
+
+
 MEDIA_TYPE_LABEL = {
     MediaType.VIDEO: "Video Clip",
     MediaType.AUDIO: "Audio Clip",
@@ -119,7 +155,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.name_label)
 
         # ---- Clip group ----
-        self.clip_group = QGroupBox("Clip Adjustments")
+        self.clip_group = CollapsibleGroupBox("Clip Adjustments", start_expanded=True)
         clip_form = QFormLayout(self.clip_group)
 
         self.volume_slider = QSlider(Qt.Horizontal)
@@ -154,7 +190,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.clip_group)
 
         # ---- Transform group (video/image only) ----
-        self.transform_group = QGroupBox("Transform")
+        self.transform_group = CollapsibleGroupBox("Transform", start_expanded=True)
         transform_form = QFormLayout(self.transform_group)
 
         self.transform_x_slider = QSlider(Qt.Horizontal)
@@ -180,7 +216,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.transform_group)
 
         # ---- Reframe group (video/image only) ----
-        self.reframe_group = QGroupBox("Reframe (Vertical / Shorts)")
+        self.reframe_group = CollapsibleGroupBox("Reframe (Vertical / Shorts)", start_expanded=False)
         reframe_form = QFormLayout(self.reframe_group)
 
         self.fill_frame_checkbox = QCheckBox("Fill Frame (crop instead of letterbox)")
@@ -197,7 +233,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.reframe_group)
 
         # ---- Keyframes group (video/image only) ----
-        self.keyframes_group = QGroupBox("Keyframes")
+        self.keyframes_group = CollapsibleGroupBox("Keyframes", start_expanded=False)
         kf_layout = QVBoxLayout(self.keyframes_group)
 
         kf_layout.addWidget(QLabel("Opacity (2+ keyframes override the Opacity slider above)"))
@@ -261,7 +297,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.keyframes_group)
 
         # ---- Transition group (video/image only) ----
-        self.transition_group = QGroupBox("Transition")
+        self.transition_group = CollapsibleGroupBox("Transition", start_expanded=False)
         transition_form = QFormLayout(self.transition_group)
 
         self.crossfade_checkbox = QCheckBox("Crossfade into next clip")
@@ -280,7 +316,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.transition_group)
 
         # ---- Color correction group (video/image only) ----
-        self.color_group = QGroupBox("Color Correction")
+        self.color_group = CollapsibleGroupBox("Color Correction", start_expanded=True)
         color_form = QFormLayout(self.color_group)
 
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -302,7 +338,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.color_group)
 
         # ---- Chroma key group (video/image only) ----
-        self.chroma_group = QGroupBox("Chroma Key (Green Screen)")
+        self.chroma_group = CollapsibleGroupBox("Chroma Key (Green Screen)", start_expanded=False)
         chroma_form = QFormLayout(self.chroma_group)
 
         self.chroma_enabled_checkbox = QCheckBox("Enable chroma key")
@@ -355,6 +391,18 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(self.text_group)
         layout.addStretch(1)
+
+        # Each collapsible group's initial expand/collapse state was applied
+        # in its own __init__, before this method had added any of its rows
+        # -- hiding "the current children" did nothing, since there were none
+        # yet. Re-apply it now that every group is fully populated, so a
+        # group that defaults to collapsed actually starts collapsed.
+        for group in (
+            self.clip_group, self.transform_group, self.reframe_group,
+            self.keyframes_group, self.transition_group, self.color_group,
+            self.chroma_group,
+        ):
+            group._apply_expanded_state(group.isChecked())
 
         self._connect_signals()
         self._selected_color = QColor("#FFFFFF")
