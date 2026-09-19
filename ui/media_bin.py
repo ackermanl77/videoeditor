@@ -156,6 +156,17 @@ class MediaBinWidget(QWidget):
         else:
             super().dragEnterEvent(event)
 
+    def dragMoveEvent(self, event) -> None:
+        # QWidget's default dragMoveEvent doesn't accept the event, so
+        # without this override the cursor shows "not allowed" for the
+        # entire drag hover -- even though dragEnterEvent/dropEvent already
+        # make the drop itself work -- undermining the empty-state hint's
+        # own promise that this panel is a drop target.
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
     def dropEvent(self, event) -> None:
         if event.mimeData().hasUrls():
             paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]

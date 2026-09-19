@@ -6,7 +6,7 @@ import json
 import os
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QThread, Qt, QTimer
+from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -129,6 +129,8 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._autosave)
         self._autosave_timer.start()
 
+        self._restore_window_state()
+
         # Deferred so the window is fully shown before a possible recovery dialog pops up.
         QTimer.singleShot(0, self._offer_autosave_recovery)
 
@@ -149,21 +151,27 @@ class MainWindow(QMainWindow):
             # the QWidget#Panel rule in ui/theme.py actually render.
             panel.setAttribute(Qt.WA_StyledBackground, True)
 
-        top_splitter = QSplitter(Qt.Horizontal)
-        top_splitter.addWidget(self.media_bin)
-        top_splitter.addWidget(self.preview)
-        top_splitter.addWidget(self.properties)
-        top_splitter.setStretchFactor(0, 2)
-        top_splitter.setStretchFactor(1, 4)
-        top_splitter.setStretchFactor(2, 2)
+        self.top_splitter = QSplitter(Qt.Horizontal)
+        self.top_splitter.addWidget(self.media_bin)
+        self.top_splitter.addWidget(self.preview)
+        self.top_splitter.addWidget(self.properties)
+        self.top_splitter.setStretchFactor(0, 2)
+        self.top_splitter.setStretchFactor(1, 4)
+        self.top_splitter.setStretchFactor(2, 2)
+        # A splitter's default lets a handle be dragged all the way to an
+        # edge, shrinking a panel to 0px and effectively hiding it with no
+        # menu item or shortcut to bring it back. Panels can still be made
+        # very small, just never fully collapsed/lost.
+        self.top_splitter.setChildrenCollapsible(False)
 
-        main_splitter = QSplitter(Qt.Vertical)
-        main_splitter.addWidget(top_splitter)
-        main_splitter.addWidget(self.timeline)
-        main_splitter.setStretchFactor(0, 3)
-        main_splitter.setStretchFactor(1, 2)
+        self.main_splitter = QSplitter(Qt.Vertical)
+        self.main_splitter.addWidget(self.top_splitter)
+        self.main_splitter.addWidget(self.timeline)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setChildrenCollapsible(False)
 
-        self.setCentralWidget(main_splitter)
+        self.setCentralWidget(self.main_splitter)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -248,26 +256,36 @@ class MainWindow(QMainWindow):
 
         toolbar.addWidget(self._build_brand_widget())
         toolbar.addSeparator()
-        toolbar.addAction(self._icon("import"), "Import", self.import_media_dialog)
+        import_action = toolbar.addAction(self._icon("import"), "Import", self.import_media_dialog)
+        import_action.setToolTip("Import media files (Ctrl+I)")
         toolbar.addSeparator()
-        toolbar.addAction(self._icon("save"), "Save", self.save_project)
+        save_action = toolbar.addAction(self._icon("save"), "Save", self.save_project)
+        save_action.setToolTip("Save the current project (Ctrl+S)")
         toolbar.addSeparator()
         self.toolbar_undo = toolbar.addAction(self._icon("undo"), "Undo", self.undo)
+        self.toolbar_undo.setToolTip("Undo the last action (Ctrl+Z)")
         self.toolbar_redo = toolbar.addAction(self._icon("redo"), "Redo", self.redo)
+        self.toolbar_redo.setToolTip("Redo the last undone action (Ctrl+Y)")
         toolbar.addSeparator()
-        toolbar.addAction(self._icon("split"), "Split", self.timeline.split_selected)
-        toolbar.addAction(self._icon("delete"), "Delete", self.timeline.delete_selected)
-        toolbar.addAction(self._icon("text"), "Add Text", self.add_text_clip)
+        split_action = toolbar.addAction(self._icon("split"), "Split", self.timeline.split_selected)
+        split_action.setToolTip("Split the selected clip at the playhead (S)")
+        delete_action = toolbar.addAction(self._icon("delete"), "Delete", self.timeline.delete_selected)
+        delete_action.setToolTip("Delete the selected clip (Delete)")
+        text_action = toolbar.addAction(self._icon("text"), "Add Text", self.add_text_clip)
+        text_action.setToolTip("Add a text clip at the playhead (T)")
         toolbar.addSeparator()
         self.play_action = toolbar.addAction(self._icon("play"), "Play", self.preview.toggle_play)
         self.play_action.setShortcut("Space")
+        self.play_action.setToolTip("Play (Space)")
         toolbar.addSeparator()
         export_action = toolbar.addAction(self._icon("export"), "Export Video", self.open_export_dialog)
         export_action.setShortcut("Ctrl+E")
+        export_action.setToolTip("Export the finished video (Ctrl+E)")
 
     def _on_playing_changed(self, is_playing: bool) -> None:
         self.play_action.setIcon(self._icon("pause" if is_playing else "play"))
         self.play_action.setText("Pause" if is_playing else "Play")
+        self.play_action.setToolTip("Pause (Space)" if is_playing else "Play (Space)")
 
     def _connect_signals(self) -> None:
         self.media_bin.import_requested.connect(self.import_media_paths)
@@ -676,6 +694,39 @@ class MainWindow(QMainWindow):
         self._warn_about_missing_media()
 
     # ------------------------------------------------------------------
+    # Window / layout persistence
+    # ------------------------------------------------------------------
+    def _restore_window_state(self) -> None:
+        """Restore window size/position and panel proportions from the last session.
+
+        Uses ``QSettings`` (backed by the registry on Windows, a plist on
+        macOS, an ini file on Linux) under the organization/application
+        name set in ``main.py``. Absent on first run, in which case the
+        layout built in ``_build_ui`` (stretch factors, ``setMinimumSize``)
+        stands as the default.
+        """
+        # Explicit type=QByteArray: some QSettings backends (notably the
+        # .ini format) don't round-trip a QByteArray's type without a hint,
+        # handing back a plain string that restoreGeometry()/restoreState()
+        # silently reject.
+        settings = QSettings()
+        geometry = settings.value("window/geometry", type=QByteArray)
+        if geometry:
+            self.restoreGeometry(geometry)
+        top_state = settings.value("window/top_splitter", type=QByteArray)
+        if top_state:
+            self.top_splitter.restoreState(top_state)
+        main_state = settings.value("window/main_splitter", type=QByteArray)
+        if main_state:
+            self.main_splitter.restoreState(main_state)
+
+    def _save_window_state(self) -> None:
+        settings = QSettings()
+        settings.setValue("window/geometry", self.saveGeometry())
+        settings.setValue("window/top_splitter", self.top_splitter.saveState())
+        settings.setValue("window/main_splitter", self.main_splitter.saveState())
+
+    # ------------------------------------------------------------------
     def open_export_dialog(self) -> None:
         if not self.project.tracks or self.project.total_duration <= 0:
             QMessageBox.information(self, "Export Video", "Add some clips to the timeline before exporting.")
@@ -711,6 +762,7 @@ class MainWindow(QMainWindow):
             # Either everything is saved, or the user just chose to discard
             # their changes — in both cases there's nothing to recover next launch.
             self._clear_autosave()
+            self._save_window_state()
             event.accept()
         else:
             event.ignore()
