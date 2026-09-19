@@ -4,6 +4,10 @@
 
 Arrange imported media on a multi-track timeline: move, trim, split, and delete clips; add/remove tracks; mute, lock, or hide a track.
 
+## Empty-state hint
+
+While every track is empty (a brand-new project, or one that's had everything deleted), a centered, non-interactive label overlays the timeline — "Import media (Ctrl+I), then drag a clip from the Media Bin here to begin editing" (`TimelineWidget.empty_hint_label`) — instead of a first-time user seeing nothing but a bare ruler and empty track rows. It's a child of the `QGraphicsView`'s viewport (not a `QGraphicsItem` in the scene), repositioned to fill the viewport on every resize (`TimelineView.resizeEvent`) and re-evaluated at the end of every `rebuild()`; `Qt.WA_TransparentForMouseEvents` keeps it from intercepting clicks meant for the view beneath it, like seeking via the ruler.
+
 ## Steps
 
 1. Drag a clip from the Media Bin onto a track, or double-click it to append it to the end of the first compatible track (video clips/images go to a video track, audio-only files go to an audio track).
@@ -42,4 +46,4 @@ The track-header column (name + M/L/H buttons, `HEADER_WIDTH = 130px`) is pinned
 
 ## Validation
 
-`tests/test_clip_and_track.py` covers clip duration/speed math and `Track.has_overlap()`/`clip_at()`. `tests/test_commands_and_history.py` covers add/remove/move/trim/split undo-redo round trips (including that a split outside the clip's span is a no-op and that redo is cleared after a new command) plus `RippleEditTests`: ripple delete/trim shift only later same-track clips (a clip on a different track is untouched), a lengthening trim shifts clips later while a shortening one shifts them earlier, a trim with no net duration change ripples nothing, and undo restores every shifted clip in one step. There is no automated test for drag/drop mouse interaction or the header-pinning behavior (both require a live Qt event loop) — verify those manually, or headlessly via a `QT_QPA_PLATFORM=offscreen` script driving `TimelineWidget` directly (which is how the Ripple toolbar button itself was verified).
+`tests/test_clip_and_track.py` covers clip duration/speed math and `Track.has_overlap()`/`clip_at()`. `tests/test_commands_and_history.py` covers add/remove/move/trim/split undo-redo round trips (including that a split outside the clip's span is a no-op and that redo is cleared after a new command) plus `RippleEditTests`: ripple delete/trim shift only later same-track clips (a clip on a different track is untouched), a lengthening trim shifts clips later while a shortening one shifts them earlier, a trim with no net duration change ripples nothing, and undo restores every shifted clip in one step. There is no automated test for drag/drop mouse interaction or the header-pinning behavior (both require a live Qt event loop) — verify those manually, or headlessly via a `QT_QPA_PLATFORM=offscreen` script driving `TimelineWidget` directly (which is how the Ripple toolbar button itself was verified, and how the empty-state hint above was verified: visible for a freshly-constructed project, hidden after adding a clip and calling `rebuild()`, visible again after removing it and rebuilding, and correctly resized to match the viewport after `TimelineWidget.resize()`).

@@ -76,6 +76,15 @@ class TimelineView(QGraphicsView):
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Defensive: a resize can in principle fire before _build_ui() has
+        # finished creating empty_hint_label (Qt may trigger one as soon as
+        # this view is added to its parent's layout, before the rest of
+        # TimelineWidget._build_ui() runs).
+        if hasattr(self._timeline_widget, "empty_hint_label"):
+            self._timeline_widget._reposition_empty_hint()
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -196,6 +205,25 @@ class TimelineWidget(QWidget):
         self.view = TimelineView(self.scene, self)
         layout.addWidget(self.view, 1)
 
+        # Shown only while every track is empty (a brand-new project, or one
+        # that's had everything deleted) -- otherwise a first-time user sees
+        # nothing but a bare ruler and empty track rows, with no indication
+        # of what to do next. A child of the viewport (not the scene) so it
+        # overlays on top of the ruler/tracks without needing a QGraphicsItem
+        # of its own, and doesn't intercept clicks meant for the view beneath
+        # it (e.g. clicking the ruler to seek).
+        self.empty_hint_label = QLabel(
+            "Import media (Ctrl+I), then drag a clip from the Media Bin here to begin editing.",
+            self.view.viewport(),
+        )
+        self.empty_hint_label.setAlignment(Qt.AlignCenter)
+        self.empty_hint_label.setWordWrap(True)
+        self.empty_hint_label.setStyleSheet(
+            f"color: {theme.COLOR_TEXT_DIM}; font-size: 13px; background: transparent;"
+        )
+        self.empty_hint_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.empty_hint_label.hide()
+
         self.ruler_item = RulerItem(self.pixels_per_second, 60.0)
         self.ruler_item.setPos(HEADER_WIDTH, 0)
         self.scene.addItem(self.ruler_item)
@@ -308,6 +336,15 @@ class TimelineWidget(QWidget):
 
         self._highlight_selection()
         self._pin_header_items()
+        self._update_empty_hint()
+
+    def _update_empty_hint(self) -> None:
+        has_any_clip = self.project is not None and any(track.clips for track in self.project.tracks)
+        self.empty_hint_label.setVisible(not has_any_clip)
+        self._reposition_empty_hint()
+
+    def _reposition_empty_hint(self) -> None:
+        self.empty_hint_label.setGeometry(self.view.viewport().rect())
 
     def _make_snap_guide_item(self, height: float) -> QGraphicsLineItem:
         """A thin vertical line shown while dragging/trimming near a snap target."""

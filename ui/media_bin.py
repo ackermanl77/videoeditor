@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import QMimeData, QSize, Qt, Signal
-from PySide6.QtGui import QDrag, QIcon, QPixmap
+from PySide6.QtCore import QMimeData, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -56,6 +56,22 @@ class MediaListWidget(QListWidget):
             drag.setPixmap(item.icon().pixmap(64, 36))
         drag.exec(Qt.CopyAction)
 
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().paintEvent(event)
+        # A brand-new project's bin is otherwise just a blank rectangle with
+        # no indication that it's a drop target, or that "Import" above is
+        # the other way in -- QListWidget has no built-in placeholder-text
+        # equivalent to QLineEdit's, so this draws one directly.
+        if self.count() == 0:
+            painter = QPainter(self.viewport())
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QColor("#9aa1ad"))
+            painter.drawText(
+                QRectF(self.viewport().rect()).adjusted(16, 16, -16, -16),
+                Qt.AlignCenter | Qt.TextWordWrap,
+                "Drop video, audio, or image files here,\nor click Import above to get started.",
+            )
+
 
 class MediaBinWidget(QWidget):
     """Displays imported media and lets the user import more / add to timeline."""
@@ -87,10 +103,11 @@ class MediaBinWidget(QWidget):
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self.list_widget, 1)
 
-        hint = QLabel("Drag a clip onto the timeline, or double-click to append it.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #9aa1ad; font-size: 11px;")
-        layout.addWidget(hint)
+        self.hint_label = QLabel("Drag a clip onto the timeline, or double-click to append it.")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet("color: #9aa1ad; font-size: 11px;")
+        self.hint_label.setVisible(False)  # nothing to drag yet; the empty list itself explains how to import
+        layout.addWidget(self.hint_label)
 
         self.setAcceptDrops(True)
 
@@ -123,6 +140,7 @@ class MediaBinWidget(QWidget):
             if pixmap is not None and not pixmap.isNull():
                 item.setIcon(QIcon(pixmap))
             self.list_widget.addItem(item)
+        self.hint_label.setVisible(bool(assets))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
