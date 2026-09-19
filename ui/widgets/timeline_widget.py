@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QGraphicsLineItem,
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QLineEdit,
     QPushButton,
     QSlider,
@@ -58,6 +60,83 @@ from ui.widgets.timeline_items import (
 DEFAULT_PIXELS_PER_SECOND = 40.0
 MIN_PPS = 5.0
 MAX_PPS = 400.0
+
+
+class FlowLayout(QLayout):
+    """A left-to-right layout that wraps to a new row instead of overflowing.
+
+    Adapted from Qt's own "Flow Layout" example. The toolbar row (8 buttons
+    plus a zoom slider) needs ~1,088px at its natural size — a plain
+    ``QHBoxLayout`` would let it run past the edge of any window narrower
+    than that, with the rightmost buttons rendered off-screen and
+    genuinely unreachable (no scrollbar, no wrap). This instead moves
+    whichever widgets don't fit onto additional rows, so every control
+    stays visible and clickable regardless of window width — the same
+    fix (wrap instead of clip) used for an analogous tab-bar overflow in
+    the sibling ``photo_professional_tool`` project.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None, margin: int = 0, spacing: int = 6):
+        super().__init__(parent)
+        self._items: List[QLayoutItem] = []
+        self._spacing = spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802 (Qt override)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QLayoutItem]:  # noqa: N802 (Qt override)
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> Optional[QLayoutItem]:  # noqa: N802 (Qt override)
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientations:  # noqa: N802 (Qt override)
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt override)
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 (Qt override)
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802 (Qt override)
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802 (Qt override)
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        return size + QSize(left + right, top + bottom)
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        x, y = effective.x(), effective.y()
+        line_height = 0
+
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > effective.right() and line_height > 0:
+                x = effective.x()
+                y += line_height + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+
+        return y + line_height - rect.y() + bottom
 
 
 class TimelineView(QGraphicsView):
@@ -159,9 +238,8 @@ class TimelineWidget(QWidget):
         layout.setContentsMargins(3, 3, 3, 3)
         layout.setSpacing(0)
 
-        toolbar = QHBoxLayout()
+        toolbar = FlowLayout(margin=0, spacing=6)
         toolbar.setContentsMargins(8, 6, 8, 6)
-        toolbar.setSpacing(6)
 
         self.add_video_track_btn = QPushButton("+ Video Track")
         self.add_audio_track_btn = QPushButton("+ Audio Track")
@@ -187,8 +265,6 @@ class TimelineWidget(QWidget):
             self.add_marker_btn,
         ):
             toolbar.addWidget(btn)
-
-        toolbar.addStretch(1)
 
         toolbar.addWidget(QLabel("Zoom"))
         self.zoom_slider = QSlider(Qt.Horizontal)

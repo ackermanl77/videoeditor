@@ -42,7 +42,8 @@ deliberately layered and documented so it is easy to read, test and extend.
   alignment
 - **Undo/redo** for every editing operation (command-pattern history)
 - **Project files** (`.vproj`, plain JSON) — save and reopen your edit, with
-  autosave/crash recovery
+  autosave/crash recovery, and a **File > Open Recent** list of your last
+  10 opened/saved projects
 - **Export** to MP4 / MOV / MKV / AVI / FLV / WebM / animated GIF with
   resolution, frame-rate and quality presets (or two-pass
   target-file-size encoding), rendered by FFmpeg with a live progress bar

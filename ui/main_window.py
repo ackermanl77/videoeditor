@@ -68,6 +68,35 @@ def _autosave_meta_path() -> str:
     return _autosave_path() + ".meta.json"
 
 
+MAX_RECENT_PROJECTS = 10
+
+
+def _recent_projects_path() -> str:
+    path = os.path.join(os.path.expanduser("~"), ".video_editor")
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, "recent_projects.json")
+
+
+def _load_recent_projects() -> List[str]:
+    path = _recent_projects_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
+
+
+def _save_recent_projects(paths: List[str]) -> None:
+    try:
+        with open(_recent_projects_path(), "w", encoding="utf-8") as f:
+            json.dump(paths, f, indent=2)
+    except OSError:
+        pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -151,6 +180,8 @@ class MainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
         self._add_action(file_menu, "New Project", self.new_project, QKeySequence.New)
         self._add_action(file_menu, "Open Project...", self.open_project, QKeySequence.Open)
+        self.recent_projects_menu = file_menu.addMenu("Open Recent")
+        self._refresh_recent_projects_menu()
         self._add_action(file_menu, "Save Project", self.save_project, QKeySequence.Save, icon="save")
         self._add_action(file_menu, "Save Project As...", self.save_project_as, QKeySequence.SaveAs)
         file_menu.addSeparator()
@@ -464,6 +495,18 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", PROJECT_FILE_FILTER)
         if not path:
             return
+        self._open_project_from_path(path)
+
+    def _open_recent_project(self, path: str) -> None:
+        if not self._confirm_discard_if_dirty():
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Open Project", f"This file could not be found:\n{path}")
+            self._remove_recent_project(path)
+            return
+        self._open_project_from_path(path)
+
+    def _open_project_from_path(self, path: str) -> None:
         try:
             project = Project.load(path)
         except Exception as exc:  # noqa: BLE001
@@ -476,6 +519,47 @@ class MainWindow(QMainWindow):
         self._waveform_cache.clear()
         self._load_project_into_panels()
         self._warn_about_missing_media()
+        self._add_recent_project(path)
+
+    # ------------------------------------------------------------------
+    # Recent Projects
+    # ------------------------------------------------------------------
+    def _add_recent_project(self, path: str) -> None:
+        path = os.path.abspath(path)
+        paths = [p for p in _load_recent_projects() if os.path.abspath(p) != path]
+        paths.insert(0, path)
+        _save_recent_projects(paths[:MAX_RECENT_PROJECTS])
+        self._refresh_recent_projects_menu()
+
+    def _remove_recent_project(self, path: str) -> None:
+        target = os.path.abspath(path)
+        paths = [p for p in _load_recent_projects() if os.path.abspath(p) != target]
+        _save_recent_projects(paths)
+        self._refresh_recent_projects_menu()
+
+    def _clear_recent_projects(self) -> None:
+        _save_recent_projects([])
+        self._refresh_recent_projects_menu()
+
+    def _refresh_recent_projects_menu(self) -> None:
+        menu = self.recent_projects_menu
+        menu.clear()
+        paths = _load_recent_projects()
+        if not paths:
+            empty_action = menu.addAction("No Recent Projects")
+            empty_action.setEnabled(False)
+            return
+        for path in paths:
+            exists = os.path.isfile(path)
+            label = os.path.basename(path) if exists else f"{os.path.basename(path)} (missing)"
+            action = menu.addAction(label)
+            action.setToolTip(path)
+            action.setEnabled(exists)
+            if exists:
+                action.triggered.connect(lambda checked=False, p=path: self._open_recent_project(p))
+        menu.addSeparator()
+        clear_action = menu.addAction("Clear Recent Projects")
+        clear_action.triggered.connect(self._clear_recent_projects)
 
     def _warn_about_missing_media(self) -> None:
         missing = sorted({a.path for a in self.project.media_pool if not os.path.isfile(a.path)})
@@ -517,6 +601,7 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._update_title()
         self._clear_autosave()
+        self._add_recent_project(path)
         self.status_bar.showMessage(f"Saved to {path}", 3000)
 
     # ------------------------------------------------------------------
