@@ -7,6 +7,7 @@ import unittest
 from core.clip import Clip, MediaType
 from core.media_asset import MediaAsset
 from core.project import Project
+from core.track import TrackType
 
 
 class ProjectSerializationTests(unittest.TestCase):
@@ -70,6 +71,23 @@ class ProjectSerializationTests(unittest.TestCase):
         project.remove_marker(marker.id)
         self.assertEqual(len(project.markers), 0)
         self.assertIsNone(project.find_marker(marker.id))
+
+    def test_track_ducking_config_round_trips_through_save_and_load(self):
+        project = Project(name="Ducking Test")
+        narration_track = project.tracks[1]
+        music_track = project.add_track(TrackType.AUDIO, name="Music")
+        music_track.duck_trigger_track_id = narration_track.id
+        music_track.duck_threshold = 0.1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "duck.vproj")
+            project.save(path)
+            loaded = Project.load(path)
+
+        loaded_music = loaded.find_track(music_track.id)
+        self.assertIsNotNone(loaded_music)
+        self.assertEqual(loaded_music.duck_trigger_track_id, narration_track.id)
+        self.assertAlmostEqual(loaded_music.duck_threshold, 0.1)
 
 
 if __name__ == "__main__":

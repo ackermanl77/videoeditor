@@ -29,7 +29,33 @@ from core.track import TrackType
 # this it's not worth the extra filter graph complexity over a hard cut.
 MIN_CROSSFADE_SECONDS = 0.05
 
-_NEUTRAL_COLOR = (0.0, 1.0, 1.0, 1.0)  # brightness, contrast, saturation, gamma
+# Whether Color Correction/Chroma Key/Denoise/Transition are "active" on a
+# clip (i.e. worth emitting a filter for) is decided by `Clip.has_*`
+# properties in `core/clip.py`, not duplicated here -- both this module and
+# the timeline's per-clip effect-indicator badges
+# (`ui/widgets/timeline_items.py::ClipItem`) read the same properties so
+# they can't drift apart on what counts as "non-default."
+
+# Maps each transition-capable TransitionType member to the actual FFmpeg
+# `xfade` filter's `transition=` name. NONE (and the legacy, never-wired-up
+# FADE member) are deliberately excluded -- callers treat "not in this dict"
+# the same as "not in TRANSITION-worthy" via `_find_crossfade_partner`'s own
+# `!= TransitionType.NONE` check, and default to "fade" if a value somehow
+# isn't a key here (defensive; every real transition member is listed).
+_XFADE_TRANSITION_NAMES: Dict[TransitionType, str] = {
+    TransitionType.CROSSFADE: "fade",
+    TransitionType.FADE: "fade",
+    TransitionType.WIPE_LEFT: "wipeleft",
+    TransitionType.WIPE_RIGHT: "wiperight",
+    TransitionType.WIPE_UP: "wipeup",
+    TransitionType.WIPE_DOWN: "wipedown",
+    TransitionType.SLIDE_LEFT: "slideleft",
+    TransitionType.SLIDE_RIGHT: "slideright",
+    TransitionType.SLIDE_UP: "slideup",
+    TransitionType.SLIDE_DOWN: "slidedown",
+    TransitionType.CIRCLE_CROP: "circlecrop",
+    TransitionType.DISSOLVE: "dissolve",
+}
 
 
 def _project_with_reframe_override(project: Project, mode: ReframeMode) -> Project:
@@ -237,11 +263,11 @@ def _build_video_clip_chain(
         if not apply_transform:
             chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
 
-    if clip.chroma_key_enabled:
+    if clip.has_chroma_key:
         key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
         chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
 
-    if (clip.brightness, clip.contrast, clip.saturation, clip.gamma) != _NEUTRAL_COLOR:
+    if clip.has_color_correction:
         chain += (
             f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
             f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
@@ -340,10 +366,10 @@ def _build_speed_ramp_video_chain(
                 f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
                 ",format=yuva420p"
             )
-        if clip.chroma_key_enabled:
+        if clip.has_chroma_key:
             key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
             seg_chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
-        if (clip.brightness, clip.contrast, clip.saturation, clip.gamma) != _NEUTRAL_COLOR:
+        if clip.has_color_correction:
             seg_chain += (
                 f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
                 f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
@@ -403,6 +429,8 @@ def _maybe_add_speed_ramped_audio(
         base_label = seg_labels[0]
 
     tail = ""
+    if clip.has_denoise:
+        tail += f",afftdn=nr={clip.denoise_strength:.3f}"
     clip_len = clip.duration
     if clip.fade_in > 0:
         tail += f",afade=t=in:st=0:d={clip.fade_in:.3f}"
@@ -431,18 +459,21 @@ def _crossfade_duration(clip: Clip, next_clip: Clip) -> float:
 def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
     """Return the index of ``clips[i]``'s crossfade partner, if a valid one follows it.
 
-    Valid means: ``clips[i]`` requests a crossfade out, the next clip is a
+    Valid means: ``clips[i]`` requests a transition out (any
+    ``TransitionType`` other than ``NONE`` -- not just the original
+    ``CROSSFADE`` member; see ``_XFADE_TRANSITION_NAMES`` for the full set
+    of ``xfade``-backed transitions this now covers), the next clip is a
     video/image clip touching its tail (no gap — clips can't overlap per
     ``Track.has_overlap``), and the clamped crossfade duration is meaningful.
     Only one pair is ever formed per clip — chaining three or more
-    consecutive crossfades on the same track isn't supported. Neither side
-    may be speed-ramped: a crossfade already can't reconcile Transform's
+    consecutive transitions on the same track isn't supported. Neither side
+    may be speed-ramped: a transition already can't reconcile Transform's
     variable output size between two clips (see
     ``_build_video_clip_chain``'s docstring), and a speed-ramped clip
     doesn't produce a single chain to feed ``xfade`` in the first place.
     """
     clip = clips[i]
-    if clip.transition_out != TransitionType.CROSSFADE:
+    if not clip.has_transition:
         return None
     if len(clip.speed_keyframes) >= 2:
         return None
@@ -458,6 +489,75 @@ def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
     if _crossfade_duration(clip, nxt) <= MIN_CROSSFADE_SECONDS:
         return None
     return i + 1
+
+
+def _apply_audio_ducking(
+    project: Project,
+    filter_lines: List[str],
+    audio_labels: List[str],
+    audio_labels_by_track: Dict[str, List[str]],
+) -> None:
+    """Route each ducked track's audio through ``sidechaincompress`` against its trigger.
+
+    A track whose ``duck_trigger_track_id`` names another track (e.g. a
+    background-music track ducking under a narration/dialogue track) has
+    its own mixed audio compressed using the trigger track's mixed audio as
+    the sidechain "detector" input -- so it automatically gets quieter
+    whenever the trigger track is audible. Implemented via FFmpeg's
+    ``sidechaincompress=threshold:ratio:attack:release`` filter, which takes
+    exactly two inputs (``[main][sidechain]``) and emits one compressed
+    output for ``main`` only -- the trigger's own audio is *not* consumed or
+    silenced by this: its labels are left untouched in ``audio_labels``, so
+    it continues to play normally, independently of being used as a
+    detector here.
+
+    Mutates ``audio_labels`` in place: the ducked track's individual clip
+    labels are removed and replaced with the single compressed output
+    label, so the final ``amix`` (in ``build_filter_graph``) picks up the
+    ducked result instead of double-counting the pre-compression labels.
+    Silently does nothing for a track with no ``duck_trigger_track_id``, an
+    unresolvable/self-referencing trigger, or either side with no audible
+    audio at all (nothing to duck, or nothing to duck against).
+    """
+    counter = 0
+    for track in project.tracks:
+        trigger_id = track.duck_trigger_track_id
+        if not trigger_id or trigger_id == track.id:
+            continue
+        main_labels = audio_labels_by_track.get(track.id) or []
+        trigger_labels = audio_labels_by_track.get(trigger_id) or []
+        if not main_labels or not trigger_labels:
+            continue
+
+        if len(main_labels) > 1:
+            main_label = f"duckmain{counter}"
+            joined = "".join(f"[{lbl}]" for lbl in main_labels)
+            filter_lines.append(
+                f"{joined}amix=inputs={len(main_labels)}:duration=longest:dropout_transition=0:normalize=0[{main_label}]"
+            )
+        else:
+            main_label = main_labels[0]
+
+        if len(trigger_labels) > 1:
+            trigger_label = f"ducktrig{counter}"
+            joined = "".join(f"[{lbl}]" for lbl in trigger_labels)
+            filter_lines.append(
+                f"{joined}amix=inputs={len(trigger_labels)}:duration=longest:dropout_transition=0:normalize=0[{trigger_label}]"
+            )
+        else:
+            trigger_label = trigger_labels[0]
+
+        out_label = f"duckout{counter}"
+        filter_lines.append(
+            f"[{main_label}][{trigger_label}]sidechaincompress=threshold={track.duck_threshold:.4f}"
+            f":ratio={track.duck_ratio:.2f}:attack={track.duck_attack:.2f}:release={track.duck_release:.2f}[{out_label}]"
+        )
+
+        for lbl in main_labels:
+            if lbl in audio_labels:
+                audio_labels.remove(lbl)
+        audio_labels.append(out_label)
+        counter += 1
 
 
 def build_filter_graph(
@@ -489,6 +589,10 @@ def build_filter_graph(
     # (track_order, start, label, (pos_x_expr, pos_y_expr))
     video_layer_labels: List[Tuple[int, float, str, Tuple[str, str]]] = []
     audio_labels: List[str] = []
+    # Mirrors audio_labels, but grouped by the Track.id each label's clip
+    # lives on -- needed only for audio ducking (_apply_audio_ducking),
+    # which has to isolate one track's own mixed audio from another's.
+    audio_labels_by_track: Dict[str, List[str]] = {}
     text_clips: List[Clip] = []
 
     # Base canvas: solid black, full project duration.
@@ -541,7 +645,9 @@ def build_filter_graph(
                     )
                     body_label = tpad_label
                 video_layer_labels.append((track_order, clip.timeline_start, body_label, _position_expr(clip)))
+                _before = len(audio_labels)
                 _maybe_add_speed_ramped_audio(project, clip, segment_specs, clip_counter, filter_lines, audio_labels, probe_cache)
+                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             elif partner_i is None:
                 idx = _register_video_input(clip, fps, input_specs)
@@ -551,7 +657,9 @@ def build_filter_graph(
                 label = f"v{clip_counter}"
                 filter_lines.append(f"{chain}[{label}]")
                 video_layer_labels.append((track_order, clip.timeline_start, label, _position_expr(clip)))
+                _before = len(audio_labels)
                 _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
+                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             else:
                 # Crossfade pair: build each side's chain up to (not including)
@@ -585,8 +693,9 @@ def build_filter_graph(
 
                 merged_label = f"xf{clip_counter}"
                 offset = max(0.0, clip.duration - d)
+                xfade_name = _XFADE_TRANSITION_NAMES.get(clip.transition_out, "fade")
                 filter_lines.append(
-                    f"[{label_a}][{label_b}]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
+                    f"[{label_a}][{label_b}]xfade=transition={xfade_name}:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
                 )
 
                 final_label = f"v{clip_counter}"
@@ -604,10 +713,12 @@ def build_filter_graph(
                 # Audio stays independent of the video crossfade (see
                 # _find_crossfade_partner's docstring) — each side keeps its
                 # own volume/fade/timeline position, meeting at a clean cut.
+                _before = len(audio_labels)
                 _maybe_add_audio(project, clip, idx_a, filter_lines, audio_labels, clip_counter, probe_cache)
                 clip_counter += 1
                 _maybe_add_audio(project, partner, idx_b, filter_lines, audio_labels, clip_counter, probe_cache)
                 clip_counter += 1
+                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 consumed_as_partner.add(partner_i)
 
     # ---- Composite video layers onto the base canvas, bottom to top ----
@@ -660,8 +771,17 @@ def build_filter_graph(
             idx = len(input_specs)
             pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}"]
             input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
-            audio_labels.append(_build_audio_chain(idx, clip, filter_lines, clip_counter))
+            label = _build_audio_chain(idx, clip, filter_lines, clip_counter)
+            audio_labels.append(label)
+            audio_labels_by_track.setdefault(track.id, []).append(label)
             clip_counter += 1
+
+    # ---- Audio ducking (sidechain compression) ----
+    # Any track with duck_trigger_track_id set gets its own mixed audio
+    # routed through sidechaincompress, keyed off its trigger track's mixed
+    # audio -- e.g. background music automatically quieting under narration.
+    # Mutates audio_labels in place (see _apply_audio_ducking's docstring).
+    _apply_audio_ducking(project, filter_lines, audio_labels, audio_labels_by_track)
 
     has_audio = bool(audio_labels)
     if has_audio:
@@ -741,6 +861,11 @@ def _build_audio_chain(
     if abs(speed - 1.0) > 1e-6:
         for f in _atempo_chain(speed):
             chain += f",{f}"
+
+    # Noise reduction, applied before fade/volume so it works on the clip's
+    # unmodified audio level rather than an already-faded/attenuated signal.
+    if clip.has_denoise:
+        chain += f",afftdn=nr={clip.denoise_strength:.3f}"
 
     # Fade in/out apply to a clip's audio too, not just its video alpha —
     # otherwise the Properties panel's Fade sliders silently do nothing for

@@ -45,6 +45,27 @@ CLIP_COLORS = {
     MediaType.TEXT: theme.CLIP_COLOR_TEXT,
 }
 
+# Small top-right badges on a ClipItem showing which effect categories are
+# active. Each entry is (Clip attribute to check, badge letter, badge
+# color). The attribute checked is one of `Clip.has_*` in `core/clip.py` --
+# the exact same "is this non-default" logic `core/filter_graph.py` uses to
+# decide whether to emit a filter for that field, so the badges can never
+# show/hide out of step with what the export actually does. Order here is
+# the order badges are drawn, left to right.
+EFFECT_INDICATORS: Tuple[Tuple[str, str, str], ...] = (
+    ("has_color_correction", "C", theme.COLOR_DANGER),
+    ("has_chroma_key", "K", theme.COLOR_SUCCESS),
+    ("has_denoise", "N", theme.COLOR_ACCENT),
+    ("has_transition", "T", theme.CLIP_COLOR_TEXT),
+)
+EFFECT_BADGE_SIZE = 10
+EFFECT_BADGE_GAP = 2
+
+
+def _active_effect_badges(clip: Clip) -> List[Tuple[str, str]]:
+    """Return (letter, color) for every active effect category on ``clip``."""
+    return [(letter, color) for attr, letter, color in EFFECT_INDICATORS if getattr(clip, attr)]
+
 
 class TimelineSignals(QObject):
     """Central signal hub since QGraphicsItem is not a QObject."""
@@ -57,6 +78,7 @@ class TimelineSignals(QObject):
     track_mute_toggled = Signal(int)
     track_lock_toggled = Signal(int)
     track_hidden_toggled = Signal(int)
+    track_duck_config_requested = Signal(int)  # row -> right-clicked "Duck Audio Under..."
     snap_guide_show = Signal(float)  # timeline seconds where the guide should be drawn
     snap_guide_hide = Signal()
     marker_clicked = Signal(str)  # marker_id -> seek the playhead there
@@ -94,6 +116,7 @@ class ClipItem(QGraphicsObject):
         self._source_out = clip.source_out
         self._source_duration = clip.source_duration
         self._locked = False
+        self._effect_badges = _active_effect_badges(clip)
 
         self.setFlags(
             QGraphicsItem.ItemIsMovable
@@ -120,9 +143,14 @@ class ClipItem(QGraphicsObject):
         self._source_in = clip.source_in
         self._source_out = clip.source_out
         self._source_duration = clip.source_duration
+        self._effect_badges = _active_effect_badges(clip)
         self._sync_position()
         self.prepareGeometryChange()
         self.update()
+
+    def active_effect_labels(self) -> List[str]:
+        """The letters of every effect-indicator badge currently shown (left to right)."""
+        return [letter for letter, _color in self._effect_badges]
 
     def _sync_position(self) -> None:
         y = RULER_HEIGHT + self.row * (TRACK_HEIGHT + TRACK_GAP)
@@ -171,15 +199,42 @@ class ClipItem(QGraphicsObject):
             else:
                 self._paint_waveform(painter, rect, top=rect.height() - 16.0, bottom=rect.height() - 3.0)
 
+        # Effect-indicator badges (top-right corner): a small colored/lettered
+        # square per active effect category (Color Correction, Chroma Key,
+        # Denoise, Transition) -- see EFFECT_INDICATORS. Skipped entirely
+        # below a minimum width rather than drawn partially/overlapping, the
+        # same "hide, don't crowd" guard used for the trim handles below.
+        badge_reserve = 0.0
+        show_badges = bool(self._effect_badges) and rect.width() >= 34
+        if show_badges:
+            n = len(self._effect_badges)
+            badge_reserve = n * EFFECT_BADGE_SIZE + (n - 1) * EFFECT_BADGE_GAP + 4
+
         painter.setPen(QColor("#ffffff"))
         font = QFont()
         font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
         text_x = 52 if (self.thumbnail is not None and rect.width() > 30) else 8
-        text_rect = QRectF(text_x, 2, rect.width() - text_x - 4, 16)
+        text_rect = QRectF(text_x, 2, max(0.0, rect.width() - text_x - 4 - badge_reserve), 16)
         elided = painter.fontMetrics().elidedText(self._name, Qt.ElideRight, int(text_rect.width()))
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+
+        if show_badges:
+            badge_font = QFont()
+            badge_font.setPointSize(6)
+            badge_font.setBold(True)
+            painter.setFont(badge_font)
+            x = rect.width() - badge_reserve + 2
+            y = 2.0
+            for letter, color in self._effect_badges:
+                badge_rect = QRectF(x, y, EFFECT_BADGE_SIZE, EFFECT_BADGE_SIZE)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(color))
+                painter.drawRoundedRect(badge_rect, 2, 2)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(badge_rect, Qt.AlignCenter, letter)
+                x += EFFECT_BADGE_SIZE + EFFECT_BADGE_GAP
 
         # Fade / trim handles indicator (subtle triangles at the corners).
         if rect.width() > 20:
@@ -437,7 +492,7 @@ class ToggleButtonItem(QGraphicsObject):
 
 
 class TrackHeaderItem(QGraphicsObject):
-    """Sticky left-hand panel showing a track's name and mute/lock/hide controls.
+    """Sticky left-hand panel showing a track's name and mute/lock/hide/duck controls.
 
     Lives in the same scene as the clips (so it scrolls vertically in sync
     with them for free), but its horizontal position is pinned to the
@@ -445,6 +500,15 @@ class TrackHeaderItem(QGraphicsObject):
     on every horizontal scroll, rather than living at a fixed scene x. Clip
     content itself starts at scene x = ``HEADER_WIDTH`` (see
     :meth:`ClipItem._sync_position`), so nothing else needs to be shifted.
+
+    ``duck_btn`` mirrors the mute/lock/hide toggles' own look but isn't a
+    toggle in the same sense -- clicking it re-opens the "Duck Audio
+    Under..." picker (the same ``track_duck_config_requested`` signal the
+    right-click context menu already uses, see :meth:`contextMenuEvent`)
+    rather than flipping a plain bool. Its ``active`` state (set by
+    :class:`~ui.widgets.timeline_widget.TimelineWidget` from
+    ``Track.duck_trigger_track_id``) is the only thing that makes an
+    otherwise entirely invisible per-track setting visible at a glance.
     """
 
     def __init__(self, track_id: str, row: int, name: str, track_kind: str, signals: TimelineSignals):
@@ -462,13 +526,20 @@ class TrackHeaderItem(QGraphicsObject):
         self.mute_btn = ToggleButtonItem("M", parent=self)
         self.lock_btn = ToggleButtonItem("L", parent=self)
         self.hide_btn = ToggleButtonItem("H", parent=self)
+        self.duck_btn = ToggleButtonItem("D", parent=self)
         self.mute_btn.setPos(HEADER_WIDTH - 92, TRACK_HEIGHT - 24)
-        self.lock_btn.setPos(HEADER_WIDTH - 68, TRACK_HEIGHT - 24)
-        self.hide_btn.setPos(HEADER_WIDTH - 44, TRACK_HEIGHT - 24)
+        self.lock_btn.setPos(HEADER_WIDTH - 70, TRACK_HEIGHT - 24)
+        self.hide_btn.setPos(HEADER_WIDTH - 48, TRACK_HEIGHT - 24)
+        self.duck_btn.setPos(HEADER_WIDTH - 26, TRACK_HEIGHT - 24)
+        self.duck_btn.setToolTip("Duck Audio Under...")
 
         self.mute_btn.clicked.connect(lambda: self.signals.track_mute_toggled.emit(self.row))
         self.lock_btn.clicked.connect(lambda: self.signals.track_lock_toggled.emit(self.row))
         self.hide_btn.clicked.connect(lambda: self.signals.track_hidden_toggled.emit(self.row))
+        # Reuses the exact same signal/handler the right-click "Duck Audio
+        # Under..." context-menu action emits (see contextMenuEvent below)
+        # rather than duplicating the QInputDialog picker logic.
+        self.duck_btn.clicked.connect(lambda: self.signals.track_duck_config_requested.emit(self.row))
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, HEADER_WIDTH, TRACK_HEIGHT)
@@ -488,6 +559,14 @@ class TrackHeaderItem(QGraphicsObject):
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(QRectF(12, 6, HEADER_WIDTH - 24, 18), Qt.AlignLeft | Qt.AlignVCenter, self.name)
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu()
+        duck_action = menu.addAction("Duck Audio Under...")
+        chosen = menu.exec(event.screenPos())
+        if chosen == duck_action:
+            self.signals.track_duck_config_requested.emit(self.row)
+        event.accept()
 
 
 class CornerItem(QGraphicsObject):

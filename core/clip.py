@@ -23,11 +23,32 @@ class MediaType(str, Enum):
 
 
 class TransitionType(str, Enum):
-    """Supported transitions applied at the head/tail of a clip."""
+    """Supported transitions applied at the head/tail of a clip.
+
+    Every member except ``NONE`` (and the legacy ``FADE``, which was never
+    actually wired into the crossfade path) is applied between adjacent
+    clips via FFmpeg's ``xfade`` filter — see
+    ``core/filter_graph.py::_XFADE_TRANSITION_NAMES`` for the mapping from
+    each member to the actual ``xfade`` ``transition=`` name, and
+    ``_find_crossfade_partner`` for how a clip's ``transition_out`` decides
+    whether it pairs with the next clip on its track. ``CROSSFADE`` is kept
+    as the original member (mapping to ``xfade``'s ``fade`` transition) for
+    backward compatibility with already-saved ``.vproj`` files.
+    """
 
     NONE = "none"
     FADE = "fade"
     CROSSFADE = "crossfade"
+    WIPE_LEFT = "wipeleft"
+    WIPE_RIGHT = "wiperight"
+    WIPE_UP = "wipeup"
+    WIPE_DOWN = "wipedown"
+    SLIDE_LEFT = "slideleft"
+    SLIDE_RIGHT = "slideright"
+    SLIDE_UP = "slideup"
+    SLIDE_DOWN = "slidedown"
+    CIRCLE_CROP = "circlecrop"
+    DISSOLVE = "dissolve"
 
 
 class ReframeMode(str, Enum):
@@ -100,6 +121,14 @@ class Clip:
     volume: float = 1.0
     muted: bool = False
     speed: float = 1.0
+
+    # Audio noise reduction, via FFmpeg's `afftdn` filter. Disabled (False)
+    # by default so an unedited clip never emits the filter, matching the
+    # neutral-default convention used by Color Correction/Chroma Key above.
+    # denoise_strength maps directly to afftdn's `nr` (noise reduction)
+    # option, in decibels, 0.01..97 per FFmpeg's own accepted range.
+    denoise_enabled: bool = False
+    denoise_strength: float = 12.0
 
     # Visual adjustments
     opacity: float = 1.0
@@ -245,6 +274,29 @@ class Clip:
     def timeline_end(self) -> float:
         return self.timeline_start + self.duration
 
+    # -- "is this effect active" checks ---------------------------------
+    # These mirror `core/filter_graph.py`'s own per-field "should I emit
+    # this filter" checks exactly (same field tuples/comparisons), so the
+    # export graph and any other consumer (e.g. the timeline's per-clip
+    # effect-indicator badges, `ui/widgets/timeline_items.py::ClipItem`)
+    # never drift apart on what counts as "non-default."
+    @property
+    def has_color_correction(self) -> bool:
+        """Whether brightness/contrast/saturation/gamma differ from ``eq``'s neutral defaults."""
+        return (self.brightness, self.contrast, self.saturation, self.gamma) != (0.0, 1.0, 1.0, 1.0)
+
+    @property
+    def has_chroma_key(self) -> bool:
+        return self.chroma_key_enabled
+
+    @property
+    def has_denoise(self) -> bool:
+        return self.denoise_enabled
+
+    @property
+    def has_transition(self) -> bool:
+        return self.transition_out != TransitionType.NONE
+
     def contains_time(self, t: float) -> bool:
         return self.timeline_start <= t < self.timeline_end
 
@@ -266,6 +318,8 @@ class Clip:
             "volume": self.volume,
             "muted": self.muted,
             "speed": self.speed,
+            "denoise_enabled": self.denoise_enabled,
+            "denoise_strength": self.denoise_strength,
             "opacity": self.opacity,
             "fade_in": self.fade_in,
             "fade_out": self.fade_out,
@@ -309,6 +363,8 @@ class Clip:
             volume=data.get("volume", 1.0),
             muted=data.get("muted", False),
             speed=data.get("speed", 1.0),
+            denoise_enabled=data.get("denoise_enabled", False),
+            denoise_strength=data.get("denoise_strength", 12.0),
             opacity=data.get("opacity", 1.0),
             fade_in=data.get("fade_in", 0.0),
             fade_out=data.get("fade_out", 0.0),

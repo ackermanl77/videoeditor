@@ -342,6 +342,7 @@ class TimelineWidget(QWidget):
         self.signals.track_mute_toggled.connect(self._on_track_mute_toggled)
         self.signals.track_lock_toggled.connect(self._on_track_lock_toggled)
         self.signals.track_hidden_toggled.connect(self._on_track_hidden_toggled)
+        self.signals.track_duck_config_requested.connect(self._on_track_duck_config_requested)
         self.signals.snap_guide_show.connect(self._on_snap_guide_show)
         self.signals.snap_guide_hide.connect(self._on_snap_guide_hide)
         self.signals.marker_clicked.connect(self._on_marker_clicked)
@@ -393,6 +394,7 @@ class TimelineWidget(QWidget):
             header.mute_btn.active = track.muted
             header.lock_btn.active = track.locked
             header.hide_btn.active = track.hidden
+            header.duck_btn.active = bool(track.duck_trigger_track_id)
             self.scene.addItem(header)
             self._header_items.append(header)
 
@@ -792,6 +794,48 @@ class TimelineWidget(QWidget):
             return
         track = self._row_tracks[row]
         track.hidden = not track.hidden
+        self.rebuild()
+        self._emit_modified()
+
+    def _on_track_duck_config_requested(self, row: int) -> None:
+        """"Duck Audio Under..." picker: sidechain-compress this track's audio under another track's.
+
+        Minimal, deliberately not-elaborate UI (matching the mute/lock/hide
+        controls' own directness): a single combo-box dialog listing every
+        other track by name, plus "None" to clear ducking. The actual
+        threshold/ratio/attack/release stay at Track's defaults -- not
+        exposed here, same scoping call as e.g. crossfade duration being the
+        only exposed crossfade parameter.
+        """
+        if self.project is None or not self._row_tracks or row >= len(self._row_tracks):
+            return
+        track = self._row_tracks[row]
+        other_tracks = [t for t in self.project.tracks if t.id != track.id]
+        options = ["None (no ducking)"] + [t.name for t in other_tracks]
+        current_index = 0
+        if track.duck_trigger_track_id:
+            for i, t in enumerate(other_tracks):
+                if t.id == track.duck_trigger_track_id:
+                    current_index = i + 1
+                    break
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Duck Audio Under",
+            f'"{track.name}" ducks (lowers volume) under which track\'s audio?',
+            options,
+            current_index,
+            editable=False,
+        )
+        if not ok:
+            return
+        if choice == options[0]:
+            track.duck_trigger_track_id = None
+        else:
+            chosen_track = other_tracks[options.index(choice) - 1]
+            track.duck_trigger_track_id = chosen_track.id
+        # Rebuild so the header's duck-toggle indicator (active/inactive)
+        # reflects the new value immediately, the same way mute/lock/hide's
+        # own handlers rebuild right after mutating their track field.
         self.rebuild()
         self._emit_modified()
 

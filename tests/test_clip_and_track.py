@@ -2,7 +2,7 @@
 
 import unittest
 
-from core.clip import Clip, MediaType, TextStyle
+from core.clip import Clip, MediaType, TextStyle, TransitionType
 from core.track import Track, TrackType
 
 
@@ -71,6 +71,65 @@ class ClipDurationTests(unittest.TestCase):
         self.assertEqual(restored.text_style.font_size, 60)
         self.assertAlmostEqual(restored.timeline_start, 1.5)
 
+    def test_denoise_fields_default_off_and_round_trip(self):
+        clip = Clip(media_type=MediaType.AUDIO, source_in=0.0, source_out=5.0)
+        self.assertFalse(clip.denoise_enabled)
+        self.assertAlmostEqual(clip.denoise_strength, 12.0)
+
+        clip.denoise_enabled = True
+        clip.denoise_strength = 30.0
+        restored = Clip.from_dict(clip.to_dict())
+        self.assertTrue(restored.denoise_enabled)
+        self.assertAlmostEqual(restored.denoise_strength, 30.0)
+
+    def test_new_transition_types_round_trip(self):
+        for transition in (
+            TransitionType.WIPE_LEFT, TransitionType.SLIDE_UP,
+            TransitionType.CIRCLE_CROP, TransitionType.DISSOLVE,
+        ):
+            with self.subTest(transition=transition):
+                clip = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0, transition_out=transition)
+                restored = Clip.from_dict(clip.to_dict())
+                self.assertEqual(restored.transition_out, transition)
+
+
+class ClipEffectFlagTests(unittest.TestCase):
+    """``Clip.has_*`` mirror filter_graph.py's own "should I emit this
+    filter" checks exactly -- both it and the timeline's per-clip
+    effect-indicator badges (``ui/widgets/timeline_items.py::ClipItem``)
+    read these instead of duplicating the field comparisons.
+    """
+
+    def test_default_clip_has_no_active_effects(self):
+        clip = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0)
+        self.assertFalse(clip.has_color_correction)
+        self.assertFalse(clip.has_chroma_key)
+        self.assertFalse(clip.has_denoise)
+        self.assertFalse(clip.has_transition)
+
+    def test_has_color_correction_true_if_any_single_field_is_non_neutral(self):
+        for field_name, value in (("brightness", 0.1), ("contrast", 1.2), ("saturation", 0.5), ("gamma", 1.3)):
+            with self.subTest(field=field_name):
+                clip = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0)
+                setattr(clip, field_name, value)
+                self.assertTrue(clip.has_color_correction)
+
+    def test_has_chroma_key_tracks_the_enabled_flag(self):
+        clip = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0, chroma_key_enabled=True)
+        self.assertTrue(clip.has_chroma_key)
+
+    def test_has_denoise_tracks_the_enabled_flag(self):
+        clip = Clip(media_type=MediaType.AUDIO, source_in=0.0, source_out=5.0, denoise_enabled=True)
+        self.assertTrue(clip.has_denoise)
+
+    def test_has_transition_false_for_none_true_otherwise(self):
+        none_clip = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0)
+        self.assertFalse(none_clip.has_transition)
+        fade_clip = Clip(
+            media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0, transition_out=TransitionType.DISSOLVE
+        )
+        self.assertTrue(fade_clip.has_transition)
+
 
 class TrackOverlapTests(unittest.TestCase):
     def test_no_overlap_when_sequential(self):
@@ -96,6 +155,28 @@ class TrackOverlapTests(unittest.TestCase):
         self.assertEqual(track.clip_at(2.0).id, a.id)
         self.assertEqual(track.clip_at(7.0).id, b.id)
         self.assertIsNone(track.clip_at(20.0))
+
+
+class TrackDuckingFieldsTests(unittest.TestCase):
+    def test_ducking_fields_default_to_no_trigger(self):
+        track = Track(track_type=TrackType.AUDIO)
+        self.assertIsNone(track.duck_trigger_track_id)
+
+    def test_ducking_fields_round_trip(self):
+        trigger = Track(track_type=TrackType.AUDIO, name="Narration")
+        music = Track(track_type=TrackType.AUDIO, name="Music")
+        music.duck_trigger_track_id = trigger.id
+        music.duck_threshold = 0.08
+        music.duck_ratio = 6.0
+        music.duck_attack = 10.0
+        music.duck_release = 300.0
+
+        restored = Track.from_dict(music.to_dict())
+        self.assertEqual(restored.duck_trigger_track_id, trigger.id)
+        self.assertAlmostEqual(restored.duck_threshold, 0.08)
+        self.assertAlmostEqual(restored.duck_ratio, 6.0)
+        self.assertAlmostEqual(restored.duck_attack, 10.0)
+        self.assertAlmostEqual(restored.duck_release, 300.0)
 
 
 if __name__ == "__main__":

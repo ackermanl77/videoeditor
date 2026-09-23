@@ -93,6 +93,25 @@ MEDIA_TYPE_LABEL = {
     MediaType.TEXT: "Text Clip",
 }
 
+# Every transition supported by build_filter_graph's xfade path (see
+# core/filter_graph.py::_XFADE_TRANSITION_NAMES), in the order offered by
+# the combo box. NONE is first ("no transition"); CROSSFADE is the original,
+# simplest option, followed by the newer wipe/slide/circle/dissolve variety.
+TRANSITION_LABELS = [
+    (TransitionType.NONE, "None"),
+    (TransitionType.CROSSFADE, "Crossfade"),
+    (TransitionType.WIPE_LEFT, "Wipe Left"),
+    (TransitionType.WIPE_RIGHT, "Wipe Right"),
+    (TransitionType.WIPE_UP, "Wipe Up"),
+    (TransitionType.WIPE_DOWN, "Wipe Down"),
+    (TransitionType.SLIDE_LEFT, "Slide Left"),
+    (TransitionType.SLIDE_RIGHT, "Slide Right"),
+    (TransitionType.SLIDE_UP, "Slide Up"),
+    (TransitionType.SLIDE_DOWN, "Slide Down"),
+    (TransitionType.CIRCLE_CROP, "Circle Crop"),
+    (TransitionType.DISSOLVE, "Dissolve"),
+]
+
 
 class PropertiesPanel(QWidget):
     """Displays and edits the properties of the currently selected clip."""
@@ -164,6 +183,16 @@ class PropertiesPanel(QWidget):
 
         self.mute_checkbox = QCheckBox("Mute audio")
         clip_form.addRow("", self.mute_checkbox)
+
+        self.denoise_checkbox = QCheckBox("Reduce noise (afftdn)")
+        self.denoise_checkbox.setToolTip(
+            "Applies FFmpeg's afftdn audio noise-reduction filter to this clip's audio."
+        )
+        clip_form.addRow("", self.denoise_checkbox)
+
+        self.denoise_strength_slider = QSlider(Qt.Horizontal)
+        self.denoise_strength_slider.setRange(1, 97)  # afftdn's nr option range x1 (whole dB)
+        clip_form.addRow("Denoise Strength", self.denoise_strength_slider)
 
         self.speed_spin = QDoubleSpinBox()
         self.speed_spin.setRange(0.25, 4.0)
@@ -300,12 +329,14 @@ class PropertiesPanel(QWidget):
         self.transition_group = CollapsibleGroupBox("Transition", start_expanded=False)
         transition_form = QFormLayout(self.transition_group)
 
-        self.crossfade_checkbox = QCheckBox("Crossfade into next clip")
-        self.crossfade_checkbox.setToolTip(
+        self.transition_combo = QComboBox()
+        self.transition_combo.setToolTip(
             "Blends this clip's tail into the next clip on the same track, "
             "if it immediately follows with no gap."
         )
-        transition_form.addRow("", self.crossfade_checkbox)
+        for value, label in TRANSITION_LABELS:
+            self.transition_combo.addItem(label, value.value)
+        transition_form.addRow("Transition Out", self.transition_combo)
 
         self.transition_duration_spin = QDoubleSpinBox()
         self.transition_duration_spin.setRange(0.1, 10.0)
@@ -418,6 +449,12 @@ class PropertiesPanel(QWidget):
         self.opacity_slider.sliderReleased.connect(lambda: self._commit("opacity", self.opacity_slider.value() / 100.0, "Edit Opacity"))
 
         self.mute_checkbox.toggled.connect(lambda checked: self._commit_now("muted", checked, "Toggle Mute"))
+
+        self.denoise_checkbox.toggled.connect(lambda checked: self._commit_now("denoise_enabled", checked, "Toggle Noise Reduction"))
+        self.denoise_strength_slider.sliderPressed.connect(lambda: self._remember("denoise_strength", float(self.denoise_strength_slider.value())))
+        self.denoise_strength_slider.valueChanged.connect(lambda v: self._apply_live("denoise_strength", float(v)))
+        self.denoise_strength_slider.sliderReleased.connect(lambda: self._commit("denoise_strength", float(self.denoise_strength_slider.value()), "Edit Denoise Strength"))
+
         self.speed_spin.editingFinished.connect(lambda: self._commit_now("speed", self.speed_spin.value(), "Edit Speed"))
         self.fade_in_spin.editingFinished.connect(lambda: self._commit_now("fade_in", self.fade_in_spin.value(), "Edit Fade In"))
         self.fade_out_spin.editingFinished.connect(lambda: self._commit_now("fade_out", self.fade_out_spin.value(), "Edit Fade Out"))
@@ -448,7 +485,7 @@ class PropertiesPanel(QWidget):
         self.crop_focus_y_slider.valueChanged.connect(lambda v: self._apply_live("crop_focus_y", v / 100.0))
         self.crop_focus_y_slider.sliderReleased.connect(lambda: self._commit("crop_focus_y", self.crop_focus_y_slider.value() / 100.0, "Edit Crop Focus"))
 
-        self.crossfade_checkbox.toggled.connect(self._on_crossfade_toggled)
+        self.transition_combo.currentIndexChanged.connect(self._on_transition_changed)
         self.transition_duration_spin.editingFinished.connect(
             lambda: self._commit_now("transition_duration", self.transition_duration_spin.value(), "Edit Transition Duration")
         )
@@ -545,6 +582,8 @@ class PropertiesPanel(QWidget):
 
         self.volume_slider.setValue(int(clip.volume * 100))
         self.mute_checkbox.setChecked(clip.muted)
+        self.denoise_checkbox.setChecked(clip.denoise_enabled)
+        self.denoise_strength_slider.setValue(int(clip.denoise_strength))
         self.speed_spin.setValue(clip.speed)
         self.opacity_slider.setValue(int(clip.opacity * 100))
         self.fade_in_spin.setValue(clip.fade_in)
@@ -567,9 +606,10 @@ class PropertiesPanel(QWidget):
             self._refresh_position_keyframe_table(clip.position_keyframes)
             self._refresh_speed_keyframe_table(clip.speed_keyframes)
 
-            self.crossfade_checkbox.setChecked(clip.transition_out == TransitionType.CROSSFADE)
+            combo_idx = self.transition_combo.findData(clip.transition_out.value)
+            self.transition_combo.setCurrentIndex(combo_idx if combo_idx >= 0 else 0)
             self.transition_duration_spin.setValue(clip.transition_duration)
-            self.transition_duration_spin.setEnabled(clip.transition_out == TransitionType.CROSSFADE)
+            self.transition_duration_spin.setEnabled(clip.transition_out != TransitionType.NONE)
 
             self.brightness_slider.setValue(int(clip.brightness * 100))
             self.contrast_slider.setValue(int(clip.contrast * 100))
@@ -762,10 +802,12 @@ class PropertiesPanel(QWidget):
         self._commit_now("speed_keyframes", keyframes, "Remove Speed Keyframe")
         self._refresh_speed_keyframe_table(keyframes)
 
-    def _on_crossfade_toggled(self, checked: bool) -> None:
-        self.transition_duration_spin.setEnabled(checked)
-        new_value = TransitionType.CROSSFADE if checked else TransitionType.NONE
-        self._commit_now("transition_out", new_value, "Toggle Crossfade")
+    def _on_transition_changed(self, index: int) -> None:
+        if self._loading or index < 0:
+            return
+        new_value = TransitionType(self.transition_combo.itemData(index))
+        self.transition_duration_spin.setEnabled(new_value != TransitionType.NONE)
+        self._commit_now("transition_out", new_value, "Edit Transition")
 
     def _pick_chroma_color(self) -> None:
         color = QColorDialog.getColor(self._chroma_color, self, "Chroma Key Color")

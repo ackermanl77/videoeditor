@@ -609,5 +609,173 @@ class TrimRangeTests(unittest.TestCase):
         self.assertIn("trim=start=1.000:end=10.000,setpts=PTS-STARTPTS[trimout_v]", graph.filter_complex)
 
 
+class DenoiseTests(unittest.TestCase):
+    def test_afftdn_added_when_denoise_enabled_on_audio_only_clip(self):
+        project = Project()
+        audio_track = [t for t in project.tracks if t.track_type == TrackType.AUDIO][0]
+        audio_track.clips.append(
+            Clip(
+                media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8,
+                timeline_start=0, denoise_enabled=True, denoise_strength=20.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("afftdn=nr=20.000", graph.filter_complex)
+
+    def test_afftdn_omitted_when_denoise_disabled(self):
+        project = Project()
+        audio_track = [t for t in project.tracks if t.track_type == TrackType.AUDIO][0]
+        audio_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("afftdn", graph.filter_complex)
+
+    def test_afftdn_applied_to_a_video_clips_own_audio(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, denoise_enabled=True, denoise_strength=12.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("afftdn=nr=12.000", graph.filter_complex)
+
+    def test_afftdn_applied_to_speed_ramped_clips_audio(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0,
+                speed_keyframes=[(0.0, 1.0), (4.0, 2.0)], denoise_enabled=True, denoise_strength=15.0,
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("afftdn=nr=15.000", graph.filter_complex)
+
+
+class TransitionVarietyTests(unittest.TestCase):
+    def _pair_project(self, transition: TransitionType):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=False))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=0, transition_out=transition, transition_duration=1.0,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=5)
+        )
+        return project
+
+    def test_each_xfade_transition_name_is_emitted(self):
+        cases = [
+            (TransitionType.WIPE_LEFT, "wipeleft"),
+            (TransitionType.WIPE_RIGHT, "wiperight"),
+            (TransitionType.WIPE_UP, "wipeup"),
+            (TransitionType.WIPE_DOWN, "wipedown"),
+            (TransitionType.SLIDE_LEFT, "slideleft"),
+            (TransitionType.SLIDE_RIGHT, "slideright"),
+            (TransitionType.SLIDE_UP, "slideup"),
+            (TransitionType.SLIDE_DOWN, "slidedown"),
+            (TransitionType.CIRCLE_CROP, "circlecrop"),
+            (TransitionType.DISSOLVE, "dissolve"),
+        ]
+        for transition_type, xfade_name in cases:
+            with self.subTest(transition_type=transition_type):
+                project = self._pair_project(transition_type)
+                graph = build_filter_graph(project, ProjectSettings())
+                self.assertIn(f"xfade=transition={xfade_name}:duration=1.000", graph.filter_complex)
+
+    def test_crossfade_still_maps_to_fade_for_backward_compatibility(self):
+        project = self._pair_project(TransitionType.CROSSFADE)
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("xfade=transition=fade:duration=1.000", graph.filter_complex)
+
+    def test_none_transition_never_forms_a_pair(self):
+        project = self._pair_project(TransitionType.NONE)
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("xfade", graph.filter_complex)
+
+
+class AudioDuckingTests(unittest.TestCase):
+    def test_sidechaincompress_ducks_music_under_narration(self):
+        project = Project()
+        # tracks[0] = default Video 1, tracks[1] = default Audio 1 (narration)
+        narration_track = project.tracks[1]
+        music_track = project.add_track(TrackType.AUDIO, name="Music")
+        music_track.duck_trigger_track_id = narration_track.id
+
+        narration_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/narration.mp3", source_in=0, source_out=10, timeline_start=0)
+        )
+        music_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/music.mp3", source_in=0, source_out=10, timeline_start=0)
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("sidechaincompress=threshold=", graph.filter_complex)
+        # Both the narration's own audio and the ducked-music output must
+        # still reach the final mix (narration keeps playing at full volume;
+        # only music gets compressed).
+        self.assertEqual(graph.filter_complex.count("amix=inputs=2"), 1)
+
+    def test_no_ducking_field_produces_identical_graph_to_before(self):
+        project = Project()
+        audio_track = project.tracks[1]
+        audio_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("sidechaincompress", graph.filter_complex)
+
+    def test_ducking_ignored_when_trigger_track_has_no_audio(self):
+        project = Project()
+        narration_track = project.tracks[1]
+        music_track = project.add_track(TrackType.AUDIO, name="Music")
+        music_track.duck_trigger_track_id = narration_track.id
+        # Narration track has no clips at all -- nothing to duck against.
+        music_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/music.mp3", source_in=0, source_out=10, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("sidechaincompress", graph.filter_complex)
+        self.assertIn("amix=inputs=1", graph.filter_complex)
+
+    def test_self_referencing_trigger_is_ignored(self):
+        project = Project()
+        audio_track = project.tracks[1]
+        audio_track.duck_trigger_track_id = audio_track.id  # nonsensical, must be a no-op
+        audio_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/song.mp3", source_in=0, source_out=8, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("sidechaincompress", graph.filter_complex)
+
+    def test_ducking_a_video_tracks_embedded_audio_under_an_audio_track(self):
+        project = Project()
+        video_track = project.tracks[0]
+        narration_track = project.tracks[1]
+        video_track.duck_trigger_track_id = narration_track.id
+
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+        video_track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        narration_track.clips.append(
+            Clip(media_type=MediaType.AUDIO, source_path="/media/narration.mp3", source_in=0, source_out=5, timeline_start=0)
+        )
+
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("sidechaincompress", graph.filter_complex)
+
+
 if __name__ == "__main__":
     unittest.main()
