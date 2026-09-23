@@ -117,7 +117,9 @@ python main.py
 
 ## Documentation
 
-`docs/PROJECT_STATUS.md` is the authoritative reference for architecture, entry points, release info, and known limitations — this README only covers day-to-day commands. Per-feature guides (media import, timeline editing, export, project files, packaging, ...) live under [docs/workflows/](docs/workflows/README.md).
+New to the app? [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) walks through the whole interface and every feature in plain language, aimed at people using the app rather than building it.
+
+`docs/PROJECT_STATUS.md` is the authoritative reference for architecture, entry points, release info, and known limitations — this README only covers day-to-day commands. Per-feature guides (media import, timeline editing, export, project files, packaging, ...) live under [docs/workflows/](docs/workflows/README.md) — these are implementation-focused, for contributors.
 
 ## Running the tests
 
