@@ -193,7 +193,7 @@ class PreviewPlayer(QWidget):
         self.time_changed.emit(t)
 
     def _load_for_time(self, t: float, autoplay: bool) -> None:
-        clip, _track = self._resolve_active_clip(t)
+        clip, track = self._resolve_active_clip(t)
         self._active_clip = clip
 
         if clip is None:
@@ -236,7 +236,9 @@ class PreviewPlayer(QWidget):
             self._current_source = clip.source_path
         self.player.setPlaybackRate(clip.speed if clip.speed > 0 else 1.0)
         self.player.setPosition(int(max(0.0, source_position_s) * 1000))
-        self.audio_output.setMuted(clip.muted)
+        # A muted *track* silences its clips too (matching export, see
+        # core/filter_graph.py); this used to honor only the clip's own flag.
+        self.audio_output.setMuted(clip.muted or (track is not None and track.muted))
         self.audio_output.setVolume(max(0.0, min(1.0, clip.volume)))
 
         if autoplay:

@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass
+import os
+import tempfile
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, ReframeMode, TransitionType
@@ -98,20 +100,54 @@ def _clip_has_audio(project: Project, clip: Clip, probe_cache: Dict[str, bool]) 
     return has_audio
 
 
-def _escape_path(path: str) -> str:
-    """Escape a filesystem path for safe use inside a filter option value."""
-    escaped = path.replace("\\", "/")
-    escaped = escaped.replace(":", "\\:")
-    return escaped
+def _escape_filter_value(value: str) -> str:
+    """Escape an arbitrary string for use as one filter option's value inside ``-filter_complex``.
+
+    FFmpeg parses a filtergraph description at two levels, each with its own
+    escaping (see "Notes on filtergraph escaping" in ffmpeg-filters(1)):
+
+    1. the option value itself (``key=value`` inside one filter's argument
+       list), where backslash, ``'`` and ``:`` are special; then
+    2. the whole filtergraph string, where backslash, ``'``, ``[``, ``]``,
+       ``,`` and ``;`` are special.
+
+    Escaping for level 1 first and then level 2 lets any string survive
+    both parsers unchanged. Used for a text overlay's ``textfile=`` path,
+    which comes from ``tempfile`` and so can contain a drive-letter colon,
+    spaces, or even an apostrophe in a Windows user name.
+    """
+    level1 = "".join("\\" + ch if ch in "\\':" else ch for ch in value)
+    return "".join("\\" + ch if ch in "\\'[],;" else ch for ch in level1)
 
 
-def _escape_text(text: str) -> str:
-    """Escape literal text for use inside an FFmpeg ``drawtext`` filter."""
-    escaped = text.replace("\\", "\\\\")
-    escaped = escaped.replace(":", "\\:")
-    escaped = escaped.replace("'", "\\'")
-    escaped = escaped.replace("%", "\\%")
-    return escaped
+def _write_text_file(content: str) -> str:
+    """Write a text overlay's content to a temp UTF-8 file for ``drawtext=textfile=``.
+
+    Passing the text through a file (with ``expansion=none``) instead of
+    inline ``text='...'`` sidesteps drawtext's own escaping rules entirely:
+    the previous inline approach backslash-escaped ``'``/``%``/``:`` inside
+    a single-quoted value, where a backslash is literal and a ``'`` always
+    ends the quote -- so e.g. "Don't stop" or "50% at 10:30" made FFmpeg
+    reject the whole export. ``expansion=none`` also stops drawtext treating
+    ``%{...}`` sequences in the user's text as expansions. Written with
+    ``newline=""`` so a multi-line overlay's line breaks reach drawtext as
+    plain LF (a Windows CRLF would render the CR as a glyph). The caller
+    owns the returned file's lifetime -- see :meth:`GraphResult.cleanup`.
+    """
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ve_text_")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    return path
+
+
+def _adelay_filter(seconds: float) -> str:
+    """``adelay`` shifting *every* channel of a stream by ``seconds``.
+
+    ``all=1`` applies the one delay to all channels -- the previous
+    ``adelay=<ms>|<ms>`` form only delayed the first two, so a 5.1 (or any
+    3+ channel) source had its remaining channels play early, out of sync.
+    """
+    return f"adelay=delays={int(round(seconds * 1000))}:all=1"
 
 
 def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t") -> str:
@@ -194,6 +230,21 @@ class GraphResult:
     video_out_label: str
     audio_out_label: str
     has_audio: bool
+    # Temp files the filter graph references by path (currently: one UTF-8
+    # text file per text overlay, see _write_text_file) and so must outlive
+    # every FFmpeg run using this graph. Whoever builds the graph owns them
+    # and must call cleanup() when done -- core/exporter.py does so in a
+    # `finally` around the whole export (every pass/fallback attempt).
+    temp_files: List[str] = field(default_factory=list)
+
+    def cleanup(self) -> None:
+        """Delete every temp file this graph created. Safe to call repeatedly."""
+        for path in self.temp_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self.temp_files = []
 
 
 def _register_video_input(clip: Clip, fps: float, input_specs: List[InputSpec]) -> int:
@@ -317,6 +368,24 @@ def _video_fade_and_opacity_suffix(clip: Clip, skip_fade_in: bool = False, skip_
     return suffix
 
 
+def _register_speed_ramp_inputs(clip: Clip, input_specs: List[InputSpec]) -> List[Tuple[int, float, float, float]]:
+    """Register one seeked ``-i`` per speed segment of ``clip``.
+
+    Returns each segment's ``(input_index, source_in, source_out, speed)``.
+    Split out of ``_build_speed_ramp_video_chain`` so a clip on a *hidden*
+    video track (no picture, audio still plays) can get the same per-segment
+    inputs for ``_maybe_add_speed_ramped_audio`` without building video
+    chains nothing would consume (an unconsumed filter output makes FFmpeg
+    refuse to run; an unused input stream is harmless).
+    """
+    segment_specs: List[Tuple[int, float, float, float]] = []
+    for seg_in, seg_out, seg_speed in clip.speed_segments:
+        idx = len(input_specs)
+        input_specs.append(InputSpec(pre_args=["-ss", f"{max(0.0, seg_in):.3f}"], path=clip.source_path))
+        segment_specs.append((idx, seg_in, seg_out, seg_speed))
+    return segment_specs
+
+
 def _build_speed_ramp_video_chain(
     clip: Clip,
     width: int,
@@ -345,12 +414,8 @@ def _build_speed_ramp_video_chain(
     already made for a crossfading clip, and for the same reason).
     """
     seg_labels: List[str] = []
-    segment_specs: List[Tuple[int, float, float, float]] = []
-    for i, (seg_in, seg_out, seg_speed) in enumerate(clip.speed_segments):
-        idx = len(input_specs)
-        input_specs.append(InputSpec(pre_args=["-ss", f"{max(0.0, seg_in):.3f}"], path=clip.source_path))
-        segment_specs.append((idx, seg_in, seg_out, seg_speed))
-
+    segment_specs = _register_speed_ramp_inputs(clip, input_specs)
+    for i, (idx, seg_in, seg_out, seg_speed) in enumerate(segment_specs):
         seg_chain = f"[{idx}:v]trim=duration={(seg_out - seg_in):.3f},setpts=PTS-STARTPTS"
         if abs(seg_speed - 1.0) > 1e-6:
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
@@ -440,8 +505,7 @@ def _maybe_add_speed_ramped_audio(
     if abs(clip.volume - 1.0) > 1e-6:
         tail += f",volume={clip.volume:.3f}"
     if clip.timeline_start > 0:
-        delay_ms = int(clip.timeline_start * 1000)
-        tail += f",adelay={delay_ms}|{delay_ms}"
+        tail += f",{_adelay_filter(clip.timeline_start)}"
 
     if tail:
         final_label = f"sr{counter}af"
@@ -594,6 +658,7 @@ def build_filter_graph(
     # which has to isolate one track's own mixed audio from another's.
     audio_labels_by_track: Dict[str, List[str]] = {}
     text_clips: List[Clip] = []
+    temp_files: List[str] = []
 
     # Base canvas: solid black, full project duration.
     filter_lines.append(
@@ -607,8 +672,16 @@ def build_filter_graph(
     probe_cache: Dict[str, bool] = {}
 
     # ---- Video tracks (bottom to top = list order) ----
+    # A track's `hidden` flag removes its *picture* (video layers and text
+    # overlays) but keeps its audio playing; `muted` removes its audio but
+    # keeps the picture -- the same split every NLE uses for the eye/speaker
+    # toggles. (Hidden previously skipped the whole track, silently dropping
+    # its audio too, and `muted` was ignored entirely for a video track's own
+    # embedded audio.)
     for track_order, track in enumerate(video_tracks):
-        if track.hidden:
+        render_video = not track.hidden
+        render_audio = not track.muted
+        if not render_video and not render_audio:
             continue
         sorted_clips = track.sorted_clips()
         consumed_as_partner = set()
@@ -617,7 +690,8 @@ def build_filter_graph(
             if i in consumed_as_partner:
                 continue
             if clip.media_type == MediaType.TEXT:
-                text_clips.append(clip)
+                if render_video:
+                    text_clips.append(clip)
                 continue
             if clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
                 continue
@@ -630,36 +704,47 @@ def build_filter_graph(
                 # (see _build_speed_ramp_video_chain's docstring); position
                 # (static or keyframed) still does, since that's resolved
                 # separately at the compositing/overlay step below.
-                body_label, segment_specs = _build_speed_ramp_video_chain(
-                    clip, width, height, clip_counter, filter_lines, input_specs
-                )
-                suffix = _video_fade_and_opacity_suffix(clip)
-                if suffix:
-                    faded_label = f"sr{clip_counter}f"
-                    filter_lines.append(f"[{body_label}]{suffix.lstrip(',')}[{faded_label}]")
-                    body_label = faded_label
-                if clip.timeline_start > 0:
-                    tpad_label = f"v{clip_counter}"
-                    filter_lines.append(
-                        f"[{body_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{tpad_label}]"
+                if render_video:
+                    body_label, segment_specs = _build_speed_ramp_video_chain(
+                        clip, width, height, clip_counter, filter_lines, input_specs
                     )
-                    body_label = tpad_label
-                video_layer_labels.append((track_order, clip.timeline_start, body_label, _position_expr(clip)))
-                _before = len(audio_labels)
-                _maybe_add_speed_ramped_audio(project, clip, segment_specs, clip_counter, filter_lines, audio_labels, probe_cache)
-                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
+                    suffix = _video_fade_and_opacity_suffix(clip)
+                    if suffix:
+                        faded_label = f"sr{clip_counter}f"
+                        filter_lines.append(f"[{body_label}]{suffix.lstrip(',')}[{faded_label}]")
+                        body_label = faded_label
+                    if clip.timeline_start > 0:
+                        tpad_label = f"v{clip_counter}"
+                        filter_lines.append(
+                            f"[{body_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{tpad_label}]"
+                        )
+                        body_label = tpad_label
+                    video_layer_labels.append((track_order, clip.timeline_start, body_label, _position_expr(clip)))
+                elif _clip_is_audible(project, clip, probe_cache):
+                    segment_specs = _register_speed_ramp_inputs(clip, input_specs)
+                else:
+                    segment_specs = []
+                if render_audio and segment_specs:
+                    _before = len(audio_labels)
+                    _maybe_add_speed_ramped_audio(project, clip, segment_specs, clip_counter, filter_lines, audio_labels, probe_cache)
+                    audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             elif partner_i is None:
-                idx = _register_video_input(clip, fps, input_specs)
-                chain = _build_video_clip_chain(idx, clip, width, height)
-                if clip.timeline_start > 0:
-                    chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
-                label = f"v{clip_counter}"
-                filter_lines.append(f"{chain}[{label}]")
-                video_layer_labels.append((track_order, clip.timeline_start, label, _position_expr(clip)))
-                _before = len(audio_labels)
-                _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
-                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
+                idx: Optional[int] = None
+                if render_video:
+                    idx = _register_video_input(clip, fps, input_specs)
+                    chain = _build_video_clip_chain(idx, clip, width, height)
+                    if clip.timeline_start > 0:
+                        chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
+                    label = f"v{clip_counter}"
+                    filter_lines.append(f"{chain}[{label}]")
+                    video_layer_labels.append((track_order, clip.timeline_start, label, _position_expr(clip)))
+                if render_audio and _clip_is_audible(project, clip, probe_cache):
+                    if idx is None:
+                        idx = _register_video_input(clip, fps, input_specs)
+                    _before = len(audio_labels)
+                    _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
+                    audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             else:
                 # Crossfade pair: build each side's chain up to (not including)
@@ -667,56 +752,66 @@ def build_filter_graph(
                 # then merge and shift into position as a single layer.
                 partner = sorted_clips[partner_i]
                 d = _crossfade_duration(clip, partner)
-
-                # xfade requires constant-frame-rate inputs ("inputs needs to
-                # be a constant frame rate" is a hard failure otherwise) —
-                # neither trim/setpts nor the final -r output flag guarantees
-                # that on their own, so force it explicitly on both sides
-                # feeding into it. Standalone clips don't need this: overlay
-                # has no such requirement, and the exporter's -r already
-                # fixes the final output rate.
-                idx_a = _register_video_input(clip, fps, input_specs)
-                chain_a = (
-                    _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True, apply_transform=False)
-                    + f",fps={fps}"
-                )
-                idx_b = _register_video_input(partner, fps, input_specs)
-                chain_b = (
-                    _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True, apply_transform=False)
-                    + f",fps={fps}"
-                )
-
-                label_a = f"xf{clip_counter}a"
-                label_b = f"xf{clip_counter}b"
-                filter_lines.append(f"{chain_a}[{label_a}]")
-                filter_lines.append(f"{chain_b}[{label_b}]")
-
-                merged_label = f"xf{clip_counter}"
                 offset = max(0.0, clip.duration - d)
-                xfade_name = _XFADE_TRANSITION_NAMES.get(clip.transition_out, "fade")
-                filter_lines.append(
-                    f"[{label_a}][{label_b}]xfade=transition={xfade_name}:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
-                )
 
-                final_label = f"v{clip_counter}"
-                if clip.timeline_start > 0:
-                    filter_lines.append(
-                        f"[{merged_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{final_label}]"
+                idx_a: Optional[int] = None
+                idx_b: Optional[int] = None
+                if render_video:
+                    # xfade requires constant-frame-rate inputs ("inputs needs to
+                    # be a constant frame rate" is a hard failure otherwise) —
+                    # neither trim/setpts nor the final -r output flag guarantees
+                    # that on their own, so force it explicitly on both sides
+                    # feeding into it. Standalone clips don't need this: overlay
+                    # has no such requirement, and the exporter's -r already
+                    # fixes the final output rate.
+                    idx_a = _register_video_input(clip, fps, input_specs)
+                    chain_a = (
+                        _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True, apply_transform=False)
+                        + f",fps={fps}"
                     )
-                else:
-                    final_label = merged_label
-                # Transform/position-keyframes don't apply mid-crossfade (see
-                # _build_video_clip_chain's docstring) — the merged output is
-                # always full-canvas, so center it same as the old behavior.
-                video_layer_labels.append((track_order, clip.timeline_start, final_label, ("0.5", "0.5")))
+                    idx_b = _register_video_input(partner, fps, input_specs)
+                    chain_b = (
+                        _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True, apply_transform=False)
+                        + f",fps={fps}"
+                    )
 
-                # Audio stays independent of the video crossfade (see
-                # _find_crossfade_partner's docstring) — each side keeps its
-                # own volume/fade/timeline position, meeting at a clean cut.
+                    label_a = f"xf{clip_counter}a"
+                    label_b = f"xf{clip_counter}b"
+                    filter_lines.append(f"{chain_a}[{label_a}]")
+                    filter_lines.append(f"{chain_b}[{label_b}]")
+
+                    merged_label = f"xf{clip_counter}"
+                    xfade_name = _XFADE_TRANSITION_NAMES.get(clip.transition_out, "fade")
+                    filter_lines.append(
+                        f"[{label_a}][{label_b}]xfade=transition={xfade_name}:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
+                    )
+
+                    final_label = f"v{clip_counter}"
+                    if clip.timeline_start > 0:
+                        filter_lines.append(
+                            f"[{merged_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{final_label}]"
+                        )
+                    else:
+                        final_label = merged_label
+                    # Transform/position-keyframes don't apply mid-crossfade (see
+                    # _build_video_clip_chain's docstring) — the merged output is
+                    # always full-canvas, so center it same as the old behavior.
+                    video_layer_labels.append((track_order, clip.timeline_start, final_label, ("0.5", "0.5")))
+
+                # Audio follows the video crossfade (see _crossfade_audio_clips):
+                # B's audio starts where xfade actually starts B's picture, and
+                # the two sides' audio crossfade over the same d-second overlap.
+                audio_a, audio_b = _crossfade_audio_clips(clip, partner, d, offset)
                 _before = len(audio_labels)
-                _maybe_add_audio(project, clip, idx_a, filter_lines, audio_labels, clip_counter, probe_cache)
+                if render_audio and _clip_is_audible(project, audio_a, probe_cache):
+                    if idx_a is None:
+                        idx_a = _register_video_input(clip, fps, input_specs)
+                    _maybe_add_audio(project, audio_a, idx_a, filter_lines, audio_labels, clip_counter, probe_cache)
                 clip_counter += 1
-                _maybe_add_audio(project, partner, idx_b, filter_lines, audio_labels, clip_counter, probe_cache)
+                if render_audio and _clip_is_audible(project, audio_b, probe_cache):
+                    if idx_b is None:
+                        idx_b = _register_video_input(partner, fps, input_specs)
+                    _maybe_add_audio(project, audio_b, idx_b, filter_lines, audio_labels, clip_counter, probe_cache)
                 clip_counter += 1
                 audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 consumed_as_partner.add(partner_i)
@@ -744,12 +839,13 @@ def build_filter_graph(
         if style is None:
             continue
         out_label = f"text{i}"
-        text_escaped = _escape_text(style.content)
+        text_path = _write_text_file(style.content)
+        temp_files.append(text_path)
         x_expr = f"(w-text_w)*{style.position_x:.3f}"
         y_expr = f"(h-text_h)*{style.position_y:.3f}"
         weight = ":bold=1" if style.bold else ""
         draw = (
-            f"[{current}]drawtext=text='{text_escaped}'"
+            f"[{current}]drawtext=textfile={_escape_filter_value(text_path.replace(os.sep, '/'))}:expansion=none"
             f":fontcolor={style.color}:fontsize={style.font_size}"
             f":bordercolor={style.outline_color}:borderw={style.outline_width}"
             f":x={x_expr}:y={y_expr}"
@@ -821,6 +917,7 @@ def build_filter_graph(
         video_out_label=video_out_label,
         audio_out_label=audio_out_label,
         has_audio=has_audio,
+        temp_files=temp_files,
     )
 
 
@@ -839,13 +936,47 @@ def _maybe_add_audio(
     (standalone clips and both sides of a crossfade pair) so the has-audio /
     muted / volume checks can't drift out of sync between them.
     """
-    if clip.media_type == MediaType.IMAGE:
-        return
-    if clip.muted or clip.volume <= 0:
-        return
-    if not _clip_has_audio(project, clip, probe_cache):
+    if not _clip_is_audible(project, clip, probe_cache):
         return
     audio_labels.append(_build_audio_chain(input_index, clip, filter_lines, counter))
+
+
+def _clip_is_audible(project: Project, clip: Clip, probe_cache: Dict[str, bool]) -> bool:
+    """Whether a video/image clip's own embedded audio would be mixed at all.
+
+    The clip-level half of the check (a track's own ``muted`` flag is the
+    caller's concern). Shared by ``_maybe_add_audio`` and the hidden-track
+    path in ``build_filter_graph``, which registers a clip's ``-i`` input
+    purely for its audio and so needs to know up front whether to bother.
+    """
+    if clip.media_type == MediaType.IMAGE:
+        return False
+    if clip.muted or clip.volume <= 0:
+        return False
+    return _clip_has_audio(project, clip, probe_cache)
+
+
+def _crossfade_audio_clips(clip: Clip, partner: Clip, d: float, offset: float) -> Tuple[Clip, Clip]:
+    """Audio-timing stand-ins for a crossfade pair's two sides.
+
+    ``xfade`` starts the partner's (B's) first frame ``offset`` seconds into
+    the merged layer -- i.e. at ``A.timeline_start + A.duration - d``, which
+    is ``d`` seconds *before* ``B.timeline_start``. B's audio used to stay at
+    ``B.timeline_start`` and so lagged its own picture by ``d`` for the whole
+    of clip B. The returned copy of B starts where its video actually does,
+    and the two sides' audio crossfade over the same ``d``-second overlap
+    (A fades out, B fades in), replacing each side's own fade there exactly
+    like ``skip_fade_out``/``skip_fade_in`` do on the video side.
+
+    Shallow copies: only scalar timing/fade fields are changed, and the
+    originals (the real model objects) are never mutated.
+    """
+    audio_a = copy.copy(clip)
+    audio_a.fade_out = d
+    audio_b = copy.copy(partner)
+    audio_b.timeline_start = clip.timeline_start + offset
+    audio_b.fade_in = d
+    return audio_a, audio_b
 
 
 def _build_audio_chain(
@@ -881,8 +1012,7 @@ def _build_audio_chain(
         chain += f",volume={clip.volume:.3f}"
 
     if clip.timeline_start > 0:
-        delay_ms = int(clip.timeline_start * 1000)
-        chain += f",adelay={delay_ms}|{delay_ms}"
+        chain += f",{_adelay_filter(clip.timeline_start)}"
 
     filter_lines.append(f"{chain}[{label}]")
     return label

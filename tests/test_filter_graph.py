@@ -7,10 +7,11 @@ media files. They protect against regressions in the graph-building logic
 """
 
 import math
+import os
 import unittest
 
 from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
-from core.filter_graph import _escape_text, build_filter_graph
+from core.filter_graph import _escape_filter_value, build_filter_graph
 from core.media_asset import MediaAsset
 from core.project import Project, ProjectSettings
 from core.track import TrackType
@@ -69,8 +70,14 @@ class FilterGraphTests(unittest.TestCase):
             )
         )
         graph = build_filter_graph(project, ProjectSettings())
-        self.assertIn("drawtext", graph.filter_complex)
-        self.assertIn("Hello World", graph.filter_complex)
+        self.addCleanup(graph.cleanup)
+        self.assertIn("drawtext=textfile=", graph.filter_complex)
+        self.assertIn(":expansion=none", graph.filter_complex)
+        # The text itself travels through a temp UTF-8 file, never inline.
+        self.assertNotIn("Hello World", graph.filter_complex)
+        self.assertEqual(len(graph.temp_files), 1)
+        with open(graph.temp_files[0], "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "Hello World")
 
     def test_image_clip_uses_loop_input(self):
         project = Project()
@@ -96,12 +103,51 @@ class FilterGraphTests(unittest.TestCase):
         self.assertTrue(graph.video_out_label)
 
 
-class TextEscapingTests(unittest.TestCase):
-    def test_escapes_special_characters(self):
-        escaped = _escape_text("Hello: World's 100% 'quote'")
-        self.assertNotIn("100%", escaped)  # % must be escaped
-        self.assertIn("\\:", escaped)
-        self.assertIn("\\'", escaped)
+class TextOverlayFileTests(unittest.TestCase):
+    """Regression tests: text containing ' or % used to break export.
+
+    The old inline ``drawtext=text='...'`` form backslash-escaped ``'`` and
+    ``%`` inside a single-quoted filter value, where a backslash is literal
+    and ``'`` always ends the quote -- "Don't stop" made FFmpeg reject the
+    whole graph. Text now goes through ``textfile=`` + ``expansion=none``.
+    """
+
+    def _graph_with_text(self, content):
+        project = Project()
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.TEXT, source_in=0, source_out=3, timeline_start=0, text_style=TextStyle(content=content))
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.addCleanup(graph.cleanup)
+        return graph
+
+    def test_special_characters_round_trip_through_the_text_file(self):
+        for content in ("Don't stop", "50% at 10:30", "a [b], c; d \\ e", "Árbol ñandú 日本", "%{pts}"):
+            with self.subTest(content=content):
+                graph = self._graph_with_text(content)
+                with open(graph.temp_files[0], "r", encoding="utf-8", newline="") as f:
+                    self.assertEqual(f.read(), content)
+                self.assertNotIn(content, graph.filter_complex)
+
+    def test_multiline_text_is_written_with_plain_newlines(self):
+        graph = self._graph_with_text("line one\nline two")
+        with open(graph.temp_files[0], "rb") as f:
+            self.assertEqual(f.read(), b"line one\nline two")
+
+    def test_cleanup_removes_the_temp_files(self):
+        graph = self._graph_with_text("bye")
+        path = graph.temp_files[0]
+        self.assertTrue(os.path.exists(path))
+        graph.cleanup()
+        self.assertFalse(os.path.exists(path))
+        graph.cleanup()  # idempotent
+
+    def test_escape_filter_value_escapes_both_parsing_levels(self):
+        # ':' is option-level special (one backslash, then that backslash is
+        # itself escaped at graph level); ',' is graph-level only.
+        self.assertEqual(_escape_filter_value("C:/a,b"), r"C\\:/a\,b")
+        self.assertEqual(_escape_filter_value("it's"), r"it\\\'s")
+        self.assertEqual(_escape_filter_value("plain/path.txt"), "plain/path.txt")
 
 
 class CrossfadeTransitionTests(unittest.TestCase):
@@ -183,6 +229,7 @@ class CrossfadeTransitionTests(unittest.TestCase):
         )
 
         graph = build_filter_graph(project, ProjectSettings())
+        self.addCleanup(graph.cleanup)
         self.assertNotIn("xfade", graph.filter_complex)
         self.assertIn("drawtext", graph.filter_complex)
 
@@ -775,6 +822,165 @@ class AudioDuckingTests(unittest.TestCase):
 
         graph = build_filter_graph(project, ProjectSettings())
         self.assertIn("sidechaincompress", graph.filter_complex)
+
+
+class AdelayAllChannelsTests(unittest.TestCase):
+    """adelay=<ms>|<ms> only delayed the first two channels -- a 5.1 source's
+    other channels played early. all=1 applies one delay to every channel."""
+
+    def test_video_clips_own_audio_uses_all_channels_delay(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=2.5)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("adelay=delays=2500:all=1", graph.filter_complex)
+        self.assertNotIn("|", graph.filter_complex)
+
+    def test_speed_ramped_audio_uses_all_channels_delay(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
+        project.tracks[0].clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=4, timeline_start=1.0,
+                speed_keyframes=[(0.0, 1.0), (2.0, 2.0)],
+            )
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("adelay=delays=1000:all=1", graph.filter_complex)
+
+
+def _video_audio_project(track_hidden=False, track_muted=False):
+    project = Project()
+    project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+    video_track = project.tracks[0]
+    video_track.hidden = track_hidden
+    video_track.muted = track_muted
+    video_track.clips.append(
+        Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+    )
+    return project, video_track
+
+
+class TrackHiddenMutedTests(unittest.TestCase):
+    """Hidden = no picture but audio keeps playing; muted = no audio.
+
+    Hidden used to skip the whole track (dropping its audio too), and a
+    video track's `muted` flag was ignored for its clips' embedded audio.
+    """
+
+    def test_visible_unmuted_track_has_video_and_audio(self):
+        project, _ = _video_audio_project()
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("[0:v]", graph.filter_complex)
+        self.assertIn("[0:a]", graph.filter_complex)
+
+    def test_hidden_track_keeps_its_audio_but_drops_its_picture(self):
+        project, _ = _video_audio_project(track_hidden=True)
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertEqual(len(graph.input_specs), 1)
+        self.assertNotIn("[0:v]", graph.filter_complex)
+        self.assertNotIn("overlay=", graph.filter_complex)
+        self.assertIn("[0:a]", graph.filter_complex)
+        self.assertNotIn("anullsrc", graph.filter_complex)
+
+    def test_muted_video_track_drops_embedded_audio_but_keeps_picture(self):
+        project, _ = _video_audio_project(track_muted=True)
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertIn("[0:v]", graph.filter_complex)
+        self.assertNotIn("[0:a]", graph.filter_complex)
+        self.assertIn("anullsrc", graph.filter_complex)
+
+    def test_hidden_and_muted_track_contributes_nothing(self):
+        project, _ = _video_audio_project(track_hidden=True, track_muted=True)
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertEqual(graph.input_specs, [])
+
+    def test_hidden_track_drops_its_text_overlays(self):
+        project, track = _video_audio_project(track_hidden=True)
+        track.clips.append(
+            Clip(media_type=MediaType.TEXT, source_in=0, source_out=2, timeline_start=5, text_style=TextStyle(content="x"))
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.addCleanup(graph.cleanup)
+        self.assertNotIn("drawtext", graph.filter_complex)
+
+    def test_hidden_track_without_audio_registers_no_input(self):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.tracks[0].hidden = True
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertEqual(graph.input_specs, [])
+
+    def test_hidden_speed_ramped_clip_keeps_segmented_audio(self):
+        project, track = _video_audio_project(track_hidden=True)
+        track.clips[0].speed_keyframes = [(0.0, 1.0), (2.0, 2.0)]
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertEqual(len(graph.input_specs), 2)  # one per speed segment
+        self.assertNotIn(":v]", graph.filter_complex)
+        self.assertIn("concat=n=2:v=0:a=1", graph.filter_complex)
+
+    def test_hidden_crossfade_pair_keeps_both_sides_audio(self):
+        project, track = _video_audio_project(track_hidden=True)
+        track.clips[0].transition_out = TransitionType.CROSSFADE
+        track.clips[0].transition_duration = 1.0
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=5)
+        )
+        graph = build_filter_graph(project, ProjectSettings())
+        self.assertNotIn("xfade", graph.filter_complex)
+        self.assertIn("[0:a]", graph.filter_complex)
+        self.assertIn("[1:a]", graph.filter_complex)
+        self.assertIn("amix=inputs=2", graph.filter_complex)
+
+
+class CrossfadeAudioSyncTests(unittest.TestCase):
+    """xfade starts clip B's picture at A.end - d, but B's audio stayed at
+    B.timeline_start -- lagging its own video by d for the whole clip."""
+
+    def _pair(self, a_start=0.0, d=1.0):
+        project = Project()
+        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=True))
+        project.add_media_asset(MediaAsset(path="/media/b.mp4", duration=5.0, has_video=True, has_audio=True))
+        track = project.tracks[0]
+        track.clips.append(
+            Clip(
+                media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5,
+                timeline_start=a_start, transition_out=TransitionType.CROSSFADE, transition_duration=d,
+            )
+        )
+        track.clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path="/media/b.mp4", source_in=0, source_out=5, timeline_start=a_start + 5)
+        )
+        return project
+
+    def _audio_chain(self, graph, input_index):
+        return next(line for line in graph.filter_complex.split(";") if line.startswith(f"[{input_index}:a]"))
+
+    def test_partner_audio_starts_where_its_video_does(self):
+        graph = build_filter_graph(self._pair(a_start=2.0, d=1.0), ProjectSettings())
+        self.assertIn("xfade=transition=fade:duration=1.000:offset=4.000", graph.filter_complex)
+        # Merged layer is tpad-shifted to A's start (2.0); B's first frame is
+        # at offset 4.0 into it -> 6.0 on the timeline, not B's own 7.0.
+        self.assertIn("adelay=delays=6000:all=1", self._audio_chain(graph, 1))
+        self.assertNotIn("delays=7000", graph.filter_complex)
+        self.assertIn("adelay=delays=2000:all=1", self._audio_chain(graph, 0))
+
+    def test_audio_crossfades_over_the_same_overlap(self):
+        graph = build_filter_graph(self._pair(a_start=0.0, d=1.0), ProjectSettings())
+        self.assertIn("afade=t=out:st=4.000:d=1.000", self._audio_chain(graph, 0))
+        self.assertIn("afade=t=in:st=0:d=1.000", self._audio_chain(graph, 1))
+
+    def test_model_clips_are_not_mutated(self):
+        project = self._pair(a_start=0.0, d=1.0)
+        build_filter_graph(project, ProjectSettings())
+        a, b = project.tracks[0].sorted_clips()
+        self.assertEqual(b.timeline_start, 5.0)
+        self.assertEqual((a.fade_out, b.fade_in), (0.0, 0.0))
 
 
 if __name__ == "__main__":
