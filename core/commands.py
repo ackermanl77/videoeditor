@@ -8,6 +8,7 @@ indirection, keeping the editing engine easy to follow and extend.
 from __future__ import annotations
 
 import copy
+import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -137,7 +138,12 @@ class SplitClipCommand(Command):
         self.project = project
         self.clip_id = clip_id
         self.split_time = split_time
-        self._new_clip_id: Optional[str] = None
+        # A fresh id, like every other clip creation (Clip's own
+        # default_factory), generated once so redo recreates the *same*
+        # second half any later history entries refer to. It used to be
+        # `id + "_b"`, which collided on a repeated split (splitting the
+        # first half again produced a second "<id>_b").
+        self._new_clip_id: str = uuid.uuid4().hex[:12]
         self._original_snapshot: Optional[Clip] = None
         self.label = "Split Clip"
 
@@ -152,18 +158,30 @@ class SplitClipCommand(Command):
         self._original_snapshot = clip.copy()
 
         offset_in_timeline = self.split_time - clip.timeline_start
-        offset_in_source = offset_in_timeline * clip.speed
+        offset_in_source = _source_offset_at(clip, offset_in_timeline)
 
         second = clip.copy()
-        second.id = second.id + "_b"
+        second.id = self._new_clip_id
         second.source_in = clip.source_in + offset_in_source
         second.timeline_start = self.split_time
         second.fade_in = 0.0
+        # Opacity/position keyframe times are clip-relative timeline seconds;
+        # speed keyframe times are source_in-relative source seconds. Each
+        # half keeps only its own side of the split, re-based to its own
+        # start, with a keyframe added exactly at the cut so the animated
+        # value (or speed) in effect there carries on unchanged.
+        tail_timeline = clip.duration - offset_in_timeline
+        second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline)
+        second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline)
+        _apply_speed_keyframes(second, _speed_keyframes_after(clip.speed_keyframes, offset_in_source))
 
+        first_speed_keyframes = _speed_keyframes_before(clip.speed_keyframes, offset_in_source)
         clip.source_out = clip.source_in + offset_in_source
         clip.fade_out = 0.0
+        clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline)
+        clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline)
+        _apply_speed_keyframes(clip, first_speed_keyframes)
 
-        self._new_clip_id = second.id
         track.clips.append(second)
 
     def undo(self) -> None:
@@ -175,6 +193,107 @@ class SplitClipCommand(Command):
         if original is not None:
             idx = track.clips.index(original)
             track.clips[idx] = self._original_snapshot.copy()
+
+
+_KF_EPS = 1e-6
+
+
+def _source_offset_at(clip: Clip, timeline_offset: float) -> float:
+    """Source seconds (from ``source_in``) shown ``timeline_offset`` seconds into ``clip``.
+
+    Walks ``Clip.speed_segments``, so a speed-ramped clip splits at the
+    source frame actually on screen at the playhead -- ``offset * clip.speed``
+    was only right for a constant-speed clip.
+    """
+    if len(clip.speed_keyframes) < 2:
+        speed = clip.speed if clip.speed > 0 else 1.0
+        return timeline_offset * speed
+    elapsed = 0.0
+    for seg_in, seg_out, seg_speed in clip.speed_segments:
+        seg_len = (seg_out - seg_in) / seg_speed
+        if timeline_offset <= elapsed + seg_len:
+            return (seg_in - clip.source_in) + (timeline_offset - elapsed) * seg_speed
+        elapsed += seg_len
+    return clip.source_length
+
+
+def _interpolate_keyframes(keyframes: List[Tuple[float, ...]], t: float) -> Tuple[float, ...]:
+    """Value(s) at ``t`` under filter_graph's piecewise-linear, hold-at-ends semantics."""
+    kfs = sorted(keyframes, key=lambda k: k[0])
+    if t <= kfs[0][0]:
+        return tuple(kfs[0][1:])
+    for (t0, *v0), (t1, *v1) in zip(kfs, kfs[1:]):
+        if t < t1:
+            frac = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+            return tuple(a + (b - a) * frac for a, b in zip(v0, v1))
+    return tuple(kfs[-1][1:])
+
+
+def _keyframes_before(keyframes, cut: float):
+    """First half's opacity/position keyframes: those before ``cut``, plus one at ``cut``.
+
+    Fewer than 2 keyframes means "not animated" (the scalar field applies),
+    so those are left exactly as they were. Always returns 2+ entries
+    otherwise, so a half whose only keyframe would be the cut itself still
+    holds the animated value rather than falling back to the scalar field.
+    """
+    if len(keyframes) < 2:
+        return list(keyframes)
+    value = _interpolate_keyframes(keyframes, cut)
+    kept = [tuple(k) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] < cut - _KF_EPS]
+    if not kept:
+        kept = [(0.0, *value)]
+    return kept + [(cut, *value)]
+
+
+def _keyframes_after(keyframes, cut: float, tail: float):
+    """Second half's opacity/position keyframes, re-based so ``cut`` becomes 0."""
+    if len(keyframes) < 2:
+        return list(keyframes)
+    value = _interpolate_keyframes(keyframes, cut)
+    kept = [(k[0] - cut, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > cut + _KF_EPS]
+    if not kept:
+        kept = [(max(tail, _KF_EPS), *value)]
+    return [(0.0, *value)] + kept
+
+
+def _speed_at(keyframes, source_t: float) -> float:
+    """Step-function speed in effect at ``source_t`` (see ``Clip.speed_segments``)."""
+    kfs = sorted(keyframes, key=lambda k: k[0])
+    speed = kfs[0][1]
+    for t, s in kfs:
+        if t <= source_t + _KF_EPS:
+            speed = s
+    return speed if speed > 0 else 1.0
+
+
+def _speed_keyframes_before(keyframes, cut: float):
+    """First half's speed keyframes (``None`` = not speed-ramped, leave as is)."""
+    if len(keyframes) < 2:
+        return None
+    kept = [tuple(k) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] < cut - _KF_EPS]
+    return kept or [(0.0, _speed_at(keyframes, 0.0))]
+
+
+def _speed_keyframes_after(keyframes, cut: float):
+    """Second half's speed keyframes, re-based so ``cut`` becomes 0 (``None`` = not ramped)."""
+    if len(keyframes) < 2:
+        return None
+    kept = [(k[0] - cut, k[1]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > cut + _KF_EPS]
+    return [(0.0, _speed_at(keyframes, cut))] + kept
+
+
+def _apply_speed_keyframes(clip: Clip, keyframes) -> None:
+    """Store a split half's speed keyframes; a half left with a single
+    speed collapses to a plain constant ``speed`` (a lone keyframe would
+    otherwise be ignored in favour of the clip's stale ``speed`` field)."""
+    if keyframes is None:
+        return
+    if len(keyframes) >= 2:
+        clip.speed_keyframes = keyframes
+    else:
+        clip.speed = keyframes[0][1]
+        clip.speed_keyframes = []
 
 
 class UpdateClipPropertyCommand(Command):
@@ -198,6 +317,34 @@ class UpdateClipPropertyCommand(Command):
         clip = self.project.find_clip(self.clip_id)
         if clip is not None:
             setattr(clip, self.attribute, self.old_value)
+
+
+class UpdateTrackPropertyCommand(Command):
+    """Generic setter for a track-level field (muted, locked, hidden, duck trigger, ...).
+
+    The timeline header's mute/lock/hide toggles used to flip these fields
+    directly on the model, so they bypassed History: not undoable, and
+    undoing an earlier edit never restored them.
+    """
+
+    def __init__(self, project: Project, track_id: str, attribute: str, new_value: Any, label: Optional[str] = None):
+        self.project = project
+        self.track_id = track_id
+        self.attribute = attribute
+        self.new_value = new_value
+        track = project.find_track(track_id)
+        self.old_value = getattr(track, attribute, None) if track else None
+        self.label = label or f"Edit Track {attribute.replace('_', ' ').title()}"
+
+    def do(self) -> None:
+        track = self.project.find_track(self.track_id)
+        if track is not None:
+            setattr(track, self.attribute, self.new_value)
+
+    def undo(self) -> None:
+        track = self.project.find_track(self.track_id)
+        if track is not None:
+            setattr(track, self.attribute, self.old_value)
 
 
 class AddTrackCommand(Command):

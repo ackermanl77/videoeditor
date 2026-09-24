@@ -34,6 +34,7 @@ from core.commands import (
     RenameMarkerCommand,
     SplitClipCommand,
     TrimClipCommand,
+    UpdateTrackPropertyCommand,
     build_ripple_delete_command,
     build_ripple_trim_command,
 )
@@ -769,19 +770,26 @@ class TimelineWidget(QWidget):
         self.rebuild()
         self._emit_modified()
 
-    def _on_track_mute_toggled(self, row: int) -> None:
-        if not self._row_tracks or row >= len(self._row_tracks):
-            return
+    def _toggle_track_flag(self, row: int, attribute: str, label: str) -> Optional[Track]:
+        """Flip a boolean track field through History (so it's undoable), like every other edit."""
+        if self.project is None or self.history is None or not self._row_tracks or row >= len(self._row_tracks):
+            return None
         track = self._row_tracks[row]
-        track.muted = not track.muted
+        self.history.execute(
+            UpdateTrackPropertyCommand(self.project, track.id, attribute, not getattr(track, attribute), label)
+        )
+        return track
+
+    def _on_track_mute_toggled(self, row: int) -> None:
+        if self._toggle_track_flag(row, "muted", "Toggle Track Mute") is None:
+            return
         self.rebuild()
         self._emit_modified()
 
     def _on_track_lock_toggled(self, row: int) -> None:
-        if not self._row_tracks or row >= len(self._row_tracks):
+        track = self._toggle_track_flag(row, "locked", "Toggle Track Lock")
+        if track is None:
             return
-        track = self._row_tracks[row]
-        track.locked = not track.locked
         for clip in track.clips:
             item = self._clip_items.get(clip.id)
             if item:
@@ -790,10 +798,8 @@ class TimelineWidget(QWidget):
         self._emit_modified()
 
     def _on_track_hidden_toggled(self, row: int) -> None:
-        if not self._row_tracks or row >= len(self._row_tracks):
+        if self._toggle_track_flag(row, "hidden", "Toggle Track Visibility") is None:
             return
-        track = self._row_tracks[row]
-        track.hidden = not track.hidden
         self.rebuild()
         self._emit_modified()
 
@@ -829,10 +835,13 @@ class TimelineWidget(QWidget):
         if not ok:
             return
         if choice == options[0]:
-            track.duck_trigger_track_id = None
+            new_trigger_id = None
         else:
-            chosen_track = other_tracks[options.index(choice) - 1]
-            track.duck_trigger_track_id = chosen_track.id
+            new_trigger_id = other_tracks[options.index(choice) - 1].id
+        if self.history is not None and new_trigger_id != track.duck_trigger_track_id:
+            self.history.execute(
+                UpdateTrackPropertyCommand(self.project, track.id, "duck_trigger_track_id", new_trigger_id, "Set Audio Ducking")
+            )
         # Rebuild so the header's duck-toggle indicator (active/inactive)
         # reflects the new value immediately, the same way mute/lock/hide's
         # own handlers rebuild right after mutating their track field.
