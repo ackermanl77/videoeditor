@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from core.clip import ReframeMode
 from core.exporter import ExportCancelled, ExportError, ExportSettings, Exporter, QUALITY_PRESETS
+from core.ffmpeg_utils import nvenc_available
 from core.project import Project
 
 RESOLUTION_PRESETS = {
@@ -141,6 +142,29 @@ class ExportDialog(QDialog):
         self.quality_combo.setCurrentText("Balanced (CRF 23)")
         form.addRow("Quality", self.quality_combo)
 
+        # Probed once (cached in core.ffmpeg_utils.nvenc_available) against
+        # whichever ffmpeg binary this app resolves to -- bundled or the
+        # user's own system ffmpeg, which might be a build without NVENC.
+        try:
+            self._gpu_detected = nvenc_available()
+        except Exception:
+            self._gpu_detected = False
+        self.gpu_checkbox = QCheckBox("Use GPU encoding (NVENC) when available")
+        self.gpu_checkbox.setChecked(self._gpu_detected)
+        self.gpu_checkbox.setEnabled(self._gpu_detected)
+        if self._gpu_detected:
+            self.gpu_checkbox.setToolTip(
+                "Encodes with your NVIDIA GPU (NVENC) instead of the CPU for MP4/MOV/MKV/AVI/FLV output -- "
+                "much faster on supported hardware. Falls back to the CPU encoder automatically for this "
+                "export if GPU encoding fails partway through."
+            )
+        else:
+            self.gpu_checkbox.setToolTip(
+                "NVENC hardware encoding wasn't detected (no supported NVIDIA GPU/driver, or this ffmpeg "
+                "build doesn't include it) -- exporting with the CPU encoder."
+            )
+        form.addRow("", self.gpu_checkbox)
+
         two_pass_row = QHBoxLayout()
         self.two_pass_checkbox = QCheckBox("Two-pass, target file size")
         self.two_pass_checkbox.toggled.connect(self._on_two_pass_toggled)
@@ -193,6 +217,12 @@ class ExportDialog(QDialog):
         self.shorts_note_label.setVisible(False)
         form.addRow("", self.shorts_note_label)
 
+        # Now that container_combo/two_pass_checkbox both exist, resolve the
+        # GPU checkbox's actual initial enabled state/tooltip against them
+        # (matches the defaults already set above for the common case, but
+        # keeps this correct if those defaults ever change).
+        self._refresh_gpu_checkbox_enabled()
+
         layout.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -218,6 +248,29 @@ class ExportDialog(QDialog):
     def _on_two_pass_toggled(self, checked: bool) -> None:
         self.target_size_spin.setEnabled(checked)
         self.quality_combo.setEnabled(not checked)
+        # core.exporter.Exporter always uses the CPU codec for two-pass,
+        # target-file-size exports regardless of this checkbox (NVENC's
+        # two-pass rate control doesn't use the same -pass 1/2 log-file
+        # scheme libx264 does) -- reflect that in the UI rather than
+        # offering a control that silently does nothing while two-pass is on.
+        self._refresh_gpu_checkbox_enabled()
+
+    def _refresh_gpu_checkbox_enabled(self) -> None:
+        is_gpu_capable_format = self.container_combo.currentText() not in (GIF_EXTENSION, ".webm")
+        enabled = self._gpu_detected and is_gpu_capable_format and not self.two_pass_checkbox.isChecked()
+        self.gpu_checkbox.setEnabled(enabled)
+        if not self._gpu_detected:
+            return
+        if not is_gpu_capable_format:
+            self.gpu_checkbox.setToolTip("GPU encoding isn't available for this output format -- using the CPU encoder.")
+        elif self.two_pass_checkbox.isChecked():
+            self.gpu_checkbox.setToolTip("Two-pass, target file size exports always use the CPU encoder.")
+        else:
+            self.gpu_checkbox.setToolTip(
+                "Encodes with your NVIDIA GPU (NVENC) instead of the CPU for MP4/MOV/MKV/AVI/FLV output -- "
+                "much faster on supported hardware. Falls back to the CPU encoder automatically for this "
+                "export if GPU encoding fails partway through."
+            )
 
     def _on_container_changed(self, text: str) -> None:
         is_gif = text == GIF_EXTENSION
@@ -228,6 +281,7 @@ class ExportDialog(QDialog):
         self.quality_combo.setEnabled(not is_gif)
         self.two_pass_checkbox.setEnabled(not is_gif)
         self.gif_note_label.setVisible(is_gif)
+        self._refresh_gpu_checkbox_enabled()
 
     def _on_resolution_changed(self, text: str) -> None:
         preset = RESOLUTION_PRESETS.get(text)
@@ -317,6 +371,7 @@ class ExportDialog(QDialog):
             reframe_override=ReframeMode.FILL if self.autofill_checkbox.isChecked() else None,
             trim_start=self.trim_start_spin.value() if trim_enabled else 0.0,
             trim_end=self.trim_end_spin.value() if trim_enabled else None,
+            use_gpu=self.gpu_checkbox.isChecked(),
         )
 
         self.export_btn.setEnabled(False)

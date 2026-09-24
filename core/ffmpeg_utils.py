@@ -70,6 +70,32 @@ def find_binary(tool: str) -> str:
     )
 
 
+@lru_cache(maxsize=None)
+def nvenc_available() -> bool:
+    """Probe whether the located ``ffmpeg`` binary can encode with NVENC.
+
+    Runs ``ffmpeg -hide_banner -encoders`` once and checks for ``h264_nvenc``
+    in the listed encoders. This is a build/driver capability check, not a
+    guarantee the encode will actually succeed at runtime (e.g. another
+    process could be holding the GPU's limited concurrent NVENC session
+    count) — callers that select NVENC should still be prepared to fall back
+    to a CPU codec if the real encode fails.
+
+    Cached for the life of the process (``lru_cache``): this doesn't change
+    while the app is running, and re-spawning ffmpeg just to re-ask the same
+    question on every export isn't worth it. Never raises — any failure
+    (ffmpeg not found, probe error, non-zero exit) is treated as "not
+    available" so callers always have a safe CPU fallback path.
+    """
+    try:
+        ffmpeg = find_binary("ffmpeg")
+        result = run([ffmpeg, "-hide_banner", "-encoders"])
+        output = (result.stdout or "") + (result.stderr or "")
+        return "h264_nvenc" in output
+    except Exception:
+        return False
+
+
 def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess with sensible defaults (no console window on Windows)."""
     creationflags = 0

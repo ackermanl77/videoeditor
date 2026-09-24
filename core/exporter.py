@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from core.clip import ReframeMode
-from core.ffmpeg_utils import find_binary, popen
+from core.ffmpeg_utils import find_binary, nvenc_available, popen
 from core.filter_graph import GraphResult, build_filter_graph
 from core.project import Project, ProjectSettings
 
@@ -35,6 +35,18 @@ CONTAINER_CODECS = {
     ".avi": ("libx264", "aac"),
     ".flv": ("libx264", "aac"),
     ".webm": ("libvpx-vp9", "libopus"),
+}
+
+# GPU (NVENC) equivalent of each CPU codec CONTAINER_CODECS can select, used
+# by Exporter._resolve_video_codec() when ExportSettings.use_gpu is set and
+# core.ffmpeg_utils.nvenc_available() confirms this ffmpeg build/driver
+# actually has it. Only libx264 has an entry: nothing in CONTAINER_CODECS
+# currently maps to libx265/HEVC, and VP9 (.webm) has no NVENC counterpart
+# worth relying on here, so GPU encoding is single-pass MP4/MOV/MKV/AVI/FLV
+# only for now. Add "libx265": "hevc_nvenc" here the day an HEVC output
+# option is added to CONTAINER_CODECS -- no other code path needs to change.
+NVENC_CODEC_MAP = {
+    "libx264": "h264_nvenc",
 }
 
 # Handled separately from CONTAINER_CODECS: GIF has no audio and uses its
@@ -66,6 +78,15 @@ class ExportSettings:
     reframe_override: Optional[ReframeMode] = None
     trim_start: float = 0.0
     trim_end: Optional[float] = None
+    # Prefer NVENC hardware encoding over the CPU codec (libx264) when this
+    # machine's ffmpeg build/driver actually has it (see
+    # core.ffmpeg_utils.nvenc_available). Single-pass exports only -- see
+    # NVENC_CODEC_MAP above and Exporter._export_two_pass, which always uses
+    # the CPU codec regardless of this flag. If NVENC is selected but the
+    # real encode fails (e.g. a driver issue, or another process holding the
+    # GPU's limited concurrent session count), Exporter transparently retries
+    # once with the CPU codec rather than failing the export outright.
+    use_gpu: bool = True
 
 
 class ExportError(RuntimeError):
@@ -235,6 +256,44 @@ class Exporter:
         chapters_index = len(graph.input_specs)
         return ["-f", "ffmetadata", "-i", chapters_path], chapters_index, chapters_path
 
+    @staticmethod
+    def _resolve_video_codec(base_codec: str, prefer_gpu: bool) -> Tuple[str, bool]:
+        """Returns ``(codec_to_use, is_gpu)``.
+
+        Falls back to the CPU codec whenever GPU encoding wasn't requested,
+        there's no NVENC equivalent for this container's codec (see
+        NVENC_CODEC_MAP), or NVENC isn't actually available on this
+        machine's ffmpeg build/driver (probed once and cached -- see
+        core.ffmpeg_utils.nvenc_available).
+        """
+        if not prefer_gpu:
+            return base_codec, False
+        nvenc_codec = NVENC_CODEC_MAP.get(base_codec)
+        if nvenc_codec is None or not nvenc_available():
+            return base_codec, False
+        return nvenc_codec, True
+
+    @staticmethod
+    def _video_quality_args(codec: str, is_gpu: bool, crf: str) -> List[str]:
+        """Quality-control flags for one video codec.
+
+        NVENC doesn't understand ``-crf`` (a libx264/libvpx-only rate-control
+        mode) -- its nearest equivalent is ``-rc vbr -cq <value>`` (constant
+        quality within a VBR envelope, ``-b:v 0`` letting ``-cq`` alone drive
+        the bitrate) plus a ``-preset``, using the same p1(fastest)-p7(best)
+        naming as ffmpeg's own NVENC preset scale. NVENC's ``-cq`` uses the
+        same 0-51 lower-is-better scale as x264's ``-crf``, so the existing
+        CRF preset numbers (18/23/28) carry over directly as sensible ``-cq``
+        values rather than needing a separate mapping table.
+        """
+        if is_gpu:
+            return ["-preset", "p4", "-rc:v", "vbr", "-cq:v", crf, "-b:v", "0", "-pix_fmt", "yuv420p"]
+        if codec == "libx264":
+            return ["-crf", crf, "-preset", "medium", "-pix_fmt", "yuv420p"]
+        if codec == "libvpx-vp9":
+            return ["-crf", crf, "-b:v", "0"]
+        return []
+
     def _export_single_pass(
         self,
         settings: ExportSettings,
@@ -249,27 +308,46 @@ class Exporter:
     ) -> str:
         crf = QUALITY_PRESETS.get(settings.quality_preset, "23")
 
-        args = self._common_args(graph, chapters_args)
-        args += ["-map", f"[{graph.video_out_label}]"]
-        if graph.has_audio:
-            args += ["-map", f"[{graph.audio_out_label}]"]
+        def build_args(codec: str, is_gpu: bool) -> List[str]:
+            args = self._common_args(graph, chapters_args)
+            args += ["-map", f"[{graph.video_out_label}]"]
+            if graph.has_audio:
+                args += ["-map", f"[{graph.audio_out_label}]"]
 
-        args += ["-c:v", video_codec]
-        if video_codec == "libx264":
-            args += ["-crf", crf, "-preset", "medium", "-pix_fmt", "yuv420p"]
-        elif video_codec == "libvpx-vp9":
-            args += ["-crf", crf, "-b:v", "0"]
+            args += ["-c:v", codec]
+            args += self._video_quality_args(codec, is_gpu, crf)
 
-        if graph.has_audio:
-            args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
+            if graph.has_audio:
+                args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
 
-        if chapters_index is not None:
-            args += ["-map_metadata", str(chapters_index)]
-        args += ["-r", str(settings.fps)]
-        args += ["-movflags", "+faststart"] if ext == ".mp4" else []
-        args += ["-progress", "pipe:1", "-nostats", settings.output_path]
+            if chapters_index is not None:
+                args += ["-map_metadata", str(chapters_index)]
+            args += ["-r", str(settings.fps)]
+            args += ["-movflags", "+faststart"] if ext == ".mp4" else []
+            args += ["-progress", "pipe:1", "-nostats", settings.output_path]
+            return args
 
-        self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering")
+        effective_codec, using_gpu = self._resolve_video_codec(video_codec, settings.use_gpu)
+        args = build_args(effective_codec, using_gpu)
+        label = "Rendering (GPU)" if using_gpu else "Rendering"
+        try:
+            self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label=label)
+        except ExportError:
+            # NVENC can fail for reasons that have nothing to do with the
+            # project itself (a driver issue, another process holding the
+            # GPU's limited concurrent NVENC session count, etc.) -- retry
+            # once with the CPU codec rather than failing the whole export.
+            # A non-GPU failure (bad media, invalid graph, ...) would fail
+            # again identically on the CPU codec too, so this doesn't mask
+            # real errors, just avoids treating a GPU-specific hiccup as fatal.
+            if not using_gpu or self._cancelled:
+                raise
+            if on_progress:
+                on_progress(0.0, "GPU encoding failed -- falling back to CPU encoder...")
+            fallback_args = build_args(video_codec, False)
+            self._run_ffmpeg(
+                fallback_args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering (CPU fallback)"
+            )
         return settings.output_path
 
     def _export_gif(
