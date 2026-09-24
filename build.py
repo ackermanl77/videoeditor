@@ -2,7 +2,7 @@
 """Convenience wrapper around PyInstaller for building the standalone app.
 
 Usage:
-    python build.py
+    python build.py [--keep-build]
 
 This simply invokes ``pyinstaller build.spec`` after a couple of sanity
 checks, so contributors don't need to remember PyInstaller's CLI flags.
@@ -42,6 +42,11 @@ def main() -> int:
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT)
     if result.returncode == 0:
+        # build/ is PyInstaller's intermediate work folder (~160 MB), not part of the app. Remove it
+        # after a successful build -- a failed one keeps it for debugging -- unless --keep-build is
+        # passed, which trades the disk space for a faster next rebuild.
+        if "--keep-build" not in sys.argv[1:]:
+            shutil.rmtree(os.path.join(ROOT, "build"), ignore_errors=True)
         exe_name = "VideoEditor.exe" if sys.platform.startswith("win") else "VideoEditor"
         print(f"\nBuild finished. Your standalone app is at: dist/{exe_name}")
     return result.returncode
