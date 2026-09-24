@@ -12,6 +12,8 @@ was found here, and a test like these would have caught it immediately.
 """
 
 import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,24 @@ from core.clip import Clip, MediaType, ReframeMode
 from core.exporter import ExportSettings, Exporter, NVENC_CODEC_MAP
 from core.media_asset import MediaAsset
 from core.project import Project
+
+# Export now checks that every source file exists (and renders to a
+# `.partial` file it renames on success), so the mocked-subprocess tests use
+# a real, empty stand-in source file and a real output folder.
+_TMPDIR = tempfile.mkdtemp(prefix="ve_exporter_tests_")
+SRC = os.path.join(_TMPDIR, "a.mp4")
+OUT = os.path.join(_TMPDIR, "out.mp4")
+open(SRC, "wb").close()
+
+
+def tearDownModule():
+    shutil.rmtree(_TMPDIR, ignore_errors=True)
+
+
+def _touch_output(args):
+    """What a successful real FFmpeg run would leave behind: its output file."""
+    if args and args[-1] not in (os.devnull, "-"):
+        open(args[-1], "wb").close()
 
 
 class ChaptersFileTests(unittest.TestCase):
@@ -115,9 +135,9 @@ class ChaptersFileTests(unittest.TestCase):
 
     def test_build_chapters_args_uses_the_next_available_input_index(self):
         project = Project()
-        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path=SRC, duration=5.0, has_video=True, has_audio=False))
         project.tracks[0].clips.append(
-            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+            Clip(media_type=MediaType.VIDEO, source_path=SRC, source_in=0, source_out=5, timeline_start=0)
         )
         project.add_marker(1.0, "Point")
         exporter = Exporter(project)
@@ -147,9 +167,10 @@ class _FakeStdout:
 class _FakeProcess:
     """Stands in for subprocess.Popen without spawning anything real."""
 
-    def __init__(self):
+    def __init__(self, args=None):
         self.stdout = _FakeStdout()
         self.returncode = 0
+        _touch_output(args)
 
     def wait(self):
         return self.returncode
@@ -171,21 +192,21 @@ class TwoPassArgsTests(unittest.TestCase):
 
     def test_pass_one_sinks_the_unused_audio_pad(self):
         project = Project()
-        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path=SRC, duration=5.0, has_video=True, has_audio=False))
         project.tracks[0].clips.append(
-            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+            Clip(media_type=MediaType.VIDEO, source_path=SRC, source_in=0, source_out=5, timeline_start=0)
         )
 
         captured_args = []
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch("core.exporter.popen", fake_popen):
             exporter = Exporter(project)
             settings = ExportSettings(
-                output_path="/tmp/out.mp4", width=320, height=240, fps=25.0,
+                output_path=OUT, width=320, height=240, fps=25.0,
                 two_pass=True, target_size_mb=1.0,
             )
             exporter.export(settings)
@@ -205,21 +226,21 @@ class ShortsExportSettingsTests(unittest.TestCase):
 
     def test_reframe_override_and_trim_reach_the_filter_graph_and_command_line(self):
         project = Project()
-        project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=False))
+        project.add_media_asset(MediaAsset(path=SRC, duration=10.0, has_video=True, has_audio=False))
         project.tracks[0].clips.append(
-            Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
+            Clip(media_type=MediaType.VIDEO, source_path=SRC, source_in=0, source_out=10, timeline_start=0)
         )
 
         captured_args = []
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch("core.exporter.popen", fake_popen):
             exporter = Exporter(project)
             settings = ExportSettings(
-                output_path="/tmp/out.mp4", width=1080, height=1920, fps=30.0,
+                output_path=OUT, width=1080, height=1920, fps=30.0,
                 reframe_override=ReframeMode.FILL, trim_start=0.0, trim_end=6.0,
             )
             exporter.export(settings)
@@ -302,9 +323,9 @@ class VideoQualityArgsTests(unittest.TestCase):
 
 def _build_simple_project():
     project = Project()
-    project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=5.0, has_video=True, has_audio=False))
+    project.add_media_asset(MediaAsset(path=SRC, duration=5.0, has_video=True, has_audio=False))
     project.tracks[0].clips.append(
-        Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=5, timeline_start=0)
+        Clip(media_type=MediaType.VIDEO, source_path=SRC, source_in=0, source_out=5, timeline_start=0)
     )
     return project
 
@@ -321,13 +342,13 @@ class GpuExportIntegrationTests(unittest.TestCase):
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch(
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=True):
             exporter = Exporter(project)
-            settings = ExportSettings(output_path="/tmp/out.mp4", width=320, height=240, fps=25.0, use_gpu=True)
+            settings = ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=True)
             exporter.export(settings)
 
         self.assertEqual(len(captured_args), 1)
@@ -342,13 +363,13 @@ class GpuExportIntegrationTests(unittest.TestCase):
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch(
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=False):
             exporter = Exporter(project)
-            settings = ExportSettings(output_path="/tmp/out.mp4", width=320, height=240, fps=25.0, use_gpu=True)
+            settings = ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=True)
             exporter.export(settings)
 
         self.assertEqual(len(captured_args), 1)
@@ -363,13 +384,13 @@ class GpuExportIntegrationTests(unittest.TestCase):
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch(
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=True):
             exporter = Exporter(project)
-            settings = ExportSettings(output_path="/tmp/out.mp4", width=320, height=240, fps=25.0, use_gpu=False)
+            settings = ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=False)
             exporter.export(settings)
 
         args = captured_args[0]
@@ -385,14 +406,14 @@ class GpuExportIntegrationTests(unittest.TestCase):
 
         def fake_popen(args, **kwargs):
             captured_args.append(list(args))
-            return _FakeProcess()
+            return _FakeProcess(args)
 
         with patch("core.exporter.find_binary", return_value="ffmpeg"), patch(
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=True):
             exporter = Exporter(project)
             settings = ExportSettings(
-                output_path="/tmp/out.mp4", width=320, height=240, fps=25.0,
+                output_path=OUT, width=320, height=240, fps=25.0,
                 two_pass=True, target_size_mb=1.0, use_gpu=True,
             )
             exporter.export(settings)
@@ -417,6 +438,8 @@ class GpuExportIntegrationTests(unittest.TestCase):
             def __init__(self, args):
                 self.stdout = _FakeStdout()
                 self.returncode = 1 if "h264_nvenc" in args else 0
+                if self.returncode == 0:
+                    _touch_output(args)
 
             def wait(self):
                 return self.returncode
@@ -438,10 +461,10 @@ class GpuExportIntegrationTests(unittest.TestCase):
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=True):
             exporter = Exporter(project)
-            settings = ExportSettings(output_path="/tmp/out.mp4", width=320, height=240, fps=25.0, use_gpu=True)
+            settings = ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=True)
             result = exporter.export(settings, on_progress=on_progress)
 
-        self.assertEqual(result, "/tmp/out.mp4")
+        self.assertEqual(result, OUT)
         self.assertEqual(len(captured_args), 2)
         self.assertIn("h264_nvenc", captured_args[0])
         self.assertIn("libx264", captured_args[1])
@@ -476,9 +499,259 @@ class GpuExportIntegrationTests(unittest.TestCase):
             "core.exporter.popen", fake_popen
         ), patch("core.exporter.nvenc_available", return_value=True):
             exporter = Exporter(project)
-            settings = ExportSettings(output_path="/tmp/out.mp4", width=320, height=240, fps=25.0, use_gpu=True)
+            settings = ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=True)
             with self.assertRaises(ExportError):
                 exporter.export(settings)
+
+
+class _ScriptedProcess:
+    """Fake Popen emitting given log lines, then exiting with ``returncode``."""
+
+    def __init__(self, args, lines, returncode):
+        self.args = list(args)
+        self._lines = lines
+        self.stdout = self
+        self.returncode = returncode
+        if returncode == 0:
+            _touch_output(args)
+        else:
+            # A real failed FFmpeg run may leave a truncated output behind.
+            if args and args[-1] not in (os.devnull, "-"):
+                with open(args[-1], "wb") as f:
+                    f.write(b"truncated")
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def close(self):
+        pass
+
+    def wait(self):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+
+def _export_with(project, script, use_gpu=False, output_path=None):
+    """Run Exporter.export() with popen replaced by ``script(args) -> _ScriptedProcess``."""
+    calls = []
+
+    def fake_popen(args, **kwargs):
+        calls.append(list(args))
+        return script(args)
+
+    with patch("core.exporter.find_binary", return_value="ffmpeg"), patch(
+        "core.exporter.popen", fake_popen
+    ), patch("core.exporter.nvenc_available", return_value=use_gpu):
+        exporter = Exporter(project)
+        settings = ExportSettings(
+            output_path=output_path or OUT, width=320, height=240, fps=25.0, use_gpu=use_gpu
+        )
+        return exporter.export(settings), calls
+
+
+class PartialOutputTests(unittest.TestCase):
+    """Export renders to name.partial.ext and only renames it over the real
+    destination on success -- a failed/cancelled export used to leave a
+    truncated file at (or clobber an existing file at) the destination."""
+
+    def setUp(self):
+        for path in (OUT, os.path.join(_TMPDIR, "out.partial.mp4")):
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_success_renders_to_partial_then_renames(self):
+        result, calls = _export_with(_build_simple_project(), lambda args: _ScriptedProcess(args, [], 0))
+        self.assertEqual(result, OUT)
+        self.assertEqual(calls[0][-1], os.path.join(_TMPDIR, "out.partial.mp4"))
+        self.assertTrue(os.path.isfile(OUT))
+        self.assertFalse(os.path.exists(os.path.join(_TMPDIR, "out.partial.mp4")))
+
+    def test_failure_deletes_partial_and_keeps_existing_destination(self):
+        from core.exporter import ExportError
+
+        with open(OUT, "wb") as f:
+            f.write(b"previous good export")
+        with self.assertRaises(ExportError):
+            _export_with(_build_simple_project(), lambda args: _ScriptedProcess(args, ["boom\n"], 1))
+        self.assertFalse(os.path.exists(os.path.join(_TMPDIR, "out.partial.mp4")))
+        with open(OUT, "rb") as f:
+            self.assertEqual(f.read(), b"previous good export")
+
+    def test_cancel_deletes_partial(self):
+        from core.exporter import ExportCancelled
+
+        project = _build_simple_project()
+        holder = {}
+
+        def script(args):
+            holder["exporter"].cancel()
+            return _ScriptedProcess(args, ["frame=1\n"], 0)
+
+        def fake_popen(args, **kwargs):
+            return script(args)
+
+        with patch("core.exporter.find_binary", return_value="ffmpeg"), patch("core.exporter.popen", fake_popen):
+            exporter = Exporter(project)
+            holder["exporter"] = exporter
+            with self.assertRaises(ExportCancelled):
+                exporter.export(ExportSettings(output_path=OUT, width=320, height=240, fps=25.0, use_gpu=False))
+        self.assertFalse(os.path.exists(os.path.join(_TMPDIR, "out.partial.mp4")))
+        self.assertFalse(os.path.exists(OUT))
+
+    def test_partial_path_keeps_the_real_extension_last(self):
+        self.assertEqual(Exporter._partial_output_path(os.path.join("d", "My Film.mkv")), os.path.join("d", "My Film.partial.mkv"))
+
+
+class ExportErrorDetailTests(unittest.TestCase):
+    def test_error_includes_the_ffmpeg_log_tail_without_progress_lines(self):
+        from core.exporter import ERROR_LOG_TAIL_LINES, ExportError
+
+        lines = [f"log line {i}\n" for i in range(50)] + [
+            "out_time_ms=1000000\n", "progress=continue\n", "[vost#0:0] Error opening output file\n",
+        ]
+        with self.assertRaises(ExportError) as ctx:
+            _export_with(_build_simple_project(), lambda args: _ScriptedProcess(args, lines, 1))
+        exc = ctx.exception
+        self.assertEqual(len(exc.log_tail), ERROR_LOG_TAIL_LINES)
+        self.assertEqual(exc.log_tail[-1], "[vost#0:0] Error opening output file")
+        self.assertNotIn("log line 0", str(exc))
+        self.assertIn("Error opening output file", str(exc))
+        self.assertNotIn("progress=continue", str(exc))
+        self.assertAlmostEqual(exc.encoded_seconds, 1.0)
+
+    def test_missing_sources_are_listed_before_ffmpeg_runs(self):
+        from core.exporter import ExportError
+
+        project = _build_simple_project()
+        gone = os.path.join(_TMPDIR, "gone.mp4")
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path=gone, source_in=0, source_out=2, timeline_start=5)
+        )
+        project.add_media_asset(MediaAsset(path=gone, duration=2.0, has_video=True, has_audio=False))
+        with self.assertRaises(ExportError) as ctx:
+            _, calls = _export_with(project, lambda args: _ScriptedProcess(args, [], 0))
+        self.assertIn(gone, str(ctx.exception))
+        self.assertNotIn(SRC, str(ctx.exception))
+
+    def test_text_overlay_temp_files_are_removed_after_export(self):
+        from core.clip import TextStyle
+
+        project = _build_simple_project()
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.TEXT, source_in=0, source_out=2, timeline_start=0, text_style=TextStyle(content="Hi"))
+        )
+        import core.filter_graph as filter_graph
+
+        written = []
+        real_write = filter_graph._write_text_file
+
+        def recording_write(content):
+            path = real_write(content)
+            written.append(path)
+            return path
+
+        existed_during_render = []
+
+        def script(args):
+            existed_during_render.extend(os.path.exists(p) for p in written)
+            return _ScriptedProcess(args, [], 0)
+
+        with patch("core.filter_graph._write_text_file", recording_write):
+            _export_with(project, script)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(existed_during_render, [True])  # alive while FFmpeg runs...
+        self.assertFalse(os.path.exists(written[0]))  # ...and removed afterward
+
+
+class GpuFallbackScopeTests(unittest.TestCase):
+    """The CPU fallback used to re-render after *any* NVENC-run error --
+    doubling the wait for e.g. a disk-full error deep into a long export.
+    It now only retries when the failure looks GPU-specific."""
+
+    def _gpu_run(self, lines):
+        def script(args):
+            return _ScriptedProcess(args, lines if "h264_nvenc" in args else [], 1 if "h264_nvenc" in args else 0)
+
+        return _export_with(_build_simple_project(), script, use_gpu=True)
+
+    def test_nvenc_error_text_after_progress_still_falls_back(self):
+        _, calls = self._gpu_run(["out_time_ms=3000000\n", "[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: out of memory\n"])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("libx264", calls[1])
+
+    def test_early_failure_falls_back(self):
+        _, calls = self._gpu_run(["Some unexplained error\n"])
+        self.assertEqual(len(calls), 2)
+
+    def test_non_gpu_failure_after_progress_does_not_rerender(self):
+        from core.exporter import ExportError
+
+        with self.assertRaises(ExportError) as ctx:
+            self._gpu_run(["out_time_ms=3000000\n", "av_interleaved_write_frame(): No space left on device\n"])
+        self.assertIn("No space left on device", str(ctx.exception))
+
+
+def _real_ffmpeg():
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(os.path.dirname(here), "bin", "ffmpeg" + (".exe" if os.name == "nt" else ""))
+    if os.path.isfile(bundled):
+        return bundled
+    return shutil.which("ffmpeg")
+
+
+class RealFfmpegExportTests(unittest.TestCase):
+    """End-to-end exports through a real FFmpeg (repo bin/ or PATH);
+    skipped when none is available."""
+
+    def setUp(self):
+        self.ffmpeg = _real_ffmpeg()
+        if not self.ffmpeg:
+            self.skipTest("real ffmpeg not available")
+        self.tmp = tempfile.mkdtemp(prefix="ve_real_export_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _export(self, project, name):
+        out = os.path.join(self.tmp, name)
+        with patch("core.exporter.find_binary", return_value=self.ffmpeg):
+            Exporter(project).export(
+                ExportSettings(output_path=out, width=160, height=120, fps=10.0, use_gpu=False)
+            )
+        return out
+
+    def test_text_with_apostrophe_percent_and_colon_exports(self):
+        from core.clip import TextStyle
+
+        for content in ("Don't stop", "50% at 10:30"):
+            with self.subTest(content=content):
+                project = Project()
+                project.tracks[0].clips.append(
+                    Clip(media_type=MediaType.TEXT, source_in=0, source_out=1, timeline_start=0, text_style=TextStyle(content=content))
+                )
+                out = self._export(project, "text.mp4")
+                self.assertGreater(os.path.getsize(out), 0)
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "text.partial.mp4")))
+
+    def test_failed_export_reports_ffmpeg_output(self):
+        from core.exporter import ExportError
+
+        bogus = os.path.join(self.tmp, "not_media.mp4")
+        with open(bogus, "wb") as f:
+            f.write(b"this is not a video")
+        project = Project()
+        project.add_media_asset(MediaAsset(path=bogus, duration=1.0, has_video=True, has_audio=False))
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.VIDEO, source_path=bogus, source_in=0, source_out=1, timeline_start=0)
+        )
+        with self.assertRaises(ExportError) as ctx:
+            self._export(project, "bad.mp4")
+        self.assertTrue(ctx.exception.log_tail)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad.mp4")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad.partial.mp4")))
 
 
 if __name__ == "__main__":

@@ -401,7 +401,9 @@ class ExportDialog(QDialog):
         self.accept()
 
     def _on_failed(self, message: str) -> None:
-        self.status_label.setText(message)
+        # ExportError messages can carry FFmpeg's last ~30 log lines; the
+        # status label gets just the headline, the dialog below the full text.
+        self.status_label.setText(message.splitlines()[0] if message else message)
         self.export_btn.setEnabled(True)
         QMessageBox.critical(self, "Export Video", message)
 

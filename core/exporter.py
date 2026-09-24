@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import os
 import re
 import subprocess
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -20,6 +22,26 @@ ProgressCallback = Callable[[float, str], None]
 
 _TIME_RE = re.compile(r"out_time_ms=(\d+)")
 _SPEED_RE = re.compile(r"speed=\s*([\d.]+)x")
+
+# `-progress pipe:1` key=value lines, interleaved with FFmpeg's own log output
+# on the merged stdout/stderr pipe (see core.ffmpeg_utils.popen). Filtered out
+# of the error-log tail kept for ExportError, which only wants real log lines.
+_PROGRESS_LINE_RE = re.compile(
+    r"^(frame|fps|stream_\d+_\d+_q|bitrate|total_size|out_time_us|out_time_ms|out_time"
+    r"|dup_frames|drop_frames|speed|progress)="
+)
+
+# How many trailing FFmpeg log lines an ExportError carries.
+ERROR_LOG_TAIL_LINES = 30
+
+# FFmpeg log text that marks a failure as NVENC/GPU-specific (driver missing
+# or too old, no capable device, session limit reached, GPU out of memory...)
+# rather than a problem with the project itself -- see
+# Exporter._is_gpu_specific_failure.
+_GPU_FAILURE_RE = re.compile(
+    r"nvenc|nvcuda|cuda|no capable devices|OpenEncodeSession|out of memory|driver does not support",
+    re.IGNORECASE,
+)
 
 # Presets balance quality vs. speed/size for common delivery targets.
 QUALITY_PRESETS = {
@@ -90,7 +112,17 @@ class ExportSettings:
 
 
 class ExportError(RuntimeError):
-    pass
+    """An export failed. ``log_tail`` holds the last FFmpeg log lines, if any
+    (already included in ``str(exc)``, kept separately for callers that want
+    to show them differently). ``encoded_seconds`` is how far FFmpeg got
+    before failing, per its own progress reports."""
+
+    def __init__(self, message: str, log_tail: Optional[List[str]] = None, encoded_seconds: float = 0.0):
+        self.log_tail = list(log_tail or [])
+        self.encoded_seconds = encoded_seconds
+        if self.log_tail:
+            message = f"{message}\n\nFFmpeg output (last {len(self.log_tail)} lines):\n" + "\n".join(self.log_tail)
+        super().__init__(message)
 
 
 class ExportCancelled(Exception):
@@ -144,7 +176,78 @@ class Exporter:
         graph = build_filter_graph(
             self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range
         )
+        try:
+            self._check_sources_exist(graph)
+            final_path = settings.output_path
+            partial_path = self._partial_output_path(final_path)
+            render_settings = dataclasses.replace(settings, output_path=partial_path)
+            try:
+                self._render(render_settings, graph, full_duration, trim_start, trim_end, is_trimmed, on_progress)
+                if not os.path.isfile(partial_path):
+                    raise ExportError("FFmpeg reported success but did not produce an output file.")
+                os.replace(partial_path, final_path)
+            except BaseException:
+                # Failure or cancellation: never leave a truncated file
+                # behind, and never touch an existing file at the real
+                # destination (it's only replaced on success, above).
+                self._remove_quietly(partial_path)
+                raise
+        finally:
+            graph.cleanup()
 
+        if on_progress:
+            on_progress(1.0, "Done")
+        return final_path
+
+    @staticmethod
+    def _partial_output_path(output_path: str) -> str:
+        """Temp render target next to ``output_path``: ``name.partial.mp4``.
+
+        Same folder (so the final ``os.replace`` is an atomic same-volume
+        rename) and the real extension last (FFmpeg picks the muxer from
+        it). Rendering straight to the destination used to leave a
+        truncated, unplayable file there -- or clobber a good previous
+        export -- whenever an export failed or was cancelled.
+        """
+        stem, ext = os.path.splitext(output_path)
+        return f"{stem}.partial{ext}"
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _check_sources_exist(graph: GraphResult) -> None:
+        """Fail fast, with a clear list, if any source file FFmpeg would open is missing.
+
+        Checks exactly the graph's ``-i`` inputs (so a hidden-and-muted
+        track's clips, which aren't rendered, don't count) -- otherwise the
+        user gets only FFmpeg's own error for the first missing file,
+        after a render may already have started.
+        """
+        missing = sorted({spec.path for spec in graph.input_specs if not os.path.isfile(spec.path)})
+        if missing:
+            shown = "\n".join(missing[:10])
+            more = f"\n...and {len(missing) - 10} more" if len(missing) > 10 else ""
+            raise ExportError(
+                f"{len(missing)} source file(s) used by the timeline could not be found:\n{shown}{more}\n\n"
+                "Restore them at their original location, then export again."
+            )
+
+    def _render(
+        self,
+        settings: ExportSettings,
+        graph: GraphResult,
+        full_duration: float,
+        trim_start: float,
+        trim_end: float,
+        is_trimmed: bool,
+        on_progress: Optional[ProgressCallback],
+    ) -> str:
+        """Run the actual encode(s) into ``settings.output_path``."""
         ext = os.path.splitext(settings.output_path)[1].lower()
         # The output's actual rendered length — used for FFmpeg progress
         # fraction, distinct from `full_duration` (the untrimmed project
@@ -180,9 +283,6 @@ class Exporter:
                         os.remove(chapters_path)
                     except OSError:
                         pass
-
-        if on_progress:
-            on_progress(1.0, "Done")
         return output_path
 
     # ------------------------------------------------------------------
@@ -332,15 +432,15 @@ class Exporter:
         label = "Rendering (GPU)" if using_gpu else "Rendering"
         try:
             self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label=label)
-        except ExportError:
+        except ExportError as exc:
             # NVENC can fail for reasons that have nothing to do with the
             # project itself (a driver issue, another process holding the
             # GPU's limited concurrent NVENC session count, etc.) -- retry
             # once with the CPU codec rather than failing the whole export.
-            # A non-GPU failure (bad media, invalid graph, ...) would fail
-            # again identically on the CPU codec too, so this doesn't mask
-            # real errors, just avoids treating a GPU-specific hiccup as fatal.
-            if not using_gpu or self._cancelled:
+            # Only for failures that look GPU-specific, though: re-rendering
+            # the whole project after e.g. a disk-full or bad-media error
+            # deep into a long export just doubles the wait for the same error.
+            if not using_gpu or self._cancelled or not self._is_gpu_specific_failure(exc):
                 raise
             if on_progress:
                 on_progress(0.0, "GPU encoding failed -- falling back to CPU encoder...")
@@ -349,6 +449,20 @@ class Exporter:
                 fallback_args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering (CPU fallback)"
             )
         return settings.output_path
+
+    @staticmethod
+    def _is_gpu_specific_failure(exc: "ExportError") -> bool:
+        """Whether a failed NVENC encode is worth retrying on the CPU codec.
+
+        True when FFmpeg's log mentions NVENC/CUDA/driver-level trouble, or
+        when it failed before encoding any output at all (encoder/session
+        initialisation is where NVENC problems surface; a retry that fails
+        equally early costs next to nothing). A failure after real progress
+        with no GPU-related text is treated as a project/media/disk problem.
+        """
+        if any(_GPU_FAILURE_RE.search(line) for line in exc.log_tail):
+            return True
+        return exc.encoded_seconds <= 0.0
 
     def _export_gif(
         self,
@@ -480,6 +594,8 @@ class Exporter:
         range_start, range_end = progress_range
         process = popen(args)
         self._process = process
+        log_tail: deque = deque(maxlen=ERROR_LOG_TAIL_LINES)
+        encoded_seconds = 0.0
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -487,11 +603,17 @@ class Exporter:
                     process.terminate()
                     raise ExportCancelled()
                 match = _TIME_RE.search(line)
-                if match and on_progress:
+                if match:
                     out_time_s = int(match.group(1)) / 1_000_000
-                    local_fraction = min(1.0, out_time_s / total_duration)
-                    fraction = range_start + local_fraction * (range_end - range_start)
-                    on_progress(fraction, f"{label}... {local_fraction * 100:.0f}%")
+                    encoded_seconds = max(encoded_seconds, out_time_s)
+                    if on_progress:
+                        local_fraction = min(1.0, out_time_s / total_duration)
+                        fraction = range_start + local_fraction * (range_end - range_start)
+                        on_progress(fraction, f"{label}... {local_fraction * 100:.0f}%")
+                elif not _PROGRESS_LINE_RE.match(line):
+                    stripped = line.rstrip()
+                    if stripped:
+                        log_tail.append(stripped)
             process.wait()
         finally:
             if process.stdout:
@@ -503,6 +625,7 @@ class Exporter:
 
         if process.returncode != 0:
             raise ExportError(
-                f"FFmpeg exited with code {process.returncode}. "
-                "Check that all source files are valid and accessible."
+                f"FFmpeg exited with code {process.returncode} ({label}).",
+                log_tail=list(log_tail),
+                encoded_seconds=encoded_seconds,
             )
