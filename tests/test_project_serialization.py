@@ -90,5 +90,47 @@ class ProjectSerializationTests(unittest.TestCase):
         self.assertAlmostEqual(loaded_music.duck_threshold, 0.1)
 
 
+class AtomicSaveTests(unittest.TestCase):
+    """Project.save() used to open the destination with "w" and dump into
+    it -- a crash or error mid-write truncated the user's only copy."""
+
+    def test_failed_save_leaves_the_previous_file_intact_and_no_temp_files(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.vproj")
+            project = Project(name="Original")
+            project.save(path)
+            with open(path, "r", encoding="utf-8") as f:
+                original = f.read()
+
+            project.name = "Changed"
+            with patch("core.project.json.dump", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    project.save(path)
+
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), original)
+            self.assertEqual(os.listdir(tmp), ["p.vproj"])
+
+    def test_failed_save_as_does_not_change_file_path(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Project()
+            with patch("core.project.json.dump", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    project.save(os.path.join(tmp, "new.vproj"))
+            self.assertIsNone(project.file_path)
+
+    def test_save_replaces_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.vproj")
+            Project(name="One").save(path)
+            Project(name="Two").save(path)
+            self.assertEqual(Project.load(path).name, "Two")
+            self.assertEqual(os.listdir(tmp), ["p.vproj"])
+
+
 if __name__ == "__main__":
     unittest.main()

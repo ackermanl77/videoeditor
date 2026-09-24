@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,32 @@ from core.media_asset import MediaAsset
 from core.track import Track, TrackType
 
 PROJECT_FILE_VERSION = 1
+
+
+def write_json_atomic(path: str, data: Any, indent: Optional[int] = None) -> None:
+    """Write ``data`` as JSON to ``path`` without ever leaving it half-written.
+
+    Serializes into a temp file in the same folder, flushes it to disk, then
+    ``os.replace``s it over ``path`` (an atomic rename on the same volume).
+    A crash, full disk, or serialization error mid-write used to truncate
+    the user's only copy of their project; now ``path`` is either the old
+    complete file or the new complete file, and a failed write leaves no
+    temp file behind.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass
@@ -189,9 +216,14 @@ class Project:
         return project
 
     def save(self, path: str) -> None:
+        """Atomically write the project to ``path`` (see :func:`write_json_atomic`).
+
+        ``file_path`` is only updated once the write has succeeded, so a
+        failed Save As doesn't leave the project pointing at a file that
+        was never written.
+        """
+        write_json_atomic(path, self.to_dict(), indent=2)
         self.file_path = path
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
     def load(cls, path: str) -> "Project":

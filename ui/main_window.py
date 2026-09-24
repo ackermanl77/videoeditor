@@ -26,7 +26,7 @@ from core.clip import Clip
 from core.ffmpeg_utils import nvenc_available
 from core.history import History
 from core.media_asset import MediaAsset
-from core.project import Project
+from core.project import Project, write_json_atomic
 from core.track import TrackType
 from core.waveform import load_waveform
 from ui.export_dialog import ExportDialog
@@ -494,15 +494,24 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{star}{name}{path} — {APP_NAME}")
 
     def _confirm_discard_if_dirty(self) -> bool:
+        """Save / Discard / Cancel prompt before losing unsaved changes.
+
+        Returns True if it's OK to continue (saved successfully, or the user
+        chose Discard). The prompt used to offer only Discard or Cancel, so
+        saving first meant cancelling, saving, and repeating the action.
+        """
         if not self._dirty:
             return True
-        result = QMessageBox.question(
+        result = QMessageBox.warning(
             self,
             "Unsaved Changes",
-            "You have unsaved changes. Discard them and continue?",
-            QMessageBox.Yes | QMessageBox.No,
+            f'Do you want to save the changes to "{self.project.name}"?',
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
         )
-        return result == QMessageBox.Yes
+        if result == QMessageBox.Save:
+            return self.save_project()
+        return result == QMessageBox.Discard
 
     def new_project(self) -> None:
         if not self._confirm_discard_if_dirty():
@@ -602,32 +611,33 @@ class MainWindow(QMainWindow):
             "original paths.",
         )
 
-    def save_project(self) -> None:
+    def save_project(self) -> bool:
+        """Save to the current file (or ask where, first time). Returns True if saved."""
         if self.project.file_path is None:
-            self.save_project_as()
-            return
-        self._save_to(self.project.file_path)
+            return self.save_project_as()
+        return self._save_to(self.project.file_path)
 
-    def save_project_as(self) -> None:
+    def save_project_as(self) -> bool:
         default = f"{self.project.name}.vproj"
         path, _ = QFileDialog.getSaveFileName(self, "Save Project As", default, PROJECT_FILE_FILTER)
         if not path:
-            return
+            return False
         if not path.endswith(".vproj"):
             path += ".vproj"
-        self._save_to(path)
+        return self._save_to(path)
 
-    def _save_to(self, path: str) -> None:
+    def _save_to(self, path: str) -> bool:
         try:
-            self.project.save(path)
+            self.project.save(path)  # atomic: temp file + os.replace
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Save Project", f"Could not save project:\n{exc}")
-            return
+            return False
         self._dirty = False
         self._update_title()
         self._clear_autosave()
         self._add_recent_project(path)
         self.status_bar.showMessage(f"Saved to {path}", 3000)
+        return True
 
     # ------------------------------------------------------------------
     # Autosave / crash recovery
@@ -642,11 +652,13 @@ class MainWindow(QMainWindow):
         if not self._dirty:
             return
         try:
-            with open(_autosave_path(), "w", encoding="utf-8") as f:
-                json.dump(self.project.to_dict(), f)
-            with open(_autosave_meta_path(), "w", encoding="utf-8") as f:
-                json.dump({"original_path": self.project.file_path, "name": self.project.name}, f)
-        except OSError:
+            # Atomic writes: a crash mid-autosave must not corrupt the very
+            # recovery slot meant to survive crashes.
+            write_json_atomic(_autosave_path(), self.project.to_dict())
+            write_json_atomic(
+                _autosave_meta_path(), {"original_path": self.project.file_path, "name": self.project.name}
+            )
+        except (OSError, TypeError, ValueError):
             pass  # autosaving is a courtesy; never interrupt the user for it
 
     def _clear_autosave(self) -> None:
