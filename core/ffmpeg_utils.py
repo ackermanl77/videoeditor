@@ -72,32 +72,60 @@ def find_binary(tool: str) -> str:
 
 @lru_cache(maxsize=None)
 def nvenc_available() -> bool:
-    """Probe whether the located ``ffmpeg`` binary can encode with NVENC.
+    """Probe whether the located ``ffmpeg`` binary can *actually* encode with NVENC.
 
-    Runs ``ffmpeg -hide_banner -encoders`` once and checks for ``h264_nvenc``
-    in the listed encoders. This is a build/driver capability check, not a
-    guarantee the encode will actually succeed at runtime (e.g. another
-    process could be holding the GPU's limited concurrent NVENC session
-    count) — callers that select NVENC should still be prepared to fall back
-    to a CPU codec if the real encode fails.
+    Two steps, both run once and cached:
+
+    1. ``ffmpeg -hide_banner -encoders`` must list ``h264_nvenc`` (a cheap
+       check that the encoder is compiled into this build at all).
+    2. A tiny real test encode (0.1 s of a 256x256 ``nullsrc`` pattern into
+       ``h264_nvenc``, discarded via ``-f null``) must succeed. Step 1 alone
+       is not enough: the gyan.dev/BtbN builds ship ``h264_nvenc`` on every
+       machine, including ones with no NVIDIA GPU, an AMD/Intel GPU, or a
+       driver too old for this ffmpeg's NVENC SDK -- all of which list the
+       encoder but fail the moment it's opened. Actually opening an encode
+       session is the only reliable check.
+
+    This still isn't a guarantee a later full-length encode will succeed
+    (e.g. another process could grab the GPU's limited concurrent NVENC
+    session count in between) -- callers that select NVENC should still be
+    prepared to fall back to a CPU codec on a GPU-specific failure (see
+    ``core.exporter.Exporter._export_single_pass``).
 
     Cached for the life of the process (``lru_cache``): this doesn't change
     while the app is running, and re-spawning ffmpeg just to re-ask the same
     question on every export isn't worth it. Never raises — any failure
-    (ffmpeg not found, probe error, non-zero exit) is treated as "not
-    available" so callers always have a safe CPU fallback path.
+    (ffmpeg not found, probe error, non-zero exit, timeout) is treated as
+    "not available" so callers always have a safe CPU fallback path.
     """
     try:
         ffmpeg = find_binary("ffmpeg")
-        result = run([ffmpeg, "-hide_banner", "-encoders"])
+        result = run([ffmpeg, "-hide_banner", "-encoders"], timeout=30)
         output = (result.stdout or "") + (result.stderr or "")
-        return "h264_nvenc" in output
+        if "h264_nvenc" not in output:
+            return False
+        test_encode = run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                "-c:v", "h264_nvenc", "-f", "null", "-",
+            ],
+            timeout=30,
+        )
+        return test_encode.returncode == 0
     except Exception:
         return False
 
 
 def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
-    """Run a subprocess with sensible defaults (no console window on Windows)."""
+    """Run a subprocess with sensible defaults (no console window on Windows).
+
+    Output is decoded as UTF-8 (FFmpeg/FFprobe always emit UTF-8, e.g. a
+    non-ASCII file name echoed back in ffprobe's JSON) with ``errors="replace"``
+    -- plain ``text=True`` would use the locale code page (cp1252 on most
+    Windows installs), which raised ``UnicodeDecodeError`` in subprocess's
+    reader thread for a file like ``Árbol.mp4`` and left ``stdout`` empty.
+    """
     creationflags = 0
     if sys.platform.startswith("win"):
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -105,6 +133,8 @@ def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
         args,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=creationflags,
         **kwargs,
     )
@@ -128,6 +158,8 @@ def run_binary(args: List[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def popen(args: List[str], **kwargs) -> subprocess.Popen:
+    """Start a long-running subprocess with stderr merged into a line-buffered
+    UTF-8 text stdout (see :func:`run` for why the encoding is explicit)."""
     creationflags = 0
     if sys.platform.startswith("win"):
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -136,6 +168,8 @@ def popen(args: List[str], **kwargs) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         universal_newlines=True,
         creationflags=creationflags,

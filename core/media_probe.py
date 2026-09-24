@@ -15,11 +15,20 @@ from core.media_asset import MediaAsset
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 
 
+class MediaProbeError(Exception):
+    """ffprobe ran but couldn't read the file as audio/video/image media."""
+
+
 def probe_file(path: str) -> MediaAsset:
     """Run ffprobe on ``path`` and return a populated :class:`MediaAsset`.
 
-    Falls back to sane defaults if ffprobe is unavailable or the file has
-    unusual metadata, so the UI never crashes on a bad import.
+    Falls back to sane defaults if ffprobe itself is unavailable or the
+    file has unusual metadata. But if ffprobe *did* run and couldn't read
+    the file (non-zero exit, unparseable output, or no audio/video stream at
+    all), raises :class:`MediaProbeError` rather than returning an empty
+    ``duration=0``/no-streams asset — importing that as if it were valid
+    media just produced a broken, zero-length clip with no explanation.
+    ``ui/import_worker.py`` reports the exception as a per-file import error.
     """
     asset = MediaAsset(path=path)
 
@@ -40,12 +49,16 @@ def probe_file(path: str) -> MediaAsset:
     ]
     result = run(args)
     if result.returncode != 0 or not result.stdout:
-        return asset
+        detail = (result.stderr or "").strip().splitlines()
+        raise MediaProbeError(
+            "Unreadable media file (ffprobe could not open it)"
+            + (f": {detail[-1]}" if detail else ".")
+        )
 
     try:
         data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return asset
+    except json.JSONDecodeError as exc:
+        raise MediaProbeError(f"Unreadable media file (invalid ffprobe output: {exc}).") from exc
 
     fmt = data.get("format", {})
     try:
@@ -74,6 +87,9 @@ def probe_file(path: str) -> MediaAsset:
                     asset.duration = float(stream.get("duration", 0.0))
                 except (TypeError, ValueError):
                     pass
+
+    if not asset.has_video and not asset.has_audio:
+        raise MediaProbeError("Unreadable media file: no audio or video streams found.")
 
     # A single-frame "video" stream with no duration/audio is really a
     # still image (e.g. imported via -loop). Treat near-zero duration

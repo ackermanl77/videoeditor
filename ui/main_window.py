@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import Clip
+from core.ffmpeg_utils import nvenc_available
 from core.history import History
 from core.media_asset import MediaAsset
 from core.project import Project
@@ -128,6 +130,11 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave)
         self._autosave_timer.start()
+
+        # Warm core.ffmpeg_utils.nvenc_available()'s cache off the UI thread:
+        # it now does a real (~1-2 s) NVENC test encode, and the Export
+        # dialog would otherwise block on it the first time it opens.
+        threading.Thread(target=nvenc_available, name="nvenc-probe", daemon=True).start()
 
         self._restore_window_state()
 
