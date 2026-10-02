@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, Optional
+
+#: ffprobe ``color_transfer`` values that mark a source as HDR (PQ / HLG).
+HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+
+#: ffprobe ``color_space`` values of standard-definition (BT.601) video.
+BT601_MATRICES = frozenset({"bt470bg", "smpte170m"})
 
 
 @dataclass
@@ -23,6 +29,18 @@ class MediaAsset:
     thumbnail_path: Optional[str] = None
     waveform_path: Optional[str] = None
     codec: str = ""
+    # Colour description of the video stream, from ffprobe (empty = unknown).
+    # Used to tone-map HDR to SDR and to convert BT.601 sources to BT.709 at
+    # export (core/filter_graph.py), and for the media bin's HDR badge.
+    pix_fmt: str = ""
+    bit_depth: int = 8
+    color_transfer: str = ""
+    color_primaries: str = ""
+    color_space: str = ""
+    color_range: str = ""
+    # Low-resolution, short-GOP copy used by the preview only (export always
+    # reads the original ``path``). None until one is generated.
+    proxy_path: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -32,21 +50,30 @@ class MediaAsset:
     def is_image(self) -> bool:
         return not self.has_video and not self.has_audio and self.width > 0
 
+    @property
+    def is_hdr(self) -> bool:
+        return self.color_transfer in HDR_TRANSFERS
+
+    @property
+    def is_bt601(self) -> bool:
+        return self.color_space in BT601_MATRICES
+
+    @property
+    def is_offline(self) -> bool:
+        return not os.path.isfile(self.path)
+
+    def preview_path(self) -> str:
+        """The file the preview should play: the proxy when it exists, else the original."""
+        if self.proxy_path and os.path.isfile(self.proxy_path):
+            return self.proxy_path
+        return self.path
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "path": self.path,
-            "duration": self.duration,
-            "width": self.width,
-            "height": self.height,
-            "fps": self.fps,
-            "has_video": self.has_video,
-            "has_audio": self.has_audio,
-            "thumbnail_path": self.thumbnail_path,
-            "waveform_path": self.waveform_path,
-            "codec": self.codec,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MediaAsset":
-        return cls(**data)
+        # Unknown keys (from a newer version, or a hand-edited file) are
+        # ignored rather than raising TypeError in __init__.
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})

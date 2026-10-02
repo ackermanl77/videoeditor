@@ -8,8 +8,16 @@ concerns while giving the UI a simple, reliable undo/redo story.
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
-from typing import Callable, List, Optional
+from typing import Callable, Hashable, List, Optional
+
+#: How long after the last merged edit a new edit with the same
+#: ``merge_key`` still joins it (seconds). A continuous slider drag, wheel
+#: spin or held arrow key produces edits far closer together than this, so
+#: one gesture becomes one undo step; a separate edit a moment later is its
+#: own step. Callers can also end a gesture explicitly (History.end_merge).
+MERGE_WINDOW_SECONDS = 0.7
 
 
 class Command(ABC):
@@ -17,6 +25,18 @@ class Command(ABC):
 
     #: Short human-readable label shown in Edit menu ("Undo Trim Clip").
     label: str = "Action"
+
+    #: Commands with an equal, non-None key may be merged into one undo step
+    #: (Qt's ``QUndoCommand::mergeWith`` semantics) -- see History.execute.
+    merge_key: Optional[Hashable] = None
+
+    def merge(self, other: "Command") -> bool:
+        """Absorb ``other`` (already applied) into this command; return False to refuse.
+
+        On success this command must undo straight back to its *own*
+        original state and redo to ``other``'s result.
+        """
+        return False
 
     @abstractmethod
     def do(self) -> None:
@@ -60,28 +80,111 @@ class CompositeCommand(Command):
             command.redo()
 
 
-class History:
-    """A bounded undo/redo stack of :class:`Command` objects."""
+class InvalidEditError(ValueError):
+    """Raised in strict mode when a command would leave the project invalid (see ``History``)."""
 
-    def __init__(self, max_size: int = 200, on_change: Optional[Callable[[], None]] = None) -> None:
+    def __init__(self, problems: List[str]):
+        self.problems = list(problems)
+        super().__init__("Edit rejected: " + "; ".join(self.problems))
+
+
+class History:
+    """A bounded undo/redo stack of :class:`Command` objects.
+
+    ``validator`` (strict mode, used by the tests and when the
+    ``VIDEO_EDITOR_STRICT`` environment variable is set) is called before and
+    after each new command; a command that introduces a problem the project
+    didn't already have (e.g. two clips overlapping on one track) is undone
+    again and :class:`InvalidEditError` is raised. Problems that existed
+    before the edit (an old project loaded with overlaps) don't block edits.
+
+    The clean index (:meth:`mark_clean` / :attr:`is_clean`) records which undo
+    position matches the file on disk, so undoing back to the saved state
+    clears the window's "unsaved changes" star.
+    """
+
+    def __init__(
+        self,
+        max_size: int = 200,
+        on_change: Optional[Callable[[], None]] = None,
+        validator: Optional[Callable[[], List[str]]] = None,
+    ) -> None:
         self._undo_stack: List[Command] = []
         self._redo_stack: List[Command] = []
         self._max_size = max_size
         self._on_change = on_change
+        self._validator = validator
+        self._merge_open = False
+        self._last_merge_time = 0.0
+        # Identity of the command on top of the undo stack when the project
+        # was last saved (None = the empty stack), and whether that saved
+        # state is still reachable by undo/redo at all.
+        self._clean_top: Optional[Command] = None
+        self._clean_reachable = True
 
     def execute(self, command: Command) -> None:
+        before = set(self._validator()) if self._validator is not None else None
         command.do()
+        if before is not None:
+            new_problems = [p for p in self._validator() if p not in before]
+            if new_problems:
+                command.undo()
+                raise InvalidEditError(new_problems)
+        now = time.monotonic()
+        top = self._undo_stack[-1] if self._undo_stack else None
+        if (
+            top is not None
+            and self._merge_open
+            and command.merge_key is not None
+            and top.merge_key == command.merge_key
+            and now - self._last_merge_time <= MERGE_WINDOW_SECONDS
+            and top.merge(command)
+        ):
+            self._last_merge_time = now
+            self._redo_stack.clear()
+            self._notify()
+            return
         self._undo_stack.append(command)
         if len(self._undo_stack) > self._max_size:
-            self._undo_stack.pop(0)
+            dropped = self._undo_stack.pop(0)
+            if dropped is self._clean_top or (self._clean_top is None and self._clean_reachable):
+                self._clean_reachable = False  # the saved state fell off the bottom
+        if any(c is self._clean_top for c in self._redo_stack):
+            self._clean_reachable = False  # the saved state was in the discarded redo branch
         self._redo_stack.clear()
+        self._merge_open = command.merge_key is not None
+        self._last_merge_time = now
         self._notify()
+
+    def end_merge(self) -> None:
+        """Close the current mergeable gesture (e.g. on slider release): the next edit is a new step."""
+        self._merge_open = False
+
+    def mark_clean(self) -> None:
+        """Record the current undo position as the saved state.
+
+        Also ends any open merge, so an edit after saving becomes a new undo
+        step instead of silently changing the command that marks "saved".
+        """
+        self._clean_top = self._undo_stack[-1] if self._undo_stack else None
+        self._clean_reachable = True
+        self._merge_open = False
+        self._notify()
+
+    @property
+    def is_clean(self) -> bool:
+        """True when the undo position is exactly the one last marked clean."""
+        if not self._clean_reachable:
+            return False
+        top = self._undo_stack[-1] if self._undo_stack else None
+        return top is self._clean_top
 
     def undo(self) -> Optional[str]:
         if not self._undo_stack:
             return None
         command = self._undo_stack.pop()
         command.undo()
+        self._merge_open = False
         self._redo_stack.append(command)
         self._notify()
         return command.label
@@ -91,6 +194,7 @@ class History:
             return None
         command = self._redo_stack.pop()
         command.redo()
+        self._merge_open = False
         self._undo_stack.append(command)
         self._notify()
         return command.label
@@ -98,6 +202,9 @@ class History:
     def clear(self) -> None:
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._merge_open = False
+        self._clean_top = None
+        self._clean_reachable = True
         self._notify()
 
     @property
