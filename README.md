@@ -47,7 +47,22 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Export** to MP4 / MOV / MKV / AVI / FLV / WebM / animated GIF with
   resolution, frame-rate and quality presets (or two-pass
   target-file-size encoding), rendered by FFmpeg with a live progress bar
-- **Keyboard shortcuts** for the operations you use most
+- **Keyboard shortcuts** for the operations you use most (Help > Keyboard
+  Shortcuts lists them all)
+- **Effect stack**: LUT (.cube), YUV chroma key with despill, sharpen, blur,
+  vignette, video denoise, in any order per clip
+- **Audio**: equal-power audio crossfades, volume keyframes, ducking with
+  adjustable threshold/ratio/attack/release, master limiter, loudness targets
+- **Editing tools**: multi-select (Ctrl+click, rubber band), copy/cut/paste,
+  duplicate, paste attributes, insert/overwrite, roll/slip/slide, razor,
+  detach/linked audio, keyframe-at-playhead buttons
+- **Accurate preview frames**: while paused, show the exact export frame
+  rendered by the export engine; next-clip preloading; preview proxies
+- **Colour**: HDR (HLG/PQ) tone-mapped to SDR; every export tagged BT.709
+- **Codecs**: H.264, HEVC, AV1 (CPU or NVENC), ProRes 422 HQ, DNxHR HQ; export
+  presets, remembered settings, exact 23.976/29.97/59.94 rates
+- **Robust projects**: versioned file format, relative media paths, Relink
+  Media, per-session autosave, `.bak` on save
 
 ## Project layout
 
@@ -130,7 +145,15 @@ anywhere Python does, without a display:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package.
+GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
+
+To check an installation or a built exe without opening the GUI:
+
+```bash
+python main.py --self-test        # or: VideoEditor.exe --self-test
+```
+
+It prints the version, the FFmpeg it found, NVENC availability and the required filters, renders a one-second test export, and exits 0 on success.
 
 ## Building a standalone executable
 
@@ -208,6 +231,10 @@ publishes it as a prerelease, for a one-off test build.
 | Add text clip                         | T |
 | Add marker at playhead                   | M |
 | Zoom timeline in / out                   | Ctrl+= / Ctrl+- (or Ctrl+scroll) |
+| Copy / Cut / Paste / Duplicate           | Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D |
+| Insert / Overwrite media at playhead     | , / . |
+| Razor tool                               | C |
+| All shortcuts                            | F1 |
 
 ## How editing works
 
