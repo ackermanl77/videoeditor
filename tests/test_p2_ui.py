@@ -47,6 +47,13 @@ class _QtCase(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    @classmethod
+    def tearDownClass(cls):
+        # The offscreen platform's clipboard crashes the interpreter at exit (0xC0000005) if it
+        # still holds a QMimeData set from Python (the copy/paste tests do). The real Windows
+        # platform doesn't, so this is a test-only cleanup.
+        QApplication.clipboard().clear()
+
 
 class ExportDialogP2Tests(_QtCase):
     def _dialog(self, project=None):
