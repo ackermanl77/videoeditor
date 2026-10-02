@@ -7,10 +7,23 @@ overlays are computed only at export time by the FFmpeg render engine — the
 preview intentionally trades perfect What-You-See-Is-What-You-Get accuracy
 for a simple, fast, maintainable implementation. A small on-screen note
 reminds the user of this.
+
+Three additions narrow the gap:
+
+* **Accurate frame** (checkbox): while paused or scrubbing, the exact
+  export composite at the playhead is rendered by the export engine itself
+  (core/frame_render.py) on a worker thread and shown instead; a
+  generation counter drops results a newer request has superseded.
+* **Next-clip preloading**: a second player opens the next clip's file
+  shortly before a cut, and the two players swap at the cut, so a cut
+  between different files no longer stalls on opening the file.
+* **Proxies**: when an asset has a preview proxy (core/proxy.py) the
+  preview plays that instead of the heavy original.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
@@ -18,6 +31,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -29,10 +43,19 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import Clip, MediaType
+from core.frame_render import FrameRenderError, render_frame
 from core.project import Project
+from core.timeline_nav import format_timecode
 from core.track import Track, TrackType
+from ui import theme
 
 POLL_INTERVAL_MS = 40
+# Open the next clip's file this long before a cut.
+PRELOAD_LEAD_S = 1.5
+# Wait this long after the last seek/edit before rendering an accurate frame.
+ACCURATE_FRAME_DEBOUNCE_MS = 150
+# J/L shuttle speeds (repeat presses step through them).
+SHUTTLE_RATES = (1.0, 2.0, 4.0)
 
 
 class PreviewPlayer(QWidget):
@@ -40,6 +63,8 @@ class PreviewPlayer(QWidget):
 
     time_changed = Signal(float)
     playing_changed = Signal(bool)
+    # (generation, PNG bytes or an error string) from the frame-render thread.
+    _frame_ready = Signal(int, object)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -49,10 +74,31 @@ class PreviewPlayer(QWidget):
         self._is_playing = False
         self._current_time = 0.0
         self._suppress_slider_signal = False
+        # Signed shuttle rate: 1 = normal play, 2/4 = fast forward (L), <0 =
+        # reverse (J). Reverse is stepped by seeking (QMediaPlayer can't play
+        # backwards).
+        self._shuttle_rate = 1.0
+        # What the player was last loaded for (see refresh_after_edit).
+        self._loaded_signature = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
+        # Second player: opens the next clip's file ahead of a cut (F10a).
+        self._preload_player = QMediaPlayer(self)
+        self._preload_audio = QAudioOutput(self)
+        self._preload_audio.setMuted(True)
+        self._preload_player.setAudioOutput(self._preload_audio)
+        self._preloaded_source: Optional[str] = None
+
+        # Accurate-frame rendering state (F10b).
+        self._frame_generation = 0
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setSingleShot(True)
+        self._frame_timer.setInterval(ACCURATE_FRAME_DEBOUNCE_MS)
+        self._frame_timer.timeout.connect(self._start_frame_render)
+        self._frame_ready.connect(self._on_frame_ready)
+        self.last_frame_error: Optional[str] = None
 
         self._build_ui()
         self._connect_signals()
@@ -75,11 +121,18 @@ class PreviewPlayer(QWidget):
         self.stack.setStyleSheet("background-color: black;")
         self.video_widget = QVideoWidget()
         self.player.setVideoOutput(self.video_widget)
+        self._preload_video = QVideoWidget()
+        self._preload_player.setVideoOutput(self._preload_video)
         self.placeholder_label = QLabel()
         self.placeholder_label.setAlignment(Qt.AlignCenter)
         self.placeholder_label.setStyleSheet("background-color: black; color: white; font-size: 24px;")
+        self.frame_label = QLabel()  # accurate rendered frames
+        self.frame_label.setAlignment(Qt.AlignCenter)
+        self.frame_label.setStyleSheet("background-color: black;")
         self.stack.addWidget(self.video_widget)
+        self.stack.addWidget(self._preload_video)
         self.stack.addWidget(self.placeholder_label)
+        self.stack.addWidget(self.frame_label)
         layout.addWidget(self.stack, 1)
 
         controls = QHBoxLayout()
@@ -88,7 +141,7 @@ class PreviewPlayer(QWidget):
         self.play_btn.setFixedWidth(36)
         controls.addWidget(self.play_btn)
 
-        self.time_label = QLabel("00:00:00 / 00:00:00")
+        self.time_label = QLabel("00:00:00:00 / 00:00:00:00")
         self.time_label.setStyleSheet("color: #9aa1ad;")
         controls.addWidget(self.time_label)
 
@@ -97,14 +150,23 @@ class PreviewPlayer(QWidget):
         self.seek_slider.setMaximum(1000)
         controls.addWidget(self.seek_slider, 1)
 
+        self.accurate_checkbox = QCheckBox("Accurate frame")
+        self.accurate_checkbox.setToolTip(
+            "While paused or scrubbing, show the exact exported frame (every track, transitions, text, "
+            "effects), rendered by the export engine at preview size."
+        )
+        self.accurate_checkbox.toggled.connect(self._on_accurate_toggled)
+        controls.addWidget(self.accurate_checkbox)
+
         layout.addLayout(controls)
 
         self.note_label = QLabel(
-            "Preview shows the top active video clip only. Transitions, text and full "
-            "multi-track compositing appear in the exported video."
+            "Playback shows the top active video clip only. Tick 'Accurate frame' to see the exact "
+            "export composite (transitions, text, effects) while paused."
         )
         self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("color: #6b7280; font-size: 10px;")
+        # COLOR_TEXT_DIM: the old #6b7280 measured 3.2:1 on the panel background.
+        self.note_label.setStyleSheet(f"color: {theme.COLOR_TEXT_DIM}; font-size: 10px;")
         layout.addWidget(self.note_label)
 
     def _connect_signals(self) -> None:
@@ -112,13 +174,23 @@ class PreviewPlayer(QWidget):
         self.seek_slider.sliderPressed.connect(self._pause_for_scrub)
         self.seek_slider.sliderMoved.connect(self._on_slider_moved)
         self.player.errorOccurred.connect(self._on_player_error)
+        self._preload_player.errorOccurred.connect(self._on_player_error)
 
     # ------------------------------------------------------------------
     def set_project(self, project: Project) -> None:
         self.project = project
         self._current_source = None
+        self._preloaded_source = None
         self._active_clip = None
         self.seek_to(0.0)
+
+    def media_path_for(self, clip: Clip) -> str:
+        """The file the preview plays for ``clip``: its asset's proxy when one exists, else the source."""
+        if self.project is not None:
+            asset = self.project.asset_for_clip(clip)
+            if asset is not None and asset.path == clip.source_path:
+                return asset.preview_path()
+        return clip.source_path
 
     def _total_duration(self) -> float:
         return self.project.total_duration if self.project else 0.0
@@ -150,7 +222,36 @@ class PreviewPlayer(QWidget):
         if self._is_playing:
             self.pause()
         else:
+            self._shuttle_rate = 1.0
             self.play()
+
+    @property
+    def shuttle_rate(self) -> float:
+        return self._shuttle_rate if self._is_playing else 0.0
+
+    def shuttle(self, direction: int) -> None:
+        """J (direction < 0) / L (> 0): play that way; pressing again speeds up 1x -> 2x -> 4x."""
+        current = self.shuttle_rate
+        if current != 0 and (current > 0) == (direction > 0):
+            index = SHUTTLE_RATES.index(abs(current)) if abs(current) in SHUTTLE_RATES else 0
+            magnitude = SHUTTLE_RATES[min(index + 1, len(SHUTTLE_RATES) - 1)]
+        else:
+            magnitude = SHUTTLE_RATES[0]
+        self._shuttle_rate = magnitude if direction > 0 else -magnitude
+        if self._shuttle_rate < 0:
+            self.player.pause()
+            self._is_playing = True
+            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self._poll_timer.start()
+            self.playing_changed.emit(True)
+        else:
+            self.play()
+
+    def stop_shuttle(self) -> None:
+        """K: pause and reset the shuttle speed."""
+        self._shuttle_rate = 1.0
+        if self._is_playing:
+            self.pause()
 
     def play(self) -> None:
         if self.project is None:
@@ -169,6 +270,7 @@ class PreviewPlayer(QWidget):
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self._poll_timer.stop()
         self.playing_changed.emit(False)
+        self.request_accurate_frame()
 
     def _pause_for_scrub(self) -> None:
         if self._is_playing:
@@ -178,6 +280,35 @@ class PreviewPlayer(QWidget):
         total = self._total_duration()
         t = (value / 1000.0) * total
         self.seek_to(t)
+
+    def _signature(self, t: float):
+        """Everything about the clip under ``t`` that decides what the player shows/plays."""
+        clip, track = self._resolve_active_clip(t)
+        if clip is None:
+            return None
+        return (
+            clip.id, clip.media_type, clip.source_path, clip.source_in, clip.source_out,
+            clip.timeline_start, clip.speed, tuple(clip.speed_keyframes),
+            clip.text_style.content if clip.text_style else None, self.media_path_for(clip),
+        )
+
+    def refresh_after_edit(self) -> None:
+        """Called after any project edit: reseek only if the clip under the playhead changed.
+
+        Every Properties-panel slider tick used to reseek QMediaPlayer (dozens
+        of setPosition calls a second while dragging), although most
+        properties (colour, opacity, key, transform) don't affect this
+        preview at all. Volume/mute are applied without a seek.
+        """
+        self.request_accurate_frame()  # any edit can change the composite
+        if self._signature(self._current_time) != self._loaded_signature:
+            self.seek_to(self._current_time)
+            return
+        clip, track = self._resolve_active_clip(self._current_time)
+        if clip is not None:
+            self.audio_output.setMuted(clip.muted or (track is not None and track.muted))
+            self.audio_output.setVolume(max(0.0, min(1.0, clip.volume)))
+        self._update_time_label()
 
     def seek_to(self, t: float) -> None:
         total = self._total_duration()
@@ -191,10 +322,107 @@ class PreviewPlayer(QWidget):
         if not self._suppress_slider_signal:
             self._update_slider()
         self.time_changed.emit(t)
+        self.request_accurate_frame()
+
+    # ------------------------------------------------------------------
+    # Accurate frame (F10b)
+    # ------------------------------------------------------------------
+    def _on_accurate_toggled(self, checked: bool) -> None:
+        if checked:
+            self.request_accurate_frame()
+        else:
+            self._frame_generation += 1  # drop anything still rendering
+            self._load_for_time(self._current_time, autoplay=self._is_playing)
+
+    def request_accurate_frame(self) -> None:
+        """Schedule a render of the exact frame at the playhead (debounced; paused only)."""
+        if self.accurate_checkbox.isChecked() and not self._is_playing and self.project is not None:
+            self._frame_generation += 1
+            self._frame_timer.start()
+
+    def _start_frame_render(self) -> None:
+        if self.project is None or self.project.total_duration <= 0:
+            return
+        generation = self._frame_generation
+        t = self._current_time
+        project = self.project
+        size = (max(160, self.stack.width()), max(90, self.stack.height()))
+
+        def work() -> None:
+            from core.frame_render import preview_size
+
+            try:
+                data = render_frame(project, t, preview_size(project, *size))
+            except FrameRenderError as exc:
+                data = str(exc)
+            except Exception as exc:  # noqa: BLE001 - never let the worker thread die silently
+                data = f"Frame render failed: {exc}"
+            self._frame_ready.emit(generation, data)
+
+        threading.Thread(target=work, name="frame-render", daemon=True).start()
+
+    def _on_frame_ready(self, generation: int, data) -> None:
+        """Show a rendered frame -- unless a newer request superseded it, or playback started."""
+        if generation != self._frame_generation or self._is_playing or not self.accurate_checkbox.isChecked():
+            return
+        if isinstance(data, (bytes, bytearray)):
+            pixmap = QPixmap()
+            pixmap.loadFromData(bytes(data), "PNG")
+            self.last_frame_error = None
+            self.frame_label.setPixmap(
+                pixmap.scaled(self.frame_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            self.frame_label.setToolTip("Exact export frame")
+        else:
+            self.last_frame_error = str(data)
+            self.frame_label.setPixmap(QPixmap())
+            self.frame_label.setText(f"Couldn't render this frame:\n{data}")
+        self.stack.setCurrentWidget(self.frame_label)
+
+    # ------------------------------------------------------------------
+    # Next-clip preloading (F10a)
+    # ------------------------------------------------------------------
+    def upcoming_clip(self) -> Optional[Clip]:
+        """The clip the preview will switch to at the end of the active one (None if none / a gap)."""
+        clip = self._active_clip
+        if clip is None:
+            return None
+        nxt, _track = self._resolve_active_clip(clip.timeline_end + 0.001)
+        if nxt is None or nxt.id == clip.id or nxt.media_type not in (MediaType.VIDEO, MediaType.AUDIO):
+            return None
+        return nxt
+
+    def maybe_preload(self) -> Optional[str]:
+        """Open the next clip's file in the spare player when the cut is near; returns the preloaded path."""
+        clip = self.upcoming_clip()
+        if clip is None or self._active_clip is None:
+            return None
+        if self._active_clip.timeline_end - self._current_time > PRELOAD_LEAD_S:
+            return None
+        path = self.media_path_for(clip)
+        if path == self._current_source or path == self._preloaded_source:
+            return self._preloaded_source
+        self._preload_player.setSource(QUrl.fromLocalFile(path))
+        self._preload_player.setPosition(int(max(0.0, clip.source_in) * 1000))
+        self._preload_player.pause()
+        self._preloaded_source = path
+        return path
+
+    def _swap_players(self) -> None:
+        """Make the preloaded player the active one (it already has the next file open)."""
+        self.player.pause()
+        self.player, self._preload_player = self._preload_player, self.player
+        self.audio_output, self._preload_audio = self._preload_audio, self.audio_output
+        self.video_widget, self._preload_video = self._preload_video, self.video_widget
+        self._preload_audio.setMuted(True)
+        self._current_source, self._preloaded_source = self._preloaded_source, None
 
     def _load_for_time(self, t: float, autoplay: bool) -> None:
         clip, track = self._resolve_active_clip(t)
         self._active_clip = clip
+        self._loaded_signature = self._signature(t)
+        if self._shuttle_rate < 0:
+            autoplay = False  # reverse shuttle steps by seeking; the player itself stays paused
 
         if clip is None:
             self.player.stop()
@@ -228,13 +456,22 @@ class PreviewPlayer(QWidget):
         if clip.media_type == MediaType.AUDIO:
             self.placeholder_label.setText(clip.name)
 
+        # Timeline <-> source mapping through the clip's speed segments, so
+        # speed-ramped clips seek to (and play at) the right place/speed.
         offset_in_clip = t - clip.timeline_start
-        source_position_s = clip.source_in + offset_in_clip * (clip.speed if clip.speed > 0 else 1.0)
+        source_position_s = clip.source_in + clip.source_offset_at(offset_in_clip)
 
-        if self._current_source != clip.source_path:
-            self.player.setSource(QUrl.fromLocalFile(clip.source_path))
-            self._current_source = clip.source_path
-        self.player.setPlaybackRate(clip.speed if clip.speed > 0 else 1.0)
+        media_path = self.media_path_for(clip)
+        if self._current_source != media_path:
+            if media_path == self._preloaded_source:
+                self._swap_players()
+                self.stack.setCurrentWidget(
+                    self.video_widget if clip.media_type == MediaType.VIDEO else self.placeholder_label
+                )
+            else:
+                self.player.setSource(QUrl.fromLocalFile(media_path))
+                self._current_source = media_path
+        self.player.setPlaybackRate(clip.speed_at(offset_in_clip) * max(1.0, self._shuttle_rate))
         self.player.setPosition(int(max(0.0, source_position_s) * 1000))
         # A muted *track* silences its clips too (matching export, see
         # core/filter_graph.py); this used to honor only the clip's own flag.
@@ -245,10 +482,28 @@ class PreviewPlayer(QWidget):
             self.player.play()
         else:
             self.player.pause()
+            if self.accurate_checkbox.isChecked():
+                self.stack.setCurrentWidget(self.frame_label)
 
     # ------------------------------------------------------------------
     def _on_poll(self) -> None:
         if not self._is_playing:
+            return
+
+        step = POLL_INTERVAL_MS / 1000.0 * abs(self._shuttle_rate)
+        if self._shuttle_rate < 0:
+            target = self._current_time - step
+            if target <= 0.0:
+                self._current_time = 0.0
+                self._load_for_time(0.0, autoplay=False)
+                self.pause()
+                self._shuttle_rate = 1.0
+            else:
+                self._current_time = target
+                self._load_for_time(target, autoplay=False)
+            self._update_time_label()
+            self._update_slider()
+            self.time_changed.emit(self._current_time)
             return
 
         clip = self._active_clip
@@ -256,22 +511,27 @@ class PreviewPlayer(QWidget):
             # Playing through a gap with no active clip (e.g. between two
             # clips on the timeline): advance by wall-clock time and keep
             # checking whether a clip has started at the new position.
-            self._advance_time_and_refresh(self._current_time + POLL_INTERVAL_MS / 1000.0)
+            self._advance_time_and_refresh(self._current_time + step)
             return
-
-        speed = clip.speed if clip.speed > 0 else 1.0
 
         if clip.media_type in (MediaType.VIDEO, MediaType.AUDIO):
             position_s = self.player.position() / 1000.0
-            timeline_t = clip.timeline_start + (position_s - clip.source_in) / speed
+            local_t = clip.timeline_offset_at(position_s - clip.source_in)
+            timeline_t = clip.timeline_start + local_t
             if position_s >= clip.source_out - 0.02:
                 self._advance_time_and_refresh(clip.timeline_end + 0.001)
                 return
+            # Crossing a speed-ramp boundary: follow the new segment's speed.
+            rate = clip.speed_at(local_t) * max(1.0, self._shuttle_rate)
+            if abs(self.player.playbackRate() - rate) > 1e-6:
+                self.player.setPlaybackRate(rate)
+            self._current_time = timeline_t
+            self.maybe_preload()
         else:
             # Text/image clips have no player position to poll; advance by
             # wall-clock time instead, and switch clips once we pass this
             # one's own end (mirrors the video/audio branch above).
-            timeline_t = self._current_time + POLL_INTERVAL_MS / 1000.0
+            timeline_t = self._current_time + step
             if timeline_t >= clip.timeline_end - 0.02:
                 self._advance_time_and_refresh(clip.timeline_end + 0.001)
                 return
@@ -309,8 +569,14 @@ class PreviewPlayer(QWidget):
         """The current preview playhead position, in seconds."""
         return self._current_time
 
+    def _fps(self) -> float:
+        return self.project.settings.fps if self.project is not None else 30.0
+
     def _update_time_label(self) -> None:
-        self.time_label.setText(f"{self.format_time(self._current_time)} / {self.format_time(self._total_duration())}")
+        fps = self._fps()
+        self.time_label.setText(
+            f"{format_timecode(self._current_time, fps)} / {format_timecode(self._total_duration(), fps)}"
+        )
 
     def _update_slider(self) -> None:
         total = self._total_duration()

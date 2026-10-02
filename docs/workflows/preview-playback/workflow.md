@@ -24,8 +24,17 @@ All of the above **are** rendered correctly in the exported file — export alwa
 ## Playback across gaps and speed
 
 - Playing through a gap with no active clip advances by wall-clock time (`_on_poll`, at `POLL_INTERVAL_MS = 40ms`) until a clip starts.
-- A clip's `speed` multiplier drives both `QMediaPlayer.setPlaybackRate()` and the timeline-time-to-source-time mapping used while polling, so scrubbing and playback stay in sync with a sped-up/slowed-down clip.
+- The timeline<->source mapping goes through the clip's speed segments (`Clip.source_offset_at()`/`timeline_offset_at()`/`speed_at()`), and the playback rate follows the segment under the playhead, so speed-ramped clips no longer drift (it used the constant `speed` only).
+- Property edits don't reseek: `PreviewPlayer.refresh_after_edit()` reseeks only when the clip under the playhead changed in a way this preview shows (source, trim, timing, speed); volume/mute are applied in place. Every Properties slider tick used to call `QMediaPlayer.setPosition()`.
+- Keyboard transport (**Playback** menu): J/K/L shuttle (repeat J or L for 2x/4x; reverse is stepped by seeking, since `QMediaPlayer` can't play backwards). The time label shows `HH:MM:SS:FF` at the project frame rate.
+- Not done yet: preloading the next clip's file in a second player, so a cut between two different files still pauses briefly while `QMediaPlayer` opens the next one.
 
 ## Validation
 
 There is no automated test for `PreviewPlayer` (it requires `QMediaPlayer`/a live event loop and, for real playback, actual media files with a working backend). Verify manually: play across a gap between clips, scrub during playback, and confirm a video clip on a higher track correctly takes over from one below it as the playhead crosses into its span.
+
+## Accurate frame, preloading and proxies (P2)
+
+- **Accurate frame** (checkbox): while paused or scrubbing, `core/frame_render.py` builds the export graph for a one-frame window (`trim_range=(t, t+1/fps)`, `video_only=True`) at preview size and pipes one PNG back; it runs on a worker thread, debounced by 150 ms, and a generation counter drops results superseded by a newer request.
+- **Next-clip preloading**: within 1.5 s of a cut to a different file, a second `QMediaPlayer` opens the next file; at the cut the two players (and their video widgets) swap instead of calling `setSource`.
+- **Proxies**: when an asset has a proxy (`MediaAsset.proxy_path`, see `core/proxy.py`), the preview plays it; export never does.
