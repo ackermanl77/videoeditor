@@ -519,13 +519,13 @@ class MultiClipEditTests(unittest.TestCase):  # F6, F7
         self.assertEqual(c.timeline_start, 0.0)
 
     def test_paste_attributes(self):
-        self.a.brightness = 0.3
         self.a.effects = [EffectInstance.create("blur")]
+        self.a.brightness = 0.3  # a colour-correction effect in the same stack
         payload = copy_clips(self.project, [self.a.id])
         self.history.execute(build_paste_attributes_command(self.project, payload, [self.b.id]))
         self.assertEqual(self.b.brightness, 0.3)
-        self.assertEqual(self.b.effects[0].kind, "blur")
-        self.assertNotEqual(self.b.effects[0].id, self.a.effects[0].id)
+        self.assertEqual([e.kind for e in self.b.effects], ["color_correction", "blur"])  # legacy order: eq first
+        self.assertNotEqual(self.b.effects[1].id, self.a.effects[1].id)
 
     def test_insert_ripples_every_unlocked_track(self):
         music = _audio(2.0)

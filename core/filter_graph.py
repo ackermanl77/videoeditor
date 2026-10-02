@@ -21,12 +21,15 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass, field
+import re
 from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, ReframeMode, TransitionType
-from core.effects import effect_filters
+from core.effects import ANALYSIS_FILE_PARAM, effect_filters
 from core.media_asset import MediaAsset
+from core.output_color import REFERENCE_WHITE_NITS, SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
+from core.stabilize import StabilizeJob, make_job
 from core.track import TrackType
 
 # Minimum overlap FFmpeg's xfade is allowed to use for a crossfade — below
@@ -137,8 +140,43 @@ _TONEMAP_CHAIN = (
 )
 
 
-def _source_color_filters(asset: Optional[MediaAsset]) -> str:
-    """Comma-prefixed filters converting a source to SDR BT.709 before it is scaled (or "")."""
+# Any source -> the HDR target (BT.2020, PQ or HLG, 10-bit): linearize with
+# the source's own description, then encode with the target transfer. SDR
+# white lands on the reference white (npl=203 cd/m2: 75 % HLG, ~58 % PQ).
+_TO_HDR_CHAIN = (
+    "zscale=tin={trc}:min={matrix}:pin={prim}:rin={rng}:t=linear:m={matrix}:p={prim}:npl={npl}"
+    ",format=gbrpf32le,zscale=p=bt2020:t={target}:m=bt2020nc:r=tv:npl={npl},format=yuv420p10le"
+)
+_SDR_MATRICES = ("bt709", "bt470bg", "smpte170m")
+
+
+@dataclass
+class _GraphContext:
+    """Export-wide settings the per-clip chain builders need."""
+
+    color: OutputColor = SDR_8BIT
+    # Motion analyses the stabilized clips need (see core/stabilize.py).
+    stabilize_jobs: List[StabilizeJob] = field(default_factory=list)
+    # Frame previews: leave stabilization out unless its analysis is already cached.
+    stabilize_cached_only: bool = False
+
+
+def _source_color_filters(asset: Optional[MediaAsset], color: OutputColor = SDR_8BIT) -> str:
+    """Comma-prefixed filters converting a source into the export's colour space before it is scaled (or "")."""
+    if color.is_hdr:
+        if asset is not None and asset.is_hdr and asset.color_transfer == color.transfer:
+            return ""  # passthrough: already in the target transfer
+        if asset is not None and asset.is_hdr:
+            trc, matrix, prim = asset.color_transfer, asset.color_space or "bt2020nc", asset.color_primaries or "bt2020"
+        else:
+            # SDR (or untagged) source: BT.709, or BT.601 when tagged as such.
+            matrix = asset.color_space if asset is not None and asset.color_space in _SDR_MATRICES else "bt709"
+            prim = asset.color_primaries if asset is not None and asset.color_primaries in _SDR_MATRICES else "bt709"
+            trc = "bt709"
+        rng = "pc" if asset is not None and asset.color_range == "pc" else "tv"
+        return "," + _TO_HDR_CHAIN.format(
+            trc=trc, matrix=matrix, prim=prim, rng=rng, npl=REFERENCE_WHITE_NITS, target=color.transfer
+        )
     if asset is None or not asset.is_hdr:
         return ""
     return "," + _TONEMAP_CHAIN.format(
@@ -149,14 +187,66 @@ def _source_color_filters(asset: Optional[MediaAsset]) -> str:
     )
 
 
-def _scale_matrix(asset: Optional[MediaAsset]) -> str:
+def _scale_matrix(asset: Optional[MediaAsset], color: OutputColor = SDR_8BIT) -> str:
     """Extra ``scale`` options converting an SD (BT.601) source's YUV matrix to BT.709 (or "")."""
-    if asset is not None and asset.is_bt601 and not asset.is_hdr:
+    if asset is not None and asset.is_bt601 and not asset.is_hdr and not color.is_hdr:
         return ":in_color_matrix=bt601:out_color_matrix=bt709"
     return ""
 
 
-def _fit_or_fill(clip: Clip, width: int, height: int, pad: bool, asset: Optional[MediaAsset] = None) -> str:
+def _with_bit_depth(filter_complex: str, color: OutputColor) -> str:
+    """The graph with its 8-bit working formats swapped for 10-bit ones.
+
+    Every chain is written with ``yuva420p``/``yuv420p`` (the default 8-bit
+    graph); a 10-bit export uses the same graph with ``yuva420p10le``/
+    ``yuv420p10le`` and 10-bit overlays, so no step quietly truncates to
+    8 bits. Done in one place so no builder can be missed.
+    """
+    if not color.is_10bit:
+        return filter_complex
+    out = re.sub(r"format=yuva420p(?![0-9])", "format=yuva420p10le", filter_complex)
+    out = re.sub(r"format=yuv420p(?![0-9])", "format=yuv420p10le", out)
+    return out.replace("overlay=x=", "overlay=format=yuv420p10:x=")
+
+
+def _needs_full_decode(clip: Clip) -> bool:
+    """Whether a clip must be decoded from its own start even inside a trimmed export window.
+
+    Stabilization replays a motion analysis frame by frame from the clip's
+    first frame, so a stabilized clip can't be seeked into.
+    """
+    return clip.has_stabilization
+
+
+def _stabilize_filters(clip: Clip, start: float, length: float, ctx: _GraphContext) -> str:
+    """Comma-prefixed ``vidstabtransform`` for a stream of ``length`` source seconds read from ``start``.
+
+    Records the matching analysis job (core/stabilize.py). With
+    ``ctx.stabilize_cached_only`` (frame previews) an effect whose analysis
+    isn't cached yet is left out instead.
+    """
+    out = ""
+    for effect in clip.effects:
+        if effect.kind != "stabilize" or not effect.is_renderable():
+            continue
+        params = effect.resolved_params()
+        job = make_job(clip.source_path, start, length, params["shakiness"], params["accuracy"])
+        if ctx.stabilize_cached_only and not job.is_done:
+            continue
+        ctx.stabilize_jobs.append(job)
+        out += "," + effect.filter(extra={ANALYSIS_FILE_PARAM: job.result_path})
+    return out
+
+
+def _fit_or_fill(
+    clip: Clip,
+    width: int,
+    height: int,
+    pad: bool,
+    asset: Optional[MediaAsset] = None,
+    color: OutputColor = SDR_8BIT,
+    t_offset: float = 0.0,
+) -> str:
     """Comma-prefixed scaling of a clip onto the canvas, ending in ``yuva420p``.
 
     Shared by the normal and the speed-ramp chain (they used to carry two
@@ -165,8 +255,8 @@ def _fit_or_fill(clip: Clip, width: int, height: int, pad: bool, asset: Optional
     "pre" effects (no alpha-capable pixel format, see core/effects.py) run
     here, before the frame gains its alpha channel.
     """
-    matrix = _scale_matrix(asset)
-    pre = effect_filters(clip.effects, "pre")
+    matrix = _scale_matrix(asset, color)
+    pre = effect_filters(clip.effects, "pre", t_offset)
     if clip.reframe_mode == ReframeMode.FILL:
         return (
             f",scale={width}:{height}:force_original_aspect_ratio=increase{matrix}{pre},format=yuva420p"
@@ -179,18 +269,13 @@ def _fit_or_fill(clip: Clip, width: int, height: int, pad: bool, asset: Optional
     return out
 
 
-def _color_filters(clip: Clip) -> str:
-    """Comma-prefixed per-pixel colour work: RGB chroma key, eq colour correction, "post" effects."""
-    out = ""
-    if clip.has_chroma_key:
-        key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
-        out += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
-    if clip.has_color_correction:
-        out += (
-            f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
-            f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
-        )
-    return out + effect_filters(clip.effects, "post")
+def _color_filters(clip: Clip, t_offset: float = 0.0) -> str:
+    """Comma-prefixed per-pixel colour work: the clip's "post" effects (keys, colour correction, looks).
+
+    Runs on a stream whose clock is clip-local time (minus ``t_offset`` for
+    a speed ramp's later segments), so animated parameters follow the clip.
+    """
+    return effect_filters(clip.effects, "post", t_offset)
 
 
 def _afade(kind: str, start: float, duration: float, curve: str = "") -> str:
@@ -363,6 +448,9 @@ class GraphResult:
     # Non-fatal problems found while planning (e.g. a source that could not
     # be probed, so its audio was left out). Reported with the export result.
     warnings: List[str] = field(default_factory=list)
+    # Motion analyses the export must run before rendering (stabilized clips,
+    # see core/stabilize.py); their result files are referenced by the graph.
+    stabilize_jobs: List[StabilizeJob] = field(default_factory=list)
 
     def cleanup(self) -> None:
         """Delete every temp file this graph created. Safe to call repeatedly."""
@@ -522,6 +610,7 @@ def _build_video_clip_chain(
     head: float = 0.0,
     source_length: Optional[float] = None,
     asset: Optional[MediaAsset] = None,
+    ctx: Optional[_GraphContext] = None,
 ) -> str:
     """Build a clip's local-time (pre-placement) video filter chain, ending unbracketed.
 
@@ -545,11 +634,16 @@ def _build_video_clip_chain(
     than the canvas, which ``xfade`` can't reconcile between two different
     clips. Transform is a documented no-op on a clip while it's crossfading.
     """
+    ctx = ctx or _GraphContext()
     length = clip.source_length if source_length is None else source_length
     if clip.media_type == MediaType.IMAGE:
         chain = f"[{idx}:v]setpts=PTS-STARTPTS"
     else:
         chain = f"[{idx}:v]trim=duration={length:.3f},setpts=PTS-STARTPTS"
+        # Stabilization runs on the source frames as decoded (stabilized
+        # clips are never seeked into, see _needs_full_decode).
+        if head <= 0:
+            chain += _stabilize_filters(clip, clip.source_in, length, ctx)
 
     speed = clip.speed if clip.speed > 0 else 1.0
     if abs(speed - 1.0) > 1e-6:
@@ -562,8 +656,8 @@ def _build_video_clip_chain(
     # docs/workflows/shorts-export/workflow.md; FIT is padded to the full
     # canvas only when not Transform-positioned), ending in yuva420p so alpha
     # exists for every later step (keying, fades, rotate).
-    chain += _source_color_filters(asset)
-    chain += _fit_or_fill(clip, width, height, pad=not apply_transform, asset=asset)
+    chain += _source_color_filters(asset, ctx.color)
+    chain += _fit_or_fill(clip, width, height, pad=not apply_transform, asset=asset, color=ctx.color)
     chain += _color_filters(clip)
 
     if apply_transform and clip.reframe_mode != ReframeMode.FILL:
@@ -637,6 +731,7 @@ def _build_speed_ramp_video_chain(
     filter_lines: List[str],
     input_specs: List[InputSpec],
     asset: Optional[MediaAsset] = None,
+    ctx: Optional[_GraphContext] = None,
 ) -> Tuple[str, List[Tuple[int, float, float, float]]]:
     """Build a speed-ramped clip's video chain: N segments, each its own
     ``-i``/trim/setpts at that segment's speed, concatenated together.
@@ -657,15 +752,19 @@ def _build_speed_ramp_video_chain(
     can't guarantee stays consistent (this mirrors the same trade-off
     already made for a crossfading clip, and for the same reason).
     """
+    ctx = ctx or _GraphContext()
     seg_labels: List[str] = []
     segment_specs = _register_speed_ramp_inputs(clip, input_specs)
+    t_offset = 0.0  # clip-local time of this segment's first frame (animated effects)
     for i, (idx, seg_in, seg_out, seg_speed) in enumerate(segment_specs):
         seg_chain = f"[{idx}:v]trim=duration={(seg_out - seg_in):.3f},setpts=PTS-STARTPTS"
+        seg_chain += _stabilize_filters(clip, seg_in, seg_out - seg_in, ctx)
         if abs(seg_speed - 1.0) > 1e-6:
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
-        seg_chain += _source_color_filters(asset)
-        seg_chain += _fit_or_fill(clip, width, height, pad=True, asset=asset)
-        seg_chain += _color_filters(clip)
+        seg_chain += _source_color_filters(asset, ctx.color)
+        seg_chain += _fit_or_fill(clip, width, height, pad=True, asset=asset, color=ctx.color, t_offset=t_offset)
+        seg_chain += _color_filters(clip, t_offset)
+        t_offset += (seg_out - seg_in) / seg_speed
 
         label = f"sr{clip_counter}v{i}"
         filter_lines.append(f"{seg_chain}[{label}]")
@@ -879,8 +978,16 @@ def build_filter_graph(
     trim_range: Optional[Tuple[float, Optional[float]]] = None,
     audio_only: bool = False,
     video_only: bool = False,
+    output_color: OutputColor = SDR_8BIT,
+    stabilize_cached_only: bool = False,
 ) -> GraphResult:
     """Construct the full FFmpeg input list + filter graph for ``project``.
+
+    ``output_color`` picks the working format and colour space: 8-bit SDR
+    BT.709 (default), 10-bit SDR, or 10-bit HDR PQ/HLG passthrough (see
+    core/output_color.py). ``stabilize_cached_only`` leaves out stabilization
+    whose motion analysis isn't cached yet (frame previews); an export
+    instead runs ``GraphResult.stabilize_jobs`` first.
 
     ``audio_only`` builds the same audio mix with no picture layers or text
     (the video output is just the black base) -- used for the loudness
@@ -933,8 +1040,12 @@ def build_filter_graph(
     # Base canvas: solid black, as long as the rendered output. Every layer
     # is composited onto it with eof_action=pass, so it also bounds the
     # video's length (a clip running past a trim window's end is cut here).
+    # Tagged with the target colour space: drawtext converts text colours
+    # with the frame's own matrix (untagged it assumed BT.601, so text in a
+    # BT.709 export came out slightly off-colour).
+    ctx = _GraphContext(color=output_color, stabilize_cached_only=stabilize_cached_only)
     filter_lines.append(
-        f"color=c=black:s={width}x{height}:d={out_duration:.3f}:rate={fps_expr(fps)}[base]"
+        f"color=c=black:s={width}x{height}:d={out_duration:.3f}:rate={fps_expr(fps)},{output_color.setparams()}[base]"
     )
 
     video_tracks = [t for t in project.tracks if t.track_type == TrackType.VIDEO]
@@ -984,7 +1095,7 @@ def build_filter_graph(
                 if render_video:
                     body_label, segment_specs = _build_speed_ramp_video_chain(
                         clip, width, height, clip_counter, filter_lines, input_specs,
-                        asset=project.asset_for_clip(clip),
+                        asset=project.asset_for_clip(clip), ctx=ctx,
                     )
                     suffix = _video_fade_and_opacity_suffix(clip).lstrip(",")
                     placement = _video_placement(clip.timeline_start, head, window, seeked=False)
@@ -1010,13 +1121,20 @@ def build_filter_graph(
                 clip_counter += 1
             elif partner_i is None:
                 source: Optional[_InputSlice] = None
+                # A stabilized clip is read from its own start and trimmed to
+                # the window afterwards; every other clip is seeked to it.
+                full = _needs_full_decode(clip)
+                input_window = None if full else window
                 if render_video:
-                    source = _register_video_input(clip, fps, input_specs, window)
+                    source = _register_video_input(clip, fps, input_specs, input_window)
                     chain = _build_video_clip_chain(
                         source.index, clip, width, height, head=source.head, source_length=source.source_length,
-                        asset=project.asset_for_clip(clip),
+                        asset=project.asset_for_clip(clip), ctx=ctx,
                     )
-                    placement = _video_placement(clip.timeline_start, source.head, window, seeked=True)
+                    placement = _video_placement(
+                        clip.timeline_start, window.head(clip.timeline_start) if full else source.head, window,
+                        seeked=not full,
+                    )
                     if placement:
                         chain += f",{placement}"
                     label = f"v{clip_counter}"
@@ -1026,11 +1144,12 @@ def build_filter_graph(
                     )
                 if render_audio and _clip_is_audible(project, clip, probe_cache):
                     if source is None:
-                        source = _register_video_input(clip, fps, input_specs, window)
+                        source = _register_video_input(clip, fps, input_specs, input_window)
                     _before = len(audio_labels)
                     _maybe_add_audio(
                         project, clip, source.index, filter_lines, audio_labels, clip_counter, probe_cache,
-                        window=window, head=source.head, source_length=source.source_length, seeked=True,
+                        window=window, head=window.head(clip.timeline_start) if full else source.head,
+                        source_length=None if full else source.source_length, seeked=not full,
                         sample_rate=sample_rate,
                     )
                     audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
@@ -1067,7 +1186,7 @@ def build_filter_graph(
                     chain_a = (
                         _build_video_clip_chain(
                             idx_a, clip, width, height, skip_fade_out=True, apply_transform=False,
-                            asset=project.asset_for_clip(clip),
+                            asset=project.asset_for_clip(clip), ctx=ctx,
                         )
                         + f",fps={fps_expr(fps)}"
                     )
@@ -1075,7 +1194,7 @@ def build_filter_graph(
                     chain_b = (
                         _build_video_clip_chain(
                             idx_b, partner, width, height, skip_fade_in=True, apply_transform=False,
-                            asset=project.asset_for_clip(partner),
+                            asset=project.asset_for_clip(partner), ctx=ctx,
                         )
                         + f",fps={fps_expr(fps)}"
                     )
@@ -1152,7 +1271,7 @@ def build_filter_graph(
         text_path = _write_text_file(style.content)
         temp_files.append(text_path)
         filter_lines.append(
-            f"[{current}]{_drawtext_filter(style, text_path, clip, window, height)}[{out_label}]"
+            f"[{current}]{_drawtext_filter(style, text_path, clip, window, height, output_color)}[{out_label}]"
         )
         current = out_label
 
@@ -1240,7 +1359,7 @@ def build_filter_graph(
         audio_out_label = "aout"
         has_audio = True  # we always emit a (possibly silent) audio track
 
-    filter_complex = ";".join(filter_lines)
+    filter_complex = _with_bit_depth(";".join(filter_lines), output_color)
 
     return GraphResult(
         input_specs=input_specs,
@@ -1251,6 +1370,7 @@ def build_filter_graph(
         temp_files=temp_files,
         has_audible_clips=has_audible_clips,
         warnings=list(probe_cache.warnings),
+        stabilize_jobs=list(ctx.stabilize_jobs),
     )
 
 
@@ -1267,7 +1387,9 @@ def _scaled_text_px(value: float, height: int, minimum: int = 0) -> int:
     return max(minimum, int(round(value * height / REFERENCE_TEXT_HEIGHT)))
 
 
-def _drawtext_filter(style, text_path: str, clip: Clip, window: _Window, height: int) -> str:
+def _drawtext_filter(
+    style, text_path: str, clip: Clip, window: _Window, height: int, color: OutputColor = SDR_8BIT
+) -> str:
     """One text overlay's ``drawtext`` filter (unbracketed), enabled over the clip's span of output time.
 
     The box position (``position_x``/``position_y``) keeps its long-standing
@@ -1285,16 +1407,16 @@ def _drawtext_filter(style, text_path: str, clip: Clip, window: _Window, height:
     font_file = resolve_font_file(style.font_family, style.bold, style.italic)
     if font_file:
         parts.append(f":fontfile={_escape_filter_value(font_file.replace(os.sep, '/'))}")
-    parts.append(f":fontcolor={style.color}:fontsize={_scaled_text_px(style.font_size, height, 1)}")
-    parts.append(f":bordercolor={style.outline_color}:borderw={_scaled_text_px(style.outline_width, height)}")
+    parts.append(f":fontcolor={color.text_color(style.color)}:fontsize={_scaled_text_px(style.font_size, height, 1)}")
+    parts.append(f":bordercolor={color.text_color(style.outline_color)}:borderw={_scaled_text_px(style.outline_width, height)}")
     parts.append(f":text_align={_TEXT_ALIGN_FLAGS.get(style.alignment, 'C')}")
     if style.shadow_enabled:
         offset = _scaled_text_px(style.shadow_offset, height)
-        parts.append(f":shadowcolor={style.shadow_color}:shadowx={offset}:shadowy={offset}")
+        parts.append(f":shadowcolor={color.text_color(style.shadow_color)}:shadowx={offset}:shadowy={offset}")
     if style.box_enabled:
         opacity = max(0.0, min(1.0, style.box_opacity))
         parts.append(
-            f":box=1:boxcolor={style.box_color}@{opacity:.2f}:boxborderw={_scaled_text_px(style.box_padding, height)}"
+            f":box=1:boxcolor={color.text_color(style.box_color)}@{opacity:.2f}:boxborderw={_scaled_text_px(style.box_padding, height)}"
         )
     parts.append(f":x={x_expr}:y={y_expr}")
     parts.append(f":enable='between(t,{start:.3f},{end:.3f})'")

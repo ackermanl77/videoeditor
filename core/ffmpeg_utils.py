@@ -145,6 +145,41 @@ def nvenc_encoder_available(encoder: str) -> bool:
         return False
 
 
+#: Test-encode pixel format/profile per encoder for :func:`encoder_supports_10bit`.
+_TEN_BIT_PROBE_ARGS = {
+    "hevc_nvenc": ["-pix_fmt", "p010le", "-profile:v", "main10"],
+    "av1_nvenc": ["-pix_fmt", "p010le"],
+    "h264_nvenc": ["-pix_fmt", "p010le", "-profile:v", "high10"],
+    "libx265": ["-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-x265-params", "log-level=error"],
+    "libaom-av1": ["-pix_fmt", "yuv420p10le", "-cpu-used", "8"],
+    "prores_ks": ["-pix_fmt", "yuv422p10le"],
+    "dnxhd": ["-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le"],
+}
+
+
+@lru_cache(maxsize=None)
+def encoder_supports_10bit(encoder: str) -> bool:
+    """Whether ``encoder`` really encodes 10-bit video on this machine (a tiny real test encode).
+
+    NVENC 10-bit needs a Pascal-or-newer GPU for HEVC (and Ada for AV1); a
+    system FFmpeg may lack 10-bit x265. The Export dialog only offers 10-bit
+    and HDR for codecs that pass. Cached; never raises.
+    """
+    extra = _TEN_BIT_PROBE_ARGS.get(encoder)
+    if extra is None:
+        return False
+    try:
+        ffmpeg = find_binary("ffmpeg")
+        result = run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=256x144:d=0.1",
+             "-c:v", encoder, *extra, "-f", "null", "-"],
+            timeout=60,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=None)
 def binary_version(tool: str) -> str:
     """First line of ``<tool> -version`` (e.g. ``ffmpeg version 9.0.1-essentials_build...``), or ``""``."""

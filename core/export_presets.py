@@ -115,3 +115,22 @@ def source_defaults(project: Project) -> Optional[Tuple[int, int, Optional[str]]
     if asset is None:
         return None
     return asset.width, asset.height, nearest_fps_choice(asset.fps)
+
+
+def hdr_passthrough_choice(project: Project) -> Optional[str]:
+    """The HDR passthrough ("pq"/"hlg") to offer: the transfer all HDR video sources share, else None.
+
+    Decides whether the Export dialog offers an HDR passthrough (see
+    core.output_color.passthrough_choice); hidden tracks count too, since
+    they can be unhidden before exporting.
+    """
+    from core.output_color import passthrough_choice
+
+    transfers = []
+    for track in project.tracks:
+        for clip in track.clips:
+            if clip.media_type == MediaType.VIDEO:
+                asset = project.asset_for_clip(clip)
+                if asset is not None:
+                    transfers.append(asset.color_transfer)
+    return passthrough_choice(transfers)

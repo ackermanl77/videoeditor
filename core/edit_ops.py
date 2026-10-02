@@ -196,10 +196,9 @@ def build_duplicate_command(project: Project, clip_ids: Iterable[str]) -> Option
     return build_paste_command(project, payload, end)
 
 
-#: Fields "Paste Attributes" copies: effects, colour, keying, transform, audio.
+#: Fields "Paste Attributes" copies: effects (colour correction and keys included), transform, audio.
 VISUAL_ATTRIBUTES = (
-    "opacity", "brightness", "contrast", "saturation", "gamma",
-    "chroma_key_enabled", "chroma_key_color", "chroma_key_similarity", "chroma_key_blend",
+    "opacity",
     "transform_x", "transform_y", "transform_scale", "transform_rotation",
     "reframe_mode", "crop_focus_x", "crop_focus_y", "effects",
 )
@@ -377,6 +376,41 @@ def build_roll_command(project: Project, clip_id: str, new_edit_time: float) -> 
     if left is None or right is None:
         return None
     return CompositeCommand([left, right], "Roll Edit")
+
+
+def build_roll_at_edge(project: Project, clip_id: str, edge: str, new_edit_time: float) -> Optional[Command]:
+    """Roll the edit point at ``clip_id``'s ``edge`` ("left" or "right") to ``new_edit_time``.
+
+    The right edge rolls with the clip touching it on the right; the left
+    edge with the clip touching it on the left. None when there is no
+    touching neighbour on that side or not enough media.
+    """
+    if edge == "right":
+        return build_roll_command(project, clip_id, new_edit_time)
+    _track, prev, clip, _nxt = _neighbours(project, clip_id)
+    if clip is None or prev is None:
+        return None
+    return build_roll_command(project, prev.id, new_edit_time)
+
+
+def build_ripple_move_command(project: Project, clip_id: str, delta: float) -> Optional[Command]:
+    """Move a clip and everything after it on its track by ``delta`` seconds, as one undo step.
+
+    Clips linked to any of them (detached audio) move too, so pictures and
+    their sound stay in sync. Refused (None) when the move would overlap a
+    clip that stays put, start before 0, or touch a locked track.
+    """
+    clip = project.find_clip(clip_id)
+    track = project.find_clip_track(clip_id)
+    if clip is None or track is None or track.locked:
+        return None
+    ids = [c.id for c in track.clips if c.timeline_start >= clip.timeline_start - _EPS]
+    for cid in list(ids):
+        ids += [linked for linked in linked_clip_ids(project, cid) if linked not in ids]
+    command = build_move_clips_command(project, ids, delta)
+    if command is not None:
+        command.label = "Ripple Move"
+    return command
 
 
 class SlipClipCommand(Command):

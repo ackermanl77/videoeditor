@@ -58,16 +58,18 @@ def marker_points(project: Project) -> List[float]:
 
 
 def clip_keyframe_points(clip: Clip) -> List[float]:
-    """Timeline times of every keyframe on ``clip`` (opacity, position, volume and speed).
+    """Timeline times of every keyframe on ``clip`` (opacity, position, volume, effect parameters, speed).
 
-    Opacity/position/volume keyframes are clip-local timeline seconds; speed
-    keyframes are source seconds and are mapped through the clip's speed
-    segments. Only animated properties (2+ keyframes) count.
+    Opacity/position/volume and effect-parameter keyframes are clip-local
+    timeline seconds; speed keyframes are source seconds and are mapped
+    through the clip's speed segments. Only animated properties (2+
+    keyframes) count.
     """
     times = set()
     for keyframes in (clip.opacity_keyframes, clip.position_keyframes, clip.volume_keyframes):
         if len(keyframes) >= 2:
             times.update(clip.timeline_start + k[0] for k in keyframes)
+    times.update(clip.timeline_start + t for t in clip.effect_keyframe_times())
     if len(clip.speed_keyframes) >= 2:
         times.update(clip.timeline_start + clip.timeline_offset_at(k[0]) for k in clip.speed_keyframes)
     return sorted(round(t, 6) for t in times if clip.timeline_start - _EPS <= t <= clip.timeline_end + _EPS)

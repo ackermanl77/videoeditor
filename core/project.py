@@ -18,12 +18,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core import __version__
 from core.clip import Clip
+from core.effects import LEGACY_FIELDS, legacy_effect_dicts, legacy_insert_index
 from core.media_asset import MediaAsset
 from core.track import Track, TrackType
 
 #: Version 2 added clip -> asset ids, relative media paths, ``app_version``,
-#: volume keyframes and the effect stack. Version 1 files are migrated on load.
-PROJECT_FILE_VERSION = 2
+#: volume keyframes and the effect stack. Version 3 moved the old colour
+#: correction / RGB chroma key clip fields into the effect stack and added
+#: effect-parameter keyframes. Older files are migrated on load.
+PROJECT_FILE_VERSION = 3
 
 
 class ProjectVersionError(ValueError):
@@ -49,8 +52,29 @@ def _migrate_1_to_2(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_2_to_3(data: Dict[str, Any]) -> Dict[str, Any]:
+    """v2 clips kept colour correction and the RGB chroma key in fixed fields: make them effects.
+
+    They go to the front of the clip's stack in the order the old graph
+    applied them (colorkey, then eq, then the stack), so the render is unchanged.
+    """
+    for track in data.get("tracks", []):
+        for clip in track.get("clips", []):
+            if not isinstance(clip, dict):
+                continue
+            legacy = {name: clip.pop(name) for name in list(LEGACY_FIELDS) if name in clip}
+            if not legacy:
+                continue
+            effects = [e for e in clip.get("effects") or [] if isinstance(e, dict)]
+            for effect in legacy_effect_dicts(legacy):
+                effects.insert(legacy_insert_index([e.get("kind") for e in effects], effect["kind"]), effect)
+            clip["effects"] = effects
+    data["file_version"] = 3
+    return data
+
+
 #: ``{from_version: migrate(data) -> data}``, applied in order on load.
-MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {1: _migrate_1_to_2}
+MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {1: _migrate_1_to_2, 2: _migrate_2_to_3}
 
 
 def migrate_project_data(data: Dict[str, Any]) -> Dict[str, Any]:

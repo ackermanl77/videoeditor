@@ -46,7 +46,9 @@ def build_frame_args(project: Project, t: float, width: int, height: int) -> Tup
     total = project.total_duration
     t = max(0.0, min(t, max(0.0, total - frame)))
     settings = ProjectSettings(width=width, height=height, fps=fps, sample_rate=project.settings.sample_rate)
-    graph = build_filter_graph(project, settings, trim_range=(t, t + frame), video_only=True)
+    # Stabilization shows only once an export has cached its motion analysis.
+    graph = build_filter_graph(project, settings, trim_range=(t, t + frame), video_only=True,
+                               stabilize_cached_only=True)
     args = [find_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin"]
     for spec in graph.input_specs:
         args += spec.pre_args + ["-i", spec.path]

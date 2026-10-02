@@ -8,11 +8,19 @@ A :class:`Clip` represents one piece of media (or generated text) placed on a
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.effects import EffectInstance
+from core.effects import (
+    LEGACY_FIELDS,
+    LEGACY_KINDS,
+    EffectInstance,
+    keyframe_times,
+    legacy_default,
+    legacy_effect_dicts,
+    legacy_insert_index,
+)
 
 
 class MediaType(str, Enum):
@@ -201,19 +209,6 @@ class Clip:
     # Independent of fade_out (which remains a simple fade to transparent).
     transition_duration: float = 0.5
 
-    # Color correction (video/image clips only). Neutral values match
-    # FFmpeg's ``eq`` filter defaults, so an unedited clip never emits it.
-    brightness: float = 0.0  # -1.0 .. 1.0
-    contrast: float = 1.0  # 0.0 .. 2.0
-    saturation: float = 1.0  # 0.0 .. 3.0
-    gamma: float = 1.0  # 0.1 .. 3.0
-
-    # Chroma key (video/image clips only), via FFmpeg's ``colorkey`` filter.
-    chroma_key_enabled: bool = False
-    chroma_key_color: str = "#00FF00"
-    chroma_key_similarity: float = 0.2  # 0.0 .. 1.0
-    chroma_key_blend: float = 0.1  # 0.0 .. 1.0
-
     # Transform (video/image clips only). The clip is first scaled to fit
     # the canvas preserving aspect ratio (as always), then this additional
     # scale/rotation is applied, and the result is positioned by its center
@@ -278,15 +273,44 @@ class Clip:
     # like opacity_keyframes override ``opacity``.
     volume_keyframes: List[Tuple[float, float]] = field(default_factory=list)
 
-    # Generic effect stack (LUT, YUV chroma key, sharpen, blur, vignette,
-    # video denoise), applied in list order -- see core/effects.py.
+    # Generic effect stack (colour correction, keys, LUT, sharpen, blur,
+    # vignette, denoise, stabilization), applied in list order -- see
+    # core/effects.py. Effect parameters can carry their own keyframes.
     effects: List[EffectInstance] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
+    # Pre-format-3 colour correction / RGB chroma key fields. They are no
+    # longer stored on the clip: given to the constructor they become
+    # ``color_correction``/``colorkey`` effects, and reading or assigning
+    # ``clip.brightness`` (etc.) reads or edits the first such effect -- see
+    # the properties installed after the class. None = not given.
+    brightness: InitVar[Optional[float]] = None
+    contrast: InitVar[Optional[float]] = None
+    saturation: InitVar[Optional[float]] = None
+    gamma: InitVar[Optional[float]] = None
+    chroma_key_enabled: InitVar[Optional[bool]] = None
+    chroma_key_color: InitVar[Optional[str]] = None
+    chroma_key_similarity: InitVar[Optional[float]] = None
+    chroma_key_blend: InitVar[Optional[float]] = None
+
+    def __post_init__(self, brightness, contrast, saturation, gamma, chroma_key_enabled, chroma_key_color,
+                      chroma_key_similarity, chroma_key_blend) -> None:
         if not self.name:
             self.name = self._default_name()
         if self.media_type == MediaType.TEXT and self.text_style is None:
             self.text_style = TextStyle()
+        given = {
+            "brightness": brightness, "contrast": contrast, "saturation": saturation, "gamma": gamma,
+            "chroma_key_enabled": chroma_key_enabled, "chroma_key_color": chroma_key_color,
+            "chroma_key_similarity": chroma_key_similarity, "chroma_key_blend": chroma_key_blend,
+        }
+        legacy = {name: value for name, value in given.items() if value is not None}
+        for data in legacy_effect_dicts(legacy) if legacy else []:
+            effect = EffectInstance.from_dict(data)
+            self.effects.insert(legacy_insert_index([e.kind for e in self.effects], effect.kind), effect)
+
+    def legacy_effect(self, kind: str) -> Optional[EffectInstance]:
+        """The first ``kind`` effect in the stack (what the Color Correction / Chroma Key groups edit)."""
+        return next((e for e in self.effects if e.kind == kind), None)
 
     def _default_name(self) -> str:
         if self.source_path:
@@ -419,6 +443,10 @@ class Clip:
             probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift)
             probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift)
             probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift)
+            probe.effects = [
+                e.with_keyframes_mapped(lambda keys: _rebase_keyframes(keys, timeline_shift)) if e.keyframes else e
+                for e in self.effects
+            ]
         return probe
 
     @property
@@ -433,12 +461,12 @@ class Clip:
     # never drift apart on what counts as "non-default."
     @property
     def has_color_correction(self) -> bool:
-        """Whether brightness/contrast/saturation/gamma differ from ``eq``'s neutral defaults."""
-        return (self.brightness, self.contrast, self.saturation, self.gamma) != (0.0, 1.0, 1.0, 1.0)
+        """Whether a colour-correction effect changes the picture (non-neutral or animated)."""
+        return any(e.kind == "color_correction" and e.is_renderable() for e in self.effects)
 
     @property
     def has_chroma_key(self) -> bool:
-        return self.chroma_key_enabled
+        return any(e.kind == "colorkey" and e.is_renderable() for e in self.effects)
 
     @property
     def has_denoise(self) -> bool:
@@ -450,7 +478,16 @@ class Clip:
 
     @property
     def has_effects(self) -> bool:
-        return any(e.is_renderable() for e in self.effects)
+        """Any renderable effect besides colour correction / RGB key (which have their own badges)."""
+        return any(e.is_renderable() and e.kind not in LEGACY_KINDS for e in self.effects)
+
+    @property
+    def has_stabilization(self) -> bool:
+        return any(e.kind == "stabilize" and e.is_renderable() for e in self.effects)
+
+    def effect_keyframe_times(self) -> List[float]:
+        """Clip-local times of every animated effect parameter's keyframes."""
+        return keyframe_times(self.effects)
 
     @property
     def has_volume_automation(self) -> bool:
@@ -488,14 +525,6 @@ class Clip:
             "fade_out": self.fade_out,
             "transition_out": self.transition_out.value,
             "transition_duration": self.transition_duration,
-            "brightness": self.brightness,
-            "contrast": self.contrast,
-            "saturation": self.saturation,
-            "gamma": self.gamma,
-            "chroma_key_enabled": self.chroma_key_enabled,
-            "chroma_key_color": self.chroma_key_color,
-            "chroma_key_similarity": self.chroma_key_similarity,
-            "chroma_key_blend": self.chroma_key_blend,
             "transform_x": self.transform_x,
             "transform_y": self.transform_y,
             "transform_scale": self.transform_scale,
@@ -555,14 +584,6 @@ class Clip:
             fade_out=data.get("fade_out", 0.0),
             transition_out=enum(TransitionType, "transition_out", TransitionType.NONE),
             transition_duration=data.get("transition_duration", 0.5),
-            brightness=data.get("brightness", 0.0),
-            contrast=data.get("contrast", 1.0),
-            saturation=data.get("saturation", 1.0),
-            gamma=data.get("gamma", 1.0),
-            chroma_key_enabled=data.get("chroma_key_enabled", False),
-            chroma_key_color=data.get("chroma_key_color", "#00FF00"),
-            chroma_key_similarity=data.get("chroma_key_similarity", 0.2),
-            chroma_key_blend=data.get("chroma_key_blend", 0.1),
             transform_x=data.get("transform_x", 0.5),
             transform_y=data.get("transform_y", 0.5),
             transform_scale=data.get("transform_scale", 1.0),
@@ -579,4 +600,41 @@ class Clip:
             link_group=data.get("link_group"),
             volume_keyframes=[tuple(kf) for kf in data.get("volume_keyframes", [])],
             effects=[EffectInstance.from_dict(e) for e in data.get("effects", []) if isinstance(e, dict)],
+            # Old-style colour/key keys (pre-format-3 data that skipped the
+            # project migration, e.g. a hand-made dict) still become effects.
+            **{name: data[name] for name in LEGACY_FIELDS if name in data},
         )
+
+
+def _legacy_property(name: str) -> property:
+    """``Clip.<old field>`` read/written through the first matching effect (see Clip.__post_init__)."""
+    kind, param = LEGACY_FIELDS[name]
+
+    def getter(self: Clip):
+        effect = self.legacy_effect(kind)
+        if effect is None:
+            return legacy_default(name)
+        if param is None:
+            return effect.enabled
+        return effect.resolved_params()[param]
+
+    def setter(self: Clip, value) -> None:
+        effect = self.legacy_effect(kind)
+        if effect is None:
+            if value == legacy_default(name):
+                return  # nothing to record: no effect already means "neutral" / "off"
+            effect = EffectInstance.create(kind)
+            # Picking a key colour before ticking "Enable" must not start keying.
+            effect.enabled = kind != "colorkey"
+            self.effects.insert(legacy_insert_index([e.kind for e in self.effects], kind), effect)
+        if param is None:
+            effect.enabled = bool(value)
+        else:
+            effect.params[param] = value
+
+    return property(getter, setter, doc=f"Compatibility view of the {kind} effect ({param or 'enabled'}).")
+
+
+for _name in LEGACY_FIELDS:
+    setattr(Clip, _name, _legacy_property(_name))
+del _name

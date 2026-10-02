@@ -38,6 +38,11 @@ class MediaAsset:
     color_primaries: str = ""
     color_space: str = ""
     color_range: str = ""
+    # HDR10 static metadata from the first frame (empty = none/unknown), in
+    # x265's units: "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)" and "maxcll,maxfall".
+    # Written into HDR passthrough exports (core/exporter.py).
+    mastering_display: str = ""
+    max_cll: str = ""
     # Low-resolution, short-GOP copy used by the preview only (export always
     # reads the original ``path``). None until one is generated.
     proxy_path: Optional[str] = None

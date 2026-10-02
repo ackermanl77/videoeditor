@@ -184,6 +184,11 @@ class SplitClipCommand(Command):
         tail_timeline = clip.duration - offset_in_timeline
         second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline)
         second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline)
+        second.volume_keyframes = _keyframes_after(clip.volume_keyframes, offset_in_timeline, tail_timeline)
+        second.effects = [
+            e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline))
+            for e in clip.effects
+        ]
         _apply_speed_keyframes(second, _speed_keyframes_after(clip.speed_keyframes, offset_in_source))
 
         first_speed_keyframes = _speed_keyframes_before(clip.speed_keyframes, offset_in_source)
@@ -191,6 +196,10 @@ class SplitClipCommand(Command):
         clip.fade_out = 0.0
         clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline)
         clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline)
+        clip.volume_keyframes = _keyframes_before(clip.volume_keyframes, offset_in_timeline)
+        clip.effects = [
+            e.with_keyframes_mapped(lambda keys: _keyframes_before(keys, offset_in_timeline)) for e in clip.effects
+        ]
         _apply_speed_keyframes(clip, first_speed_keyframes)
 
         track.clips.append(second)

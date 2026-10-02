@@ -14,11 +14,13 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
-from core.clip import ReframeMode
+from core.clip import MediaType, ReframeMode
 from core.effects import effect_files
-from core.ffmpeg_utils import find_binary, nvenc_available, nvenc_encoder_available, popen
+from core.ffmpeg_utils import encoder_supports_10bit, find_binary, nvenc_available, nvenc_encoder_available, popen
 from core.filter_graph import GraphResult, build_filter_graph, fps_expr
+from core.output_color import SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
+from core.stabilize import StabilizeJob, detect_args, partial_path, pending_jobs
 
 ProgressCallback = Callable[[float, str], None]
 """Called with (fraction_complete 0..1, status_message)."""
@@ -112,11 +114,17 @@ NVENC_TUNING = [
     "-rc-lookahead", "20", "-b_ref_mode", "middle",
 ]
 
-# Every non-GIF output is tagged as SDR BT.709 (HDR sources are tone-mapped
-# to it in the graph). Untagged files left players guessing BT.601 vs BT.709
-# from the frame size; an HDR source used to come out with a BT.2020 matrix
-# tag and no transfer at all.
-BT709_OUTPUT_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+# Every non-GIF output is tagged with its colour target: SDR BT.709 by
+# default (HDR sources are tone-mapped to it in the graph), or BT.2020 PQ/HLG
+# for an HDR passthrough export (core/output_color.py). Untagged files left
+# players guessing BT.601 vs BT.709 from the frame size; an HDR source used
+# to come out with a BT.2020 matrix tag and no transfer at all.
+BT709_OUTPUT_TAGS = SDR_8BIT.output_tag_args()
+
+# Codec choices that can be written with 10 bits per sample (10-bit SDR and
+# HDR exports). H.264 and VP9 stay 8-bit here.
+TEN_BIT_CODECS = ("hevc", "av1", "prores", "dnxhr")
+TEN_BIT_ENCODERS = ("libx265", "libaom-av1", "prores_ks", "dnxhd", "hevc_nvenc", "av1_nvenc")
 
 # Handled separately from CONTAINER_CODECS: GIF has no audio and uses its
 # own palette-based encode (see Exporter._export_gif), not a CRF video codec.
@@ -180,6 +188,10 @@ class ExportSettings:
     # Target-size export on the GPU: one NVENC pass with a VBR rate cap
     # (lands close to, not exactly on, the size) instead of x264 two-pass.
     gpu_target_size: bool = False
+    # Colour format (core.output_color.COLOR_MODE_LABELS key): "sdr8" (the
+    # default, 8-bit SDR BT.709), "sdr10" (10-bit SDR), or "pq"/"hlg" (10-bit
+    # HDR passthrough for HDR sources). 10-bit needs HEVC, AV1, ProRes or DNxHR.
+    color_mode: str = "sdr8"
 
 
 def resolve_codecs(ext: str, choice: str = "auto") -> Tuple[str, str]:
@@ -234,6 +246,10 @@ class Exporter:
         self._process: Optional[subprocess.Popen] = None
         # Non-fatal problems from the last export (see GraphResult.warnings).
         self.warnings: List[str] = []
+        # The export's colour target and the HDR sources' static metadata
+        # (set per export; defaults for callers building arguments directly).
+        self._color: OutputColor = SDR_8BIT
+        self._hdr_metadata: Tuple[str, str] = ("", "")
 
     def cancel(self) -> None:
         """Request cancellation. Safe to call from another thread.
@@ -258,6 +274,9 @@ class Exporter:
         failure or :class:`ExportCancelled` if :meth:`cancel` was called.
         """
         self._cancelled = False
+        ext = os.path.splitext(settings.output_path)[1].lower()
+        self._color = SDR_8BIT if ext == GIF_EXTENSION else OutputColor.from_mode(settings.color_mode)
+        self._hdr_metadata = self._source_hdr_metadata(self._color)
 
         project_settings = ProjectSettings(
             width=settings.width,
@@ -272,11 +291,13 @@ class Exporter:
         trim_range = (trim_start, trim_end) if is_trimmed else None
 
         graph = build_filter_graph(
-            self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range
+            self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range,
+            output_color=self._color,
         )
         self.warnings = list(graph.warnings)
         try:
             self._check_sources_exist(graph, self._effect_files())
+            self._run_stabilize_analyses(graph.stabilize_jobs, on_progress)
             if settings.loudness_target is not None and graph.has_audible_clips:
                 graph = self._with_loudness_normalization(
                     graph, project_settings, settings, trim_range, on_progress
@@ -301,6 +322,42 @@ class Exporter:
         if on_progress:
             on_progress(1.0, "Done")
         return final_path
+
+    def _source_hdr_metadata(self, color: OutputColor) -> Tuple[str, str]:
+        """``(master-display, max-cll)`` of the HDR sources in the target transfer (first found; "" if none)."""
+        if not color.is_hdr:
+            return "", ""
+        master, cll = "", ""
+        for track in self.project.tracks:
+            for clip in track.clips:
+                if clip.media_type != MediaType.VIDEO:
+                    continue
+                asset = self.project.asset_for_clip(clip)
+                if asset is None or asset.color_transfer != color.transfer:
+                    continue
+                master = master or asset.mastering_display
+                cll = cll or asset.max_cll
+        return master, cll
+
+    def _run_stabilize_analyses(self, jobs: List[StabilizeJob], on_progress: Optional[ProgressCallback]) -> None:
+        """Pass 1 of stabilization (``vidstabdetect``) for every clip whose analysis isn't cached yet.
+
+        Each result is written to a ``.partial`` file and renamed into the
+        cache only when complete, so a cancelled or failed analysis never
+        leaves a truncated result that a later export would trust.
+        """
+        todo = pending_jobs(jobs)
+        for number, job in enumerate(todo, 1):
+            tmp = partial_path(job)
+            label = f"Analyzing motion for stabilization ({number}/{len(todo)})"
+            try:
+                self._run_ffmpeg(detect_args(find_binary("ffmpeg"), job, tmp), job.length, on_progress,
+                                 progress_range=(0.0, 1.0), label=label)
+                if not os.path.isfile(tmp):
+                    raise ExportError("The stabilization analysis produced no result.")
+                os.replace(tmp, job.result_path)
+            finally:
+                self._remove_quietly(tmp)
 
     def _with_loudness_normalization(
         self,
@@ -444,7 +501,11 @@ class Exporter:
                 video_codec, audio_codec = resolve_codecs(ext, settings.video_codec)
             except ValueError as exc:
                 raise ExportError(str(exc))
-            graph = self._with_bt709_frames(graph)
+            if self._color.is_10bit and video_codec not in TEN_BIT_ENCODERS:
+                raise ExportError(
+                    "10-bit and HDR exports need HEVC, AV1, ProRes or DNxHR; choose one of them as the video codec."
+                )
+            graph = self._with_output_tags(graph, self._color)
             use_two_pass = bool(settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0)
             if use_two_pass and video_codec not in TWO_PASS_ENCODERS:
                 raise ExportError(
@@ -483,8 +544,8 @@ class Exporter:
         return output_path
 
     @staticmethod
-    def _with_bt709_frames(graph: GraphResult) -> GraphResult:
-        """Tag the final frames as SDR BT.709, limited range.
+    def _with_output_tags(graph: GraphResult, color: OutputColor = SDR_8BIT) -> GraphResult:
+        """Tag the final frames with the export's colour target (SDR BT.709 or BT.2020 PQ/HLG), limited range.
 
         Encoders in this FFmpeg take colour tags from the frames; the
         ``-colorspace``/``-color_trc`` output options alone left
@@ -494,8 +555,7 @@ class Exporter:
         return dataclasses.replace(
             graph,
             filter_complex=(
-                f"{graph.filter_complex};[{graph.video_out_label}]"
-                "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv[vtagged]"
+                f"{graph.filter_complex};[{graph.video_out_label}]{color.setparams()}[vtagged]"
             ),
             video_out_label="vtagged",
         )
@@ -574,7 +634,7 @@ class Exporter:
         return ["-f", "ffmetadata", "-i", chapters_path], chapters_index, chapters_path
 
     @staticmethod
-    def _resolve_video_codec(base_codec: str, prefer_gpu: bool) -> Tuple[str, bool]:
+    def _resolve_video_codec(base_codec: str, prefer_gpu: bool, ten_bit: bool = False) -> Tuple[str, bool]:
         """Returns ``(codec_to_use, is_gpu)``.
 
         Falls back to the CPU codec whenever GPU encoding wasn't requested,
@@ -591,10 +651,19 @@ class Exporter:
         # nvenc_available() tested H.264; other NVENC encoders get their own probe.
         if nvenc_codec != "h264_nvenc" and not nvenc_encoder_available(nvenc_codec):
             return base_codec, False
+        # 10-bit NVENC needs a newer GPU than 8-bit (and AV1 needs Ada or later).
+        if ten_bit and not encoder_supports_10bit(nvenc_codec):
+            return base_codec, False
         return nvenc_codec, True
 
     @staticmethod
-    def _video_quality_args(codec: str, is_gpu: bool, crf: str) -> List[str]:
+    def _video_quality_args(
+        codec: str,
+        is_gpu: bool,
+        crf: str,
+        color: OutputColor = SDR_8BIT,
+        hdr_metadata: Tuple[str, str] = ("", ""),
+    ) -> List[str]:
         """Quality-control flags for one video codec.
 
         NVENC doesn't understand ``-crf`` (a libx264/libvpx-only rate-control
@@ -605,25 +674,64 @@ class Exporter:
         same 0-51 lower-is-better scale as x264's ``-crf``, so the existing
         CRF preset numbers (18/23/28) carry over directly as sensible ``-cq``
         values rather than needing a separate mapping table.
+
+        ``color`` adds the pixel format/profile of a 10-bit export (and the
+        HDR10 static metadata x265 can write) -- see :func:`_pixel_args`.
         """
+        pixel = Exporter._pixel_args(codec, color, hdr_metadata)
         if is_gpu:
-            return NVENC_TUNING + ["-rc:v", "vbr", "-cq:v", crf, "-b:v", "0", "-pix_fmt", "yuv420p"]
+            return NVENC_TUNING + ["-rc:v", "vbr", "-cq:v", crf, "-b:v", "0"] + pixel
         if codec == "libx264":
-            return ["-crf", crf, "-preset", "medium", "-pix_fmt", "yuv420p"]
+            return ["-crf", crf, "-preset", "medium"] + pixel
         if codec == "libx265":
             # x265's CRF scale sits about 4-6 above x264's for the same quality.
-            return ["-crf", str(int(crf) + 4), "-preset", "medium", "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
-                    "-x265-params", "log-level=error"]
+            return ["-crf", str(int(crf) + 4), "-preset", "medium"] + pixel
         if codec == "libaom-av1":
             # libaom's 0-63 scale: x264 18/23/28 -> about 25/32/39.
-            return ["-crf", str(round(int(crf) * 1.4)), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1",
-                    "-pix_fmt", "yuv420p"]
+            return ["-crf", str(round(int(crf) * 1.4)), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1"] + pixel
         if codec == "libvpx-vp9":
             return ["-crf", crf, "-b:v", "0"]
+        if codec in ("prores_ks", "dnxhd"):
+            return pixel
+        return []
+
+    @staticmethod
+    def _pixel_args(codec: str, color: OutputColor = SDR_8BIT, hdr_metadata: Tuple[str, str] = ("", "")) -> List[str]:
+        """Pixel format, profile and encoder-level colour flags for ``codec`` at the export's bit depth.
+
+        x265 also gets the HDR description in its own parameters (and the
+        source's mastering display / MaxCLL when probed): it is the encoder
+        here that can write HDR10 static metadata. NVENC and AV1 exports
+        carry the colour tags only (the filter graph doesn't pass frame side
+        data through to them).
+        """
+        ten = color.is_10bit
+        if codec in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+            out = ["-pix_fmt", "p010le" if ten else "yuv420p"]
+            return out + (["-profile:v", "main10"] if ten and codec == "hevc_nvenc" else [])
+        if codec == "libx264":
+            return ["-pix_fmt", "yuv420p"]
+        if codec == "libx265":
+            params = ["log-level=error"]
+            if ten:
+                params += [f"colorprim={color.primaries}", f"transfer={color.transfer}", f"colormatrix={color.matrix}"]
+            if color.is_hdr:
+                params += ["repeat-headers=1"]
+                master, cll = hdr_metadata
+                if color.hdr == "pq":
+                    params += ["hdr10=1"] + ([f"master-display={master}"] if master else []) \
+                        + ([f"max-cll={cll}"] if cll else [])
+            out = ["-pix_fmt", "yuv420p10le" if ten else "yuv420p"]
+            out += ["-profile:v", "main10"] if ten else []
+            return out + ["-tag:v", "hvc1", "-x265-params", ":".join(params)]
+        if codec == "libaom-av1":
+            return ["-pix_fmt", "yuv420p10le" if ten else "yuv420p"]
         if codec == "prores_ks":
             return ["-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
         if codec == "dnxhd":
-            return ["-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
+            # DNxHR HQ is 8-bit; its 10-bit sibling is HQX.
+            return ["-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le"] if ten else \
+                ["-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
         return []
 
     def _output_args(
@@ -644,7 +752,7 @@ class Exporter:
         args = ["-map", f"[{graph.video_out_label}]"]
         if graph.has_audio:
             args += ["-map", f"[{graph.audio_out_label}]"]
-        args += ["-c:v", codec] + video_args + BT709_OUTPUT_TAGS
+        args += ["-c:v", codec] + video_args + self._color.output_tag_args()
         if graph.has_audio:
             args += ["-c:a", audio_codec]
             if not audio_codec.startswith("pcm_"):
@@ -672,10 +780,11 @@ class Exporter:
 
         def build_args(codec: str, is_gpu: bool) -> List[str]:
             return self._common_args(graph, chapters_args) + self._output_args(
-                settings, graph, ext, codec, audio_codec, self._video_quality_args(codec, is_gpu, crf), chapters_index
+                settings, graph, ext, codec, audio_codec,
+                self._video_quality_args(codec, is_gpu, crf, self._color, self._hdr_metadata), chapters_index
             )
 
-        effective_codec, using_gpu = self._resolve_video_codec(video_codec, settings.use_gpu)
+        effective_codec, using_gpu = self._resolve_video_codec(video_codec, settings.use_gpu, self._color.is_10bit)
         args = build_args(effective_codec, using_gpu)
         label = "Rendering (GPU)" if using_gpu else "Rendering"
         try:
@@ -790,6 +899,7 @@ class Exporter:
                 "-b:v", f"{video_kbps}k",
                 "-pass", "1",
                 "-passlogfile", passlog_prefix,
+                *self._pixel_args(video_codec, self._color),
                 "-an",
                 "-r", fps_expr(settings.fps),
                 "-f", "null",
@@ -803,9 +913,10 @@ class Exporter:
             # ---- Pass 2: real encode at the bitrate computed for the target size ----
             video_args = ["-b:v", f"{video_kbps}k", "-pass", "2", "-passlogfile", passlog_prefix]
             if video_codec == "libx264":
-                video_args += ["-preset", "medium", "-pix_fmt", "yuv420p"]
+                video_args += ["-preset", "medium"]
             elif video_codec == "libaom-av1":
-                video_args += ["-cpu-used", "6", "-row-mt", "1", "-pix_fmt", "yuv420p"]
+                video_args += ["-cpu-used", "6", "-row-mt", "1"]
+            video_args += self._pixel_args(video_codec, self._color, self._hdr_metadata)
             pass2_args = self._common_args(graph, chapters_args) + self._output_args(
                 settings, graph, ext, video_codec, audio_codec, video_args, chapters_index
             )
@@ -842,13 +953,13 @@ class Exporter:
         (returns None) when NVENC isn't available for this codec, or on a
         GPU-specific failure, so the exact-size CPU two-pass still runs.
         """
-        codec, is_gpu = self._resolve_video_codec(video_codec, True)
+        codec, is_gpu = self._resolve_video_codec(video_codec, True, self._color.is_10bit)
         if not is_gpu:
             return None
         video_args = [a for a in NVENC_TUNING] + [
             "-rc:v", "vbr", "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.5)}k",
-            "-bufsize", f"{video_kbps * 2}k", "-pix_fmt", "yuv420p",
-        ]
+            "-bufsize", f"{video_kbps * 2}k",
+        ] + self._pixel_args(codec, self._color)
         args = self._common_args(graph, chapters_args) + self._output_args(
             settings, graph, ext, codec, audio_codec, video_args, chapters_index
         )

@@ -102,6 +102,9 @@ def probe_file(path: str) -> MediaAsset:
     if not asset.has_video and not asset.has_audio:
         raise MediaProbeError("Unreadable media file: no audio or video streams found.")
 
+    if asset.is_hdr:
+        _read_hdr_metadata(asset, ffprobe)
+
     # A single-frame "video" stream with no duration/audio is really a
     # still image (e.g. imported via -loop). Treat near-zero duration
     # image formats as images.
@@ -125,6 +128,27 @@ def _read_color_description(asset: MediaAsset, stream: dict) -> None:
     asset.color_primaries = stream.get("color_primaries", "") or ""
     asset.color_space = stream.get("color_space", "") or ""
     asset.color_range = stream.get("color_range", "") or ""
+
+
+def _read_hdr_metadata(asset: MediaAsset, ffprobe: str) -> None:
+    """HDR10 static metadata (mastering display, MaxCLL/MaxFALL) from the first frame's side data.
+
+    HEVC/AV1 carry it per frame (SEI / metadata OBUs), not in the stream
+    header, so it takes a one-frame read. Missing or unreadable metadata
+    simply leaves the fields empty -- an HDR passthrough export then writes
+    the colour tags without it.
+    """
+    from core.output_color import mastering_from_side_data
+
+    args = [ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+            "-show_frames", "-show_entries", "frame=side_data_list", "-print_format", "json", asset.path]
+    try:
+        result = run(args, timeout=PROBE_TIMEOUT_S)
+        frames = json.loads(result.stdout or "{}").get("frames") or []
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return
+    side_data = frames[0].get("side_data_list") or [] if frames else []
+    asset.mastering_display, asset.max_cll = mastering_from_side_data(side_data)
 
 
 def bit_depth_of(pix_fmt: str) -> int:

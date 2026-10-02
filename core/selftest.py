@@ -26,6 +26,7 @@ from core import __version__
 REQUIRED_FILTERS = (
     "drawtext", "xfade", "overlay", "amix", "alimiter", "loudnorm", "sidechaincompress", "afftdn",
     "colorkey", "chromakey", "despill", "zscale", "tonemap", "lut3d", "unsharp", "gblur", "vignette", "hqdn3d",
+    "eq", "setparams", "vidstabdetect", "vidstabtransform",
 )
 REPORT_NAME = "VideoEditor-selftest.txt"
 
