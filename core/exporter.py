@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import json
+import math
 import os
 import re
 import subprocess
@@ -13,15 +15,16 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from core.clip import ReframeMode
-from core.ffmpeg_utils import find_binary, nvenc_available, popen
-from core.filter_graph import GraphResult, build_filter_graph
+from core.effects import effect_files
+from core.ffmpeg_utils import find_binary, nvenc_available, nvenc_encoder_available, popen
+from core.filter_graph import GraphResult, build_filter_graph, fps_expr
 from core.project import Project, ProjectSettings
 
 ProgressCallback = Callable[[float, str], None]
 """Called with (fraction_complete 0..1, status_message)."""
 
 _TIME_RE = re.compile(r"out_time_ms=(\d+)")
-_SPEED_RE = re.compile(r"speed=\s*([\d.]+)x")
+_SPEED_RE = re.compile(r"^speed=\s*([0-9.]+)x")
 
 # `-progress pipe:1` key=value lines, interleaved with FFmpeg's own log output
 # on the merged stdout/stderr pipe (see core.ffmpeg_utils.popen). Filtered out
@@ -59,24 +62,82 @@ CONTAINER_CODECS = {
     ".webm": ("libvpx-vp9", "libopus"),
 }
 
-# GPU (NVENC) equivalent of each CPU codec CONTAINER_CODECS can select, used
-# by Exporter._resolve_video_codec() when ExportSettings.use_gpu is set and
-# core.ffmpeg_utils.nvenc_available() confirms this ffmpeg build/driver
-# actually has it. Only libx264 has an entry: nothing in CONTAINER_CODECS
-# currently maps to libx265/HEVC, and VP9 (.webm) has no NVENC counterpart
-# worth relying on here, so GPU encoding is single-pass MP4/MOV/MKV/AVI/FLV
-# only for now. Add "libx265": "hevc_nvenc" here the day an HEVC output
-# option is added to CONTAINER_CODECS -- no other code path needs to change.
+# Video codec choices offered by the Export dialog ("auto" = the container's
+# default from CONTAINER_CODECS), the CPU encoder each one uses, and the
+# containers it can be written to.
+VIDEO_CODEC_CHOICES = {
+    "auto": "Container default",
+    "h264": "H.264",
+    "hevc": "HEVC (H.265)",
+    "av1": "AV1",
+    "prores": "ProRes 422 HQ (intermediate)",
+    "dnxhr": "DNxHR HQ (intermediate)",
+}
+CODEC_ENCODERS = {
+    "h264": "libx264",
+    "hevc": "libx265",
+    "av1": "libaom-av1",
+    "prores": "prores_ks",
+    "dnxhr": "dnxhd",
+}
+CODEC_CONTAINERS = {
+    "h264": (".mp4", ".mov", ".mkv", ".avi", ".flv"),
+    "hevc": (".mp4", ".mov", ".mkv"),
+    "av1": (".mp4", ".mkv", ".webm"),
+    "prores": (".mov", ".mkv"),
+    "dnxhr": (".mov", ".mkv"),
+}
+# Intermediate codecs carry uncompressed PCM audio, as editing intermediates do.
+INTERMEDIATE_ENCODERS = ("prores_ks", "dnxhd")
+# Target-size (two-pass) needs a codec with a real two-pass mode here.
+TWO_PASS_ENCODERS = ("libx264", "libvpx-vp9", "libaom-av1")
+
+# GPU (NVENC) equivalent of each CPU encoder, used by
+# Exporter._resolve_video_codec() when ExportSettings.use_gpu is set and the
+# encoder really works on this machine (core.ffmpeg_utils.nvenc_available /
+# nvenc_encoder_available: a GPU can do H.264 but not AV1). VP9 (.webm) and
+# the intermediates have no NVENC counterpart.
 NVENC_CODEC_MAP = {
     "libx264": "h264_nvenc",
+    "libx265": "hevc_nvenc",
+    "libaom-av1": "av1_nvenc",
 }
+
+# NVENC quality flags on top of preset p4. Measured on an RTX 5080 (10 s of
+# 1080p, encode only): 1.03-1.24x the time of plain p4 for H.264/HEVC/AV1.
+# Preset p5 with full-resolution multipass cost 1.12-1.36x, over the ~1.2x
+# budget, so it isn't used.
+NVENC_TUNING = [
+    "-preset", "p4", "-tune", "hq", "-multipass", "qres", "-spatial-aq", "1", "-temporal-aq", "1",
+    "-rc-lookahead", "20", "-b_ref_mode", "middle",
+]
+
+# Every non-GIF output is tagged as SDR BT.709 (HDR sources are tone-mapped
+# to it in the graph). Untagged files left players guessing BT.601 vs BT.709
+# from the frame size; an HDR source used to come out with a BT.2020 matrix
+# tag and no transfer at all.
+BT709_OUTPUT_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
 
 # Handled separately from CONTAINER_CODECS: GIF has no audio and uses its
 # own palette-based encode (see Exporter._export_gif), not a CRF video codec.
 GIF_EXTENSION = ".gif"
 
 AUDIO_BITRATE_KBPS = 192
+AUDIO_BITRATE_OPTIONS_KBPS = (128, 192, 256, 320)
 MIN_VIDEO_BITRATE_KBPS = 150
+
+# Integrated-loudness targets offered by the export dialog (EBU R128 /
+# ITU BS.1770 LUFS). Normalization is two-pass loudnorm: an audio-only
+# measurement pass, then the real render with the measured values and
+# linear=true (a single gain change, no dynamic compression).
+LOUDNESS_TARGETS = {
+    "Off": None,
+    "-14 LUFS (YouTube / streaming)": -14.0,
+    "-16 LUFS (podcast)": -16.0,
+    "-23 LUFS (EBU R128 broadcast)": -23.0,
+}
+LOUDNESS_TRUE_PEAK = -1.0
+LOUDNESS_LRA = 11.0
 
 
 @dataclass
@@ -109,6 +170,41 @@ class ExportSettings:
     # GPU's limited concurrent session count), Exporter transparently retries
     # once with the CPU codec rather than failing the export outright.
     use_gpu: bool = True
+    # AAC/Opus bitrate for the audio track.
+    audio_bitrate_kbps: int = AUDIO_BITRATE_KBPS
+    # Integrated loudness target in LUFS (see LOUDNESS_TARGETS), or None to
+    # leave the mix level alone (the master limiter still caps peaks).
+    loudness_target: Optional[float] = None
+    # Video codec (a VIDEO_CODEC_CHOICES key); "auto" = the container's default.
+    video_codec: str = "auto"
+    # Target-size export on the GPU: one NVENC pass with a VBR rate cap
+    # (lands close to, not exactly on, the size) instead of x264 two-pass.
+    gpu_target_size: bool = False
+
+
+def resolve_codecs(ext: str, choice: str = "auto") -> Tuple[str, str]:
+    """``(video_encoder, audio_encoder)`` for a container extension and codec choice.
+
+    Raises ``ValueError`` when the codec can't go in that container (e.g.
+    ProRes in .mp4) -- the dialog only offers valid pairs; this guards the API.
+    """
+    if not choice or choice == "auto":
+        return CONTAINER_CODECS.get(ext, ("libx264", "aac"))
+    if choice not in CODEC_ENCODERS:
+        raise ValueError(f"Unknown video codec '{choice}'.")
+    if ext not in CODEC_CONTAINERS[choice]:
+        raise ValueError(f"{VIDEO_CODEC_CHOICES[choice]} can't be written to a {ext} file.")
+    video = CODEC_ENCODERS[choice]
+    if video in INTERMEDIATE_ENCODERS:
+        return video, "pcm_s16le"
+    return video, ("libopus" if ext == ".webm" else "aac")
+
+
+def format_eta(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 class ExportError(RuntimeError):
@@ -136,6 +232,8 @@ class Exporter:
         self.project = project
         self._cancelled = False
         self._process: Optional[subprocess.Popen] = None
+        # Non-fatal problems from the last export (see GraphResult.warnings).
+        self.warnings: List[str] = []
 
     def cancel(self) -> None:
         """Request cancellation. Safe to call from another thread.
@@ -176,8 +274,13 @@ class Exporter:
         graph = build_filter_graph(
             self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range
         )
+        self.warnings = list(graph.warnings)
         try:
-            self._check_sources_exist(graph)
+            self._check_sources_exist(graph, self._effect_files())
+            if settings.loudness_target is not None and graph.has_audible_clips:
+                graph = self._with_loudness_normalization(
+                    graph, project_settings, settings, trim_range, on_progress
+                )
             final_path = settings.output_path
             partial_path = self._partial_output_path(final_path)
             render_settings = dataclasses.replace(settings, output_path=partial_path)
@@ -199,6 +302,78 @@ class Exporter:
             on_progress(1.0, "Done")
         return final_path
 
+    def _with_loudness_normalization(
+        self,
+        graph: GraphResult,
+        project_settings: ProjectSettings,
+        settings: ExportSettings,
+        trim_range: Optional[Tuple[float, float]],
+        on_progress: Optional[ProgressCallback],
+    ) -> GraphResult:
+        """First loudnorm pass: measure the mix, then return ``graph`` with the second pass appended.
+
+        The measurement runs on an audio-only build of the same graph
+        (``build_filter_graph(audio_only=True)``), so it costs an audio
+        decode/mix rather than a second video render. Returns ``graph``
+        unchanged when the mix measures as silence.
+        """
+        target = settings.loudness_target
+        measure_graph = build_filter_graph(
+            self.project, project_settings, reframe_override=settings.reframe_override,
+            trim_range=trim_range, audio_only=True,
+        )
+        try:
+            args = self._common_args(measure_graph)
+            filter_index = args.index("-filter_complex") + 1
+            args[filter_index] += (
+                f";[{measure_graph.video_out_label}]nullsink"
+                f";[{measure_graph.audio_out_label}]{self._loudnorm_filter(target)}:print_format=json[lnmeasure]"
+            )
+            args += ["-map", "[lnmeasure]", "-f", "null", "-progress", "pipe:1", "-nostats", os.devnull]
+            duration = max(project_settings_duration(self.project, trim_range), 0.01)
+            log = self._run_ffmpeg(args, duration, on_progress, progress_range=(0.0, 1.0), label="Measuring loudness")
+        finally:
+            measure_graph.cleanup()
+        measured = self._parse_loudnorm_json(log)
+        if measured is None:
+            raise ExportError("Could not read FFmpeg's loudness measurement.", log_tail=log)
+        try:
+            if not math.isfinite(float(measured["input_i"])):
+                return graph  # silent mix: nothing to normalize
+        except (KeyError, ValueError):
+            raise ExportError("Could not read FFmpeg's loudness measurement.", log_tail=log)
+        sample_rate = project_settings.sample_rate or 48000
+        second_pass = (
+            f"{self._loudnorm_filter(target)}"
+            f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}:linear=true"
+            # loudnorm works (and outputs) at 192 kHz internally.
+            f",aresample={sample_rate}"
+        )
+        return dataclasses.replace(
+            graph,
+            filter_complex=f"{graph.filter_complex};[{graph.audio_out_label}]{second_pass}[aloud]",
+            audio_out_label="aloud",
+        )
+
+    @staticmethod
+    def _loudnorm_filter(target: float) -> str:
+        return f"loudnorm=I={target:.1f}:TP={LOUDNESS_TRUE_PEAK:.1f}:LRA={LOUDNESS_LRA:.1f}"
+
+    @staticmethod
+    def _parse_loudnorm_json(log_lines: List[str]) -> Optional[dict]:
+        """The last ``{...}`` block loudnorm printed (``print_format=json``), or None."""
+        text = "\n".join(log_lines)
+        end = text.rfind("}")
+        start = text.rfind("{", 0, end)
+        if start < 0 or end < 0:
+            return None
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+
     @staticmethod
     def _partial_output_path(output_path: str) -> str:
         """Temp render target next to ``output_path``: ``name.partial.mp4``.
@@ -219,8 +394,12 @@ class Exporter:
         except OSError:
             pass
 
+    def _effect_files(self) -> List[str]:
+        """Files read by enabled effects (LUTs) on any clip."""
+        return [path for track in self.project.tracks for clip in track.clips for path in effect_files(clip.effects)]
+
     @staticmethod
-    def _check_sources_exist(graph: GraphResult) -> None:
+    def _check_sources_exist(graph: GraphResult, extra_files: Optional[List[str]] = None) -> None:
         """Fail fast, with a clear list, if any source file FFmpeg would open is missing.
 
         Checks exactly the graph's ``-i`` inputs (so a hidden-and-muted
@@ -228,7 +407,8 @@ class Exporter:
         user gets only FFmpeg's own error for the first missing file,
         after a render may already have started.
         """
-        missing = sorted({spec.path for spec in graph.input_specs if not os.path.isfile(spec.path)})
+        paths = [spec.path for spec in graph.input_specs] + list(extra_files or [])
+        missing = sorted({path for path in paths if not os.path.isfile(path)})
         if missing:
             shown = "\n".join(missing[:10])
             more = f"\n...and {len(missing) - 10} more" if len(missing) > 10 else ""
@@ -260,18 +440,35 @@ class Exporter:
             # encode with no real concept of chapter markers.
             output_path = self._export_gif(settings, graph, total_duration, on_progress)
         else:
-            video_codec, audio_codec = CONTAINER_CODECS.get(ext, ("libx264", "aac"))
+            try:
+                video_codec, audio_codec = resolve_codecs(ext, settings.video_codec)
+            except ValueError as exc:
+                raise ExportError(str(exc))
+            graph = self._with_bt709_frames(graph)
+            use_two_pass = bool(settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0)
+            if use_two_pass and video_codec not in TWO_PASS_ENCODERS:
+                raise ExportError(
+                    "Target file size needs H.264, VP9 or AV1; choose one of them or turn target size off."
+                )
             chapters_args, chapters_index, chapters_path = self._build_chapters_args(
                 graph, full_duration, trim_start, trim_end if is_trimmed else None
             )
             try:
-                use_two_pass = settings.two_pass and settings.target_size_mb and settings.target_size_mb > 0
                 if use_two_pass:
-                    video_kbps = self._target_video_bitrate_kbps(settings.target_size_mb, total_duration, graph.has_audio)
-                    output_path = self._export_two_pass(
-                        settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration, on_progress,
-                        chapters_args, chapters_index,
+                    video_kbps = self._target_video_bitrate_kbps(
+                        settings.target_size_mb, total_duration, graph.has_audio, settings.audio_bitrate_kbps
                     )
+                    output_path = None
+                    if settings.use_gpu and settings.gpu_target_size:
+                        output_path = self._export_gpu_target_size(
+                            settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration,
+                            on_progress, chapters_args, chapters_index,
+                        )
+                    if output_path is None:
+                        output_path = self._export_two_pass(
+                            settings, graph, ext, video_codec, audio_codec, video_kbps, total_duration,
+                            on_progress, chapters_args, chapters_index,
+                        )
                 else:
                     output_path = self._export_single_pass(
                         settings, graph, ext, video_codec, audio_codec, total_duration, on_progress,
@@ -285,11 +482,31 @@ class Exporter:
                         pass
         return output_path
 
+    @staticmethod
+    def _with_bt709_frames(graph: GraphResult) -> GraphResult:
+        """Tag the final frames as SDR BT.709, limited range.
+
+        Encoders in this FFmpeg take colour tags from the frames; the
+        ``-colorspace``/``-color_trc`` output options alone left
+        ``color_primaries``/``color_transfer`` unset in the file (verified
+        with ffprobe), so the graph's output is tagged with ``setparams``.
+        """
+        return dataclasses.replace(
+            graph,
+            filter_complex=(
+                f"{graph.filter_complex};[{graph.video_out_label}]"
+                "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv[vtagged]"
+            ),
+            video_out_label="vtagged",
+        )
+
     # ------------------------------------------------------------------
     @staticmethod
-    def _target_video_bitrate_kbps(target_size_mb: float, duration_s: float, has_audio: bool) -> int:
+    def _target_video_bitrate_kbps(
+        target_size_mb: float, duration_s: float, has_audio: bool, audio_bitrate_kbps: int = AUDIO_BITRATE_KBPS
+    ) -> int:
         total_kbps = (target_size_mb * 8 * 1024) / duration_s
-        audio_kbps = AUDIO_BITRATE_KBPS if has_audio else 0
+        audio_kbps = audio_bitrate_kbps if has_audio else 0
         return max(MIN_VIDEO_BITRATE_KBPS, int(total_kbps - audio_kbps))
 
     def _common_args(self, graph: GraphResult, chapters_args: Optional[List[str]] = None) -> List[str]:
@@ -371,6 +588,9 @@ class Exporter:
         nvenc_codec = NVENC_CODEC_MAP.get(base_codec)
         if nvenc_codec is None or not nvenc_available():
             return base_codec, False
+        # nvenc_available() tested H.264; other NVENC encoders get their own probe.
+        if nvenc_codec != "h264_nvenc" and not nvenc_encoder_available(nvenc_codec):
+            return base_codec, False
         return nvenc_codec, True
 
     @staticmethod
@@ -387,12 +607,54 @@ class Exporter:
         values rather than needing a separate mapping table.
         """
         if is_gpu:
-            return ["-preset", "p4", "-rc:v", "vbr", "-cq:v", crf, "-b:v", "0", "-pix_fmt", "yuv420p"]
+            return NVENC_TUNING + ["-rc:v", "vbr", "-cq:v", crf, "-b:v", "0", "-pix_fmt", "yuv420p"]
         if codec == "libx264":
             return ["-crf", crf, "-preset", "medium", "-pix_fmt", "yuv420p"]
+        if codec == "libx265":
+            # x265's CRF scale sits about 4-6 above x264's for the same quality.
+            return ["-crf", str(int(crf) + 4), "-preset", "medium", "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
+                    "-x265-params", "log-level=error"]
+        if codec == "libaom-av1":
+            # libaom's 0-63 scale: x264 18/23/28 -> about 25/32/39.
+            return ["-crf", str(round(int(crf) * 1.4)), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1",
+                    "-pix_fmt", "yuv420p"]
         if codec == "libvpx-vp9":
             return ["-crf", crf, "-b:v", "0"]
+        if codec == "prores_ks":
+            return ["-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
+        if codec == "dnxhd":
+            return ["-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
         return []
+
+    def _output_args(
+        self,
+        settings: ExportSettings,
+        graph: GraphResult,
+        ext: str,
+        codec: str,
+        audio_codec: str,
+        video_args: List[str],
+        chapters_index: Optional[int],
+    ) -> List[str]:
+        """Everything after the inputs/graph for a final (audio-carrying) encode.
+
+        Shared by single-pass, two-pass pass 2 and GPU target size, which used
+        to carry diverging copies of it.
+        """
+        args = ["-map", f"[{graph.video_out_label}]"]
+        if graph.has_audio:
+            args += ["-map", f"[{graph.audio_out_label}]"]
+        args += ["-c:v", codec] + video_args + BT709_OUTPUT_TAGS
+        if graph.has_audio:
+            args += ["-c:a", audio_codec]
+            if not audio_codec.startswith("pcm_"):
+                args += ["-b:a", f"{settings.audio_bitrate_kbps}k"]
+        if chapters_index is not None:
+            args += ["-map_metadata", str(chapters_index)]
+        args += ["-r", fps_expr(settings.fps)]
+        args += ["-movflags", "+faststart"] if ext in (".mp4", ".mov") else []
+        args += ["-progress", "pipe:1", "-nostats", settings.output_path]
+        return args
 
     def _export_single_pass(
         self,
@@ -409,23 +671,9 @@ class Exporter:
         crf = QUALITY_PRESETS.get(settings.quality_preset, "23")
 
         def build_args(codec: str, is_gpu: bool) -> List[str]:
-            args = self._common_args(graph, chapters_args)
-            args += ["-map", f"[{graph.video_out_label}]"]
-            if graph.has_audio:
-                args += ["-map", f"[{graph.audio_out_label}]"]
-
-            args += ["-c:v", codec]
-            args += self._video_quality_args(codec, is_gpu, crf)
-
-            if graph.has_audio:
-                args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
-
-            if chapters_index is not None:
-                args += ["-map_metadata", str(chapters_index)]
-            args += ["-r", str(settings.fps)]
-            args += ["-movflags", "+faststart"] if ext == ".mp4" else []
-            args += ["-progress", "pipe:1", "-nostats", settings.output_path]
-            return args
+            return self._common_args(graph, chapters_args) + self._output_args(
+                settings, graph, ext, codec, audio_codec, self._video_quality_args(codec, is_gpu, crf), chapters_index
+            )
 
         effective_codec, using_gpu = self._resolve_video_codec(video_codec, settings.use_gpu)
         args = build_args(effective_codec, using_gpu)
@@ -494,7 +742,7 @@ class Exporter:
             ";[gifsrc2][gifpal]paletteuse=dither=bayer:bayer_scale=3[gifout]"
             f";[{graph.audio_out_label}]anullsink"
         )
-        args += ["-map", "[gifout]", "-loop", "0", "-r", str(settings.fps)]
+        args += ["-map", "[gifout]", "-loop", "0", "-r", fps_expr(settings.fps)]
         args += ["-progress", "pipe:1", "-nostats", settings.output_path]
 
         self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering GIF")
@@ -543,7 +791,7 @@ class Exporter:
                 "-pass", "1",
                 "-passlogfile", passlog_prefix,
                 "-an",
-                "-r", str(settings.fps),
+                "-r", fps_expr(settings.fps),
                 "-f", "null",
                 "-progress", "pipe:1", "-nostats",
                 null_output,
@@ -553,20 +801,14 @@ class Exporter:
             )
 
             # ---- Pass 2: real encode at the bitrate computed for the target size ----
-            pass2_args = self._common_args(graph, chapters_args)
-            pass2_args += ["-map", f"[{graph.video_out_label}]"]
-            if graph.has_audio:
-                pass2_args += ["-map", f"[{graph.audio_out_label}]"]
-            pass2_args += ["-c:v", video_codec, "-b:v", f"{video_kbps}k", "-pass", "2", "-passlogfile", passlog_prefix]
+            video_args = ["-b:v", f"{video_kbps}k", "-pass", "2", "-passlogfile", passlog_prefix]
             if video_codec == "libx264":
-                pass2_args += ["-preset", "medium", "-pix_fmt", "yuv420p"]
-            if graph.has_audio:
-                pass2_args += ["-c:a", audio_codec, "-b:a", f"{AUDIO_BITRATE_KBPS}k"]
-            if chapters_index is not None:
-                pass2_args += ["-map_metadata", str(chapters_index)]
-            pass2_args += ["-r", str(settings.fps)]
-            pass2_args += ["-movflags", "+faststart"] if ext == ".mp4" else []
-            pass2_args += ["-progress", "pipe:1", "-nostats", settings.output_path]
+                video_args += ["-preset", "medium", "-pix_fmt", "yuv420p"]
+            elif video_codec == "libaom-av1":
+                video_args += ["-cpu-used", "6", "-row-mt", "1", "-pix_fmt", "yuv420p"]
+            pass2_args = self._common_args(graph, chapters_args) + self._output_args(
+                settings, graph, ext, video_codec, audio_codec, video_args, chapters_index
+            )
 
             self._run_ffmpeg(
                 pass2_args, total_duration, on_progress, progress_range=(0.5, 1.0), label="Rendering (pass 2/2)"
@@ -580,6 +822,46 @@ class Exporter:
 
         return settings.output_path
 
+    def _export_gpu_target_size(
+        self,
+        settings: ExportSettings,
+        graph: GraphResult,
+        ext: str,
+        video_codec: str,
+        audio_codec: str,
+        video_kbps: int,
+        total_duration: float,
+        on_progress: Optional[ProgressCallback],
+        chapters_args: Optional[List[str]] = None,
+        chapters_index: Optional[int] = None,
+    ) -> Optional[str]:
+        """Target size in one NVENC pass (VBR with a rate cap); None means "use CPU two-pass instead".
+
+        NVENC has no ``-pass 1/2`` log files, but a capped VBR with
+        multipass lands close to the target in a single run. Falls back
+        (returns None) when NVENC isn't available for this codec, or on a
+        GPU-specific failure, so the exact-size CPU two-pass still runs.
+        """
+        codec, is_gpu = self._resolve_video_codec(video_codec, True)
+        if not is_gpu:
+            return None
+        video_args = [a for a in NVENC_TUNING] + [
+            "-rc:v", "vbr", "-b:v", f"{video_kbps}k", "-maxrate", f"{int(video_kbps * 1.5)}k",
+            "-bufsize", f"{video_kbps * 2}k", "-pix_fmt", "yuv420p",
+        ]
+        args = self._common_args(graph, chapters_args) + self._output_args(
+            settings, graph, ext, codec, audio_codec, video_args, chapters_index
+        )
+        try:
+            self._run_ffmpeg(args, total_duration, on_progress, progress_range=(0.0, 1.0), label="Rendering (GPU, target size)")
+        except ExportError as exc:
+            if self._cancelled or not self._is_gpu_specific_failure(exc):
+                raise
+            if on_progress:
+                on_progress(0.0, "GPU encoding failed -- falling back to CPU two-pass...")
+            return None
+        return settings.output_path
+
     def _run_ffmpeg(
         self,
         args: List[str],
@@ -587,15 +869,16 @@ class Exporter:
         on_progress: Optional[ProgressCallback],
         progress_range: tuple,
         label: str,
-    ) -> None:
+    ) -> List[str]:
+        """Run one FFmpeg pass; returns its last log lines (progress lines excluded)."""
         if self._cancelled:
             raise ExportCancelled()
 
-        range_start, range_end = progress_range
         process = popen(args)
         self._process = process
         log_tail: deque = deque(maxlen=ERROR_LOG_TAIL_LINES)
         encoded_seconds = 0.0
+        speed = 0.0
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -603,13 +886,17 @@ class Exporter:
                     process.terminate()
                     raise ExportCancelled()
                 match = _TIME_RE.search(line)
-                if match:
+                speed_match = _SPEED_RE.match(line)
+                if speed_match:
+                    try:
+                        speed = float(speed_match.group(1))
+                    except ValueError:
+                        pass
+                elif match:
                     out_time_s = int(match.group(1)) / 1_000_000
                     encoded_seconds = max(encoded_seconds, out_time_s)
                     if on_progress:
-                        local_fraction = min(1.0, out_time_s / total_duration)
-                        fraction = range_start + local_fraction * (range_end - range_start)
-                        on_progress(fraction, f"{label}... {local_fraction * 100:.0f}%")
+                        on_progress(*progress_message(label, out_time_s, total_duration, speed, progress_range))
                 elif not _PROGRESS_LINE_RE.match(line):
                     stripped = line.rstrip()
                     if stripped:
@@ -629,3 +916,25 @@ class Exporter:
                 log_tail=list(log_tail),
                 encoded_seconds=encoded_seconds,
             )
+        return list(log_tail)
+
+
+def progress_message(
+    label: str, out_time_s: float, total_duration: float, speed: float, progress_range: tuple
+) -> Tuple[float, str]:
+    """``(overall fraction, status text)`` for one progress report, with speed and time left once known."""
+    range_start, range_end = progress_range
+    local_fraction = min(1.0, out_time_s / total_duration) if total_duration > 0 else 0.0
+    fraction = range_start + local_fraction * (range_end - range_start)
+    message = f"{label}... {local_fraction * 100:.0f}%"
+    if speed > 0:
+        remaining = max(0.0, total_duration - out_time_s) / speed
+        message += f" ({speed:.1f}x realtime, ~{format_eta(remaining)} left)"
+    return fraction, message
+
+
+def project_settings_duration(project: Project, trim_range: Optional[Tuple[float, float]]) -> float:
+    """Length of what an export renders: the trim window, or the whole project."""
+    if trim_range is not None:
+        return trim_range[1] - trim_range[0]
+    return project.total_duration

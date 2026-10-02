@@ -250,11 +250,15 @@ class ShortsExportSettingsTests(unittest.TestCase):
         filter_index = args.index("-filter_complex") + 1
         filter_complex = args[filter_index]
         self.assertIn("force_original_aspect_ratio=increase", filter_complex)
-        self.assertIn("trim=start=0.000:end=6.000,setpts=PTS-STARTPTS", filter_complex)
-        # The trimmed labels must be what actually gets mapped to the output.
+        # The graph is built for the 0-6 s window itself (B2): a 6 s canvas
+        # and the clip's input bounded to it, not a trim of the full render.
+        self.assertIn("color=c=black:s=1080x1920:d=6.000", filter_complex)
+        self.assertIn("[0:v]trim=duration=6.000", filter_complex)
         self.assertIn("-map", args)
         map_index = args.index("-map")
-        self.assertIn(args[map_index + 1], ("[trimout_v]",))
+        # The composite ([comp0]) is mapped through the BT.709 frame-tagging step (B6).
+        self.assertEqual(args[map_index + 1], "[vtagged]")
+        self.assertIn("[comp0]setparams=color_primaries=bt709", filter_complex)
 
 
 class ResolveVideoCodecTests(unittest.TestCase):

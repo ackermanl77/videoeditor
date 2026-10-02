@@ -630,7 +630,10 @@ class TrimRangeTests(unittest.TestCase):
         self.assertNotIn("trim=start=", graph.filter_complex)
         self.assertNotIn("atrim=start=", graph.filter_complex)
 
-    def test_trim_range_wraps_video_and_audio_output(self):
+    def test_trim_range_builds_only_the_window(self):
+        # B2: the graph is built for the window itself -- a 5 s canvas, the
+        # input seeked to the window's start and bounded to its length --
+        # instead of rendering the whole timeline and trimming the result.
         project = Project()
         project.add_media_asset(MediaAsset(path="/media/a.mp4", duration=10.0, has_video=True, has_audio=True))
         track = project.tracks[0]
@@ -638,12 +641,14 @@ class TrimRangeTests(unittest.TestCase):
             Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
         )
         graph = build_filter_graph(project, ProjectSettings(), trim_range=(2.0, 7.0))
-        self.assertIn(
-            f"[{'comp0'}]trim=start=2.000:end=7.000,setpts=PTS-STARTPTS[trimout_v]", graph.filter_complex
-        )
-        self.assertIn("atrim=start=2.000:end=7.000,asetpts=PTS-STARTPTS[trimout_a]", graph.filter_complex)
-        self.assertEqual(graph.video_out_label, "trimout_v")
-        self.assertEqual(graph.audio_out_label, "trimout_a")
+        fc = graph.filter_complex
+        self.assertIn("color=c=black:s=1920x1080:d=5.000", fc)
+        self.assertEqual(graph.input_specs[0].pre_args, ["-ss", "2.000", "-t", "5.500"])
+        self.assertIn("[0:v]trim=duration=5.000,setpts=PTS-STARTPTS,setpts=PTS+2.000000/TB", fc)
+        self.assertIn("atrim=duration=5.000[aout]", fc)
+        self.assertNotIn("trim=start=2.000:end=7.000", fc)
+        self.assertEqual(graph.video_out_label, "comp0")
+        self.assertEqual(graph.audio_out_label, "aout")
 
     def test_trim_end_none_defaults_to_project_duration(self):
         project = Project()
@@ -653,7 +658,52 @@ class TrimRangeTests(unittest.TestCase):
             Clip(media_type=MediaType.VIDEO, source_path="/media/a.mp4", source_in=0, source_out=10, timeline_start=0)
         )
         graph = build_filter_graph(project, ProjectSettings(), trim_range=(1.0, None))
-        self.assertIn("trim=start=1.000:end=10.000,setpts=PTS-STARTPTS[trimout_v]", graph.filter_complex)
+        self.assertIn("color=c=black:s=1920x1080:d=9.000", graph.filter_complex)
+        self.assertEqual(graph.input_specs[0].pre_args[:2], ["-ss", "1.000"])
+
+    def _sequence(self, n=4, length=5.0):
+        project = Project()
+        for i in range(n):
+            path = f"/media/c{i}.mp4"
+            project.add_media_asset(MediaAsset(path=path, duration=length, has_video=True, has_audio=True))
+            project.tracks[0].clips.append(
+                Clip(media_type=MediaType.VIDEO, source_path=path, source_in=0, source_out=length,
+                     timeline_start=i * length)
+            )
+        return project
+
+    def test_clips_outside_the_window_are_left_out(self):
+        graph = build_filter_graph(self._sequence(), ProjectSettings(), trim_range=(12.0, 14.0))
+        self.assertEqual([os.path.basename(s.path) for s in graph.input_specs], ["c2.mp4"])
+        self.assertEqual(graph.input_specs[0].pre_args, ["-ss", "2.000", "-t", "2.500"])
+        self.assertEqual(graph.filter_complex.count("overlay="), 1)
+
+    def test_clip_starting_inside_the_window_is_shifted_by_the_window_start(self):
+        graph = build_filter_graph(self._sequence(), ProjectSettings(), trim_range=(12.0, 17.0))
+        fc = graph.filter_complex
+        # c3 starts at 15 s = 3 s into the window; its audio is delayed the same.
+        self.assertIn("setpts=PTS+3.000/TB[v3]", fc)
+        self.assertIn("adelay=delays=3000:all=1[a3]", fc)
+
+    def test_windowed_text_and_position_keyframes_use_window_time(self):
+        project = self._sequence(2)
+        project.tracks[0].clips[1].position_keyframes = [(0.0, 0.2, 0.2), (2.0, 0.8, 0.8)]
+        project.tracks[0].clips.append(
+            Clip(media_type=MediaType.TEXT, source_in=0, source_out=4, timeline_start=6.0)
+        )
+        graph = build_filter_graph(project, ProjectSettings(), trim_range=(7.0, 10.0))
+        self.assertIn("between(t,-1.000,3.000)", graph.filter_complex)
+        # clip 2 starts at 5 s, 2 s before the window: clip-local = t + 2.
+        self.assertIn("(t+2.000000)", graph.filter_complex)
+        graph.cleanup()
+
+    def test_full_export_shifts_with_setpts_not_tpad(self):
+        # B1: tpad generated start*fps transparent full-canvas frames per clip.
+        graph = build_filter_graph(self._sequence(), ProjectSettings())
+        self.assertNotIn("tpad", graph.filter_complex)
+        self.assertIn("setpts=PTS+15.000/TB[v3]", graph.filter_complex)
+        for spec in graph.input_specs:
+            self.assertEqual(spec.pre_args, ["-ss", "0.000", "-t", "5.500"])
 
 
 class DenoiseTests(unittest.TestCase):

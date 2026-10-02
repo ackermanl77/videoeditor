@@ -14,6 +14,12 @@ import sys
 from functools import lru_cache
 from typing import List, Optional
 
+#: Default timeout (seconds) for :func:`run`/:func:`run_binary`. ffprobe,
+#: thumbnail and waveform calls used to have none, so a damaged file or a
+#: stalled network share could hang an import (or the export-time probe)
+#: forever. Callers with legitimately longer work pass their own ``timeout``.
+DEFAULT_TIMEOUT_S = 60.0
+
 # When PyInstaller bundles the app, sys._MEIPASS points at the extracted
 # runtime directory. We look there first so a bundled ffmpeg/ffprobe binary
 # (placed next to the executable at build time) is preferred over anything
@@ -117,6 +123,39 @@ def nvenc_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=None)
+def nvenc_encoder_available(encoder: str) -> bool:
+    """Like :func:`nvenc_available`, for one specific NVENC encoder (``hevc_nvenc``, ``av1_nvenc``...).
+
+    A GPU can support H.264 NVENC but not AV1 (anything older than Ada), so
+    each encoder gets its own tiny real test encode. Cached; never raises.
+    """
+    try:
+        ffmpeg = find_binary("ffmpeg")
+        result = run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                "-c:v", encoder, "-f", "null", "-",
+            ],
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=None)
+def binary_version(tool: str) -> str:
+    """First line of ``<tool> -version`` (e.g. ``ffmpeg version 9.0.1-essentials_build...``), or ``""``."""
+    try:
+        result = run([find_binary(tool), "-hide_banner", "-version"], timeout=15)
+    except Exception:
+        return ""
+    lines = (result.stdout or "").strip().splitlines()
+    return lines[0] if lines else ""
+
+
 def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess with sensible defaults (no console window on Windows).
 
@@ -129,6 +168,7 @@ def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
     creationflags = 0
     if sys.platform.startswith("win"):
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    kwargs.setdefault("timeout", DEFAULT_TIMEOUT_S)  # raises subprocess.TimeoutExpired
     return subprocess.run(
         args,
         capture_output=True,
@@ -149,6 +189,7 @@ def run_binary(args: List[str], **kwargs) -> subprocess.CompletedProcess:
     creationflags = 0
     if sys.platform.startswith("win"):
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    kwargs.setdefault("timeout", DEFAULT_TIMEOUT_S)
     return subprocess.run(
         args,
         capture_output=True,

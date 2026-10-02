@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, ReframeMode, TransitionType
+from core.effects import effect_filters
+from core.media_asset import MediaAsset
 from core.project import Project, ProjectSettings
 from core.track import TrackType
 
@@ -84,7 +86,7 @@ def _clip_has_audio(project: Project, clip: Clip, probe_cache: Dict[str, bool]) 
     assuming ``True`` — mapping a non-existent ``[N:a]`` stream would make
     FFmpeg fail the entire export.
     """
-    asset = project.find_asset_by_path(clip.source_path)
+    asset = project.asset_for_clip(clip)
     if asset is not None:
         return asset.has_audio
     if clip.source_path in probe_cache:
@@ -94,10 +96,124 @@ def _clip_has_audio(project: Project, clip: Clip, probe_cache: Dict[str, bool]) 
         from core.media_probe import probe_file
 
         has_audio = probe_file(clip.source_path).has_audio
-    except Exception:  # noqa: BLE001 - never let a missing/corrupt file abort export planning
+    except Exception as exc:  # noqa: BLE001 - never let a missing/corrupt file abort export planning
         has_audio = False
+        warnings = getattr(probe_cache, "warnings", None)
+        if warnings is not None:
+            warnings.append(f"Could not probe {clip.source_path} ({exc}); its audio is left out.")
     probe_cache[clip.source_path] = has_audio
     return has_audio
+
+
+class _ProbeCache(dict):
+    """``path -> has_audio`` cache for :func:`_clip_has_audio`, collecting probe warnings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.warnings: List[str] = []
+
+
+def fps_expr(fps: float) -> str:
+    """FFmpeg rate text for ``fps``: NTSC rates as exact fractions (``30000/1001``).
+
+    29.97 written as a decimal is not 30000/1001, so a long export drifts by
+    a frame every few minutes against the source. Other rates are passed
+    through unchanged.
+    """
+    for numerator in (24000, 30000, 48000, 60000, 120000):
+        if abs(fps - numerator / 1001) < 0.005:
+            return f"{numerator}/1001"
+    return str(fps)
+
+
+# HDR (PQ/HLG) -> SDR BT.709: linearize with the source's own transfer,
+# matrix, primaries and range given explicitly (zscale can't find a path
+# from untagged/partially tagged frames), tone-map in float RGB with hable,
+# then back to limited-range BT.709 YUV.
+_TONEMAP_CHAIN = (
+    "zscale=tin={trc}:min={matrix}:pin={prim}:rin={rng}:t=linear:npl=100:m={matrix}:p={prim}"
+    ",format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0"
+    ",zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+)
+
+
+def _source_color_filters(asset: Optional[MediaAsset]) -> str:
+    """Comma-prefixed filters converting a source to SDR BT.709 before it is scaled (or "")."""
+    if asset is None or not asset.is_hdr:
+        return ""
+    return "," + _TONEMAP_CHAIN.format(
+        trc=asset.color_transfer,
+        matrix=asset.color_space or "bt2020nc",
+        prim=asset.color_primaries or "bt2020",
+        rng="pc" if asset.color_range == "pc" else "tv",
+    )
+
+
+def _scale_matrix(asset: Optional[MediaAsset]) -> str:
+    """Extra ``scale`` options converting an SD (BT.601) source's YUV matrix to BT.709 (or "")."""
+    if asset is not None and asset.is_bt601 and not asset.is_hdr:
+        return ":in_color_matrix=bt601:out_color_matrix=bt709"
+    return ""
+
+
+def _fit_or_fill(clip: Clip, width: int, height: int, pad: bool, asset: Optional[MediaAsset] = None) -> str:
+    """Comma-prefixed scaling of a clip onto the canvas, ending in ``yuva420p``.
+
+    Shared by the normal and the speed-ramp chain (they used to carry two
+    copies of this). FILL scales to cover the canvas and crops around the
+    crop focus; FIT scales to fit, padded to the full canvas when ``pad``.
+    "pre" effects (no alpha-capable pixel format, see core/effects.py) run
+    here, before the frame gains its alpha channel.
+    """
+    matrix = _scale_matrix(asset)
+    pre = effect_filters(clip.effects, "pre")
+    if clip.reframe_mode == ReframeMode.FILL:
+        return (
+            f",scale={width}:{height}:force_original_aspect_ratio=increase{matrix}{pre},format=yuva420p"
+            f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
+            f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
+        )
+    out = f",scale={width}:{height}:force_original_aspect_ratio=decrease{matrix}{pre},format=yuva420p"
+    if pad:
+        out += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    return out
+
+
+def _color_filters(clip: Clip) -> str:
+    """Comma-prefixed per-pixel colour work: RGB chroma key, eq colour correction, "post" effects."""
+    out = ""
+    if clip.has_chroma_key:
+        key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
+        out += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
+    if clip.has_color_correction:
+        out += (
+            f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
+            f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
+        )
+    return out + effect_filters(clip.effects, "post")
+
+
+def _afade(kind: str, start: float, duration: float, curve: str = "") -> str:
+    """One ``afade``; ``curve="qsin"`` is the equal-power curve used for crossfades.
+
+    A linear (default ``tri``) crossfade of two uncorrelated sources dips
+    about 3 dB in the middle; quarter-sine in/out keeps the summed power flat.
+    """
+    out = f"afade=t={kind}:st={start:.3f}:d={duration:.3f}" if kind == "out" else f"afade=t=in:st=0:d={duration:.3f}"
+    return out + (f":curve={curve}" if curve else "")
+
+
+def _volume_filter(clip: Clip) -> str:
+    """Comma-prefixed gain: a per-frame envelope for 2+ volume keyframes, else the scalar volume.
+
+    The envelope uses clip-local time: every audio chain re-stamps its
+    samples to start at the clip's own start before this step.
+    """
+    if clip.has_volume_automation:
+        return f",volume=eval=frame:volume='{_piecewise_linear_expr(clip.volume_keyframes, 't')}'"
+    if abs(clip.volume - 1.0) > 1e-6:
+        return f",volume={clip.volume:.3f}"
+    return ""
 
 
 def _escape_filter_value(value: str) -> str:
@@ -172,15 +288,17 @@ def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t
     return f"if(lt({t_var},{kfs[0][0]:.6f}),{kfs[0][1]:.6f},{expr})"  # before the first: hold its value
 
 
-def _position_expr(clip: Clip) -> Tuple[str, str]:
+def _position_expr(clip: Clip, origin: float = 0.0) -> Tuple[str, str]:
     """Return (x_expr, y_expr) for the overlay compositing step's x/y formulas.
 
     A plain float string for a non-keyframed clip (identical to before
     position keyframing existed). For 2+ position keyframes, a
-    piecewise-linear expression over *global* time — the overlay step runs
-    after each layer's ``tpad`` shift to ``clip.timeline_start``, so ``t``
-    there is project time, not the clip-local time keyframes are specified
-    in; ``(t-timeline_start)`` converts back to clip-local time.
+    piecewise-linear expression over *output* time — the overlay step runs
+    after each layer has been shifted to its place on the output timeline
+    (``clip.timeline_start - origin``, where ``origin`` is the start of the
+    export window, 0 for a full export), so ``t`` there is output time, not
+    the clip-local time keyframes are specified in;
+    ``(t-(timeline_start-origin))`` converts back to clip-local time.
 
     In FILL reframe mode, Transform's position (static or keyframed) is
     ignored — the cropped frame already exactly covers the canvas, so
@@ -192,7 +310,9 @@ def _position_expr(clip: Clip) -> Tuple[str, str]:
         return "0.5", "0.5"
     if len(clip.position_keyframes) < 2:
         return f"{clip.transform_x:.4f}", f"{clip.transform_y:.4f}"
-    t_local = f"(t-{clip.timeline_start:.6f})"
+    # Signed format: inside a trimmed export window a clip can start before
+    # the window (a negative output-time start), giving "(t+1.500000)".
+    t_local = f"(t{-(clip.timeline_start - origin):+.6f})"
     x_keyframes = [(t, x) for t, x, _y in clip.position_keyframes]
     y_keyframes = [(t, y) for t, _x, y in clip.position_keyframes]
     return _piecewise_linear_expr(x_keyframes, t_local), _piecewise_linear_expr(y_keyframes, t_local)
@@ -236,6 +356,13 @@ class GraphResult:
     # and must call cleanup() when done -- core/exporter.py does so in a
     # `finally` around the whole export (every pass/fallback attempt).
     temp_files: List[str] = field(default_factory=list)
+    # Whether any clip actually contributes audio (False when [aout] is
+    # only the silent anullsrc fallback) -- loudness normalization skips a
+    # silent mix, whose measured loudness is -inf.
+    has_audible_clips: bool = False
+    # Non-fatal problems found while planning (e.g. a source that could not
+    # be probed, so its audio was left out). Reported with the export result.
+    warnings: List[str] = field(default_factory=list)
 
     def cleanup(self) -> None:
         """Delete every temp file this graph created. Safe to call repeatedly."""
@@ -247,15 +374,141 @@ class GraphResult:
         self.temp_files = []
 
 
-def _register_video_input(clip: Clip, fps: float, input_specs: List[InputSpec]) -> int:
-    """Add clip's ``-i`` input (looped for a still image, seeked for video) and return its index."""
+# Master-bus peak ceiling: alimiter's limit=0.891 is -1 dBFS. amix sums its
+# inputs with normalize=0 (so adding a track never quietly lowers the
+# others), which let two ordinary tracks reach +3.7 dBFS and clip on decode.
+# level=false keeps alimiter from auto-raising the level; latency=true
+# compensates its look-ahead delay so audio stays in sync with the picture.
+MASTER_LIMITER = "alimiter=limit=0.891:level=false:latency=true"
+
+
+def _audio_format_filter(sample_rate: int) -> str:
+    """Per-clip normalization to the project's sample rate and a stereo layout.
+
+    Every clip reaches ``amix`` in the same format, instead of leaving a mix
+    of 44.1 kHz music, 48 kHz camera audio, mono voice-over and 5.1 to
+    amix's own format negotiation.
+    """
+    return f"aresample={sample_rate},aformat=sample_rates={sample_rate}:channel_layouts=stereo"
+
+
+# Extra seconds of source each seeked input may decode past what its trim
+# filter keeps (``-t`` on the input). Only a safety margin: the exact cut is
+# still made by the ``trim``/``atrim`` filters, so frames/samples are never
+# lost to it; it just stops the decoder shortly after the trim point instead
+# of reading the rest of a (possibly hour-long) source file.
+INPUT_DURATION_MARGIN = 0.5
+
+
+@dataclass(frozen=True)
+class _Window:
+    """The span of project time being rendered: ``[start, end)``.
+
+    A full export is ``[0, inf)``. A trimmed export (Trim Range, Shorts cap)
+    renders only its own window: clips outside it are left out of the graph
+    entirely, clips straddling its start are seeked (or trimmed) to it, and
+    every layer is placed relative to ``start`` -- so the last 5 s of a long
+    timeline cost about as much as 5 s, not as much as the whole timeline.
+    """
+
+    start: float = 0.0
+    end: float = math.inf
+
+    def overlaps(self, t0: float, t1: float) -> bool:
+        return t1 > self.start + 1e-6 and t0 < self.end - 1e-6
+
+    def head(self, clip_start: float) -> float:
+        """Clip-local seconds cut from the front of a clip starting at ``clip_start``."""
+        return max(0.0, self.start - clip_start)
+
+    def local_end(self, clip_start: float, clip_duration: float) -> float:
+        """Clip-local time at which the window ends (at most the clip's own duration)."""
+        return min(clip_duration, self.end - clip_start)
+
+
+def _timeline_shift(offset: float) -> str:
+    """Delay a clip-local stream (first frame at PTS 0) to ``offset`` seconds of output time.
+
+    ``setpts`` only relabels the clip's own frames. The previous
+    ``tpad=start_duration=<offset>:color=black@0.0`` generated ``offset * fps``
+    transparent full-canvas frames per clip, each of which ``overlay`` then
+    alpha-blended over the canvas -- cost proportional to the *sum* of every
+    clip's start time, quadratic in clip count for a sequential edit.
+    ``overlay`` (``eof_action=pass``) passes the main input through untouched
+    until the shifted layer's first frame arrives, so the result is frame-for-
+    frame identical (tests/integration verifies this with ``framemd5``).
+    """
+    return f"setpts=PTS+{offset:.3f}/TB"
+
+
+def _video_placement(clip_start: float, head: float, window: _Window, seeked: bool) -> str:
+    """Filters (no leading comma, possibly empty) moving a clip-local video stream into output time.
+
+    ``head > 0`` means the clip starts before the export window. A *seeked*
+    stream (``_register_video_input(..., seek=True)``) already starts at
+    clip-local time ``head`` (see ``_build_video_clip_chain``), so it only
+    needs re-basing to 0; an unseeked one (speed-ramp segments, crossfade
+    pairs) is trimmed to it first.
+    """
+    if head > 0:
+        if seeked:
+            return "setpts=PTS-STARTPTS"
+        return f"trim=start={head:.6f},setpts=PTS-STARTPTS"
+    offset = clip_start - window.start
+    return _timeline_shift(offset) if offset > 0 else ""
+
+
+def _audio_placement(clip_start: float, head: float, window: _Window, seeked: bool) -> str:
+    """Audio counterpart of :func:`_video_placement` (``adelay`` instead of ``setpts``)."""
+    if head > 0:
+        if seeked:
+            return "asetpts=PTS-STARTPTS"
+        return f"atrim=start={head:.6f},asetpts=PTS-STARTPTS"
+    offset = clip_start - window.start
+    return _adelay_filter(offset) if offset > 0 else ""
+
+
+@dataclass
+class _InputSlice:
+    """What one registered clip input actually covers (see ``_register_video_input``)."""
+
+    index: int
+    head: float  # clip-local seconds skipped by seeking the input (0 if not seeked)
+    source_length: float  # source seconds the trim filter keeps
+
+
+def _register_video_input(
+    clip: Clip,
+    fps: float,
+    input_specs: List[InputSpec],
+    window: Optional[_Window] = None,
+) -> _InputSlice:
+    """Add clip's ``-i`` input (looped for a still image, seeked for video).
+
+    With a ``window``, the input is seeked to the first source frame inside
+    it and bounded to the last one; without one (crossfade pairs, which trim
+    after merging instead), it covers the whole clip. Either way ``-t``
+    bounds how much the decoder reads -- it used to decode each source to
+    its end even though the graph kept only the clip's own trim.
+    """
     idx = len(input_specs)
-    if clip.media_type == MediaType.IMAGE:
-        pre_args = ["-loop", "1", "-framerate", str(fps), "-t", f"{clip.source_length:.3f}"]
+    speed = clip.speed if clip.speed > 0 else 1.0
+    head = window.head(clip.timeline_start) if window is not None else 0.0
+    local_end = window.local_end(clip.timeline_start, clip.duration) if window is not None else clip.duration
+    if head <= 0 and local_end >= clip.duration:
+        source_in, source_length = clip.source_in, clip.source_length
     else:
-        pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}"]
+        source_in = clip.source_in + head * speed
+        source_length = max(0.0, (local_end - head) * speed)
+    if clip.media_type == MediaType.IMAGE:
+        pre_args = ["-loop", "1", "-framerate", str(fps), "-t", f"{source_length:.3f}"]
+    else:
+        pre_args = [
+            "-ss", f"{max(0.0, source_in):.3f}",
+            "-t", f"{source_length + INPUT_DURATION_MARGIN:.3f}",
+        ]
     input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
-    return idx
+    return _InputSlice(index=idx, head=head, source_length=source_length)
 
 
 def _build_video_clip_chain(
@@ -266,13 +519,23 @@ def _build_video_clip_chain(
     skip_fade_in: bool = False,
     skip_fade_out: bool = False,
     apply_transform: bool = True,
+    head: float = 0.0,
+    source_length: Optional[float] = None,
+    asset: Optional[MediaAsset] = None,
 ) -> str:
-    """Build a clip's local-time (pre-``tpad``) video filter chain, ending unbracketed.
+    """Build a clip's local-time (pre-placement) video filter chain, ending unbracketed.
 
     Shared by both standalone clips and crossfade pairs — a crossfade needs
-    each side's chain up to (but not including) the timeline-position
-    ``tpad`` step, so the two can be combined with ``xfade`` first and
-    ``tpad``-shifted only once, as a single merged layer.
+    each side's chain up to (but not including) the timeline-placement
+    step, so the two can be combined with ``xfade`` first and shifted into
+    place only once, as a single merged layer.
+
+    ``head``/``source_length`` describe a seeked input (see
+    ``_register_video_input``): the input starts ``head`` clip-local seconds
+    in and holds ``source_length`` source seconds. Its frames are re-stamped
+    to start at clip-local time ``head`` so every clip-local filter below
+    (fades, the opacity-keyframe ``geq``) sees the same times it would for
+    the whole clip.
 
     ``apply_transform=False`` (used only for crossfade-pair sides) skips
     Transform and instead pads the fitted frame to the full canvas size —
@@ -282,47 +545,26 @@ def _build_video_clip_chain(
     than the canvas, which ``xfade`` can't reconcile between two different
     clips. Transform is a documented no-op on a clip while it's crossfading.
     """
+    length = clip.source_length if source_length is None else source_length
     if clip.media_type == MediaType.IMAGE:
         chain = f"[{idx}:v]setpts=PTS-STARTPTS"
     else:
-        chain = f"[{idx}:v]trim=duration={clip.source_length:.3f},setpts=PTS-STARTPTS"
+        chain = f"[{idx}:v]trim=duration={length:.3f},setpts=PTS-STARTPTS"
 
     speed = clip.speed if clip.speed > 0 else 1.0
     if abs(speed - 1.0) > 1e-6:
         chain += f",setpts=PTS/{speed:.6f}"
+    if head > 0:
+        chain += f",setpts=PTS+{head:.6f}/TB"
 
-    # format=yuva420p happens right after the fit/fill step (rather than
-    # after pad, as originally) so alpha exists for every step that
-    # follows, including the now-conditional pad and Transform's rotate.
-    if clip.reframe_mode == ReframeMode.FILL:
-        # Scale to fully COVER the canvas (the opposite of "decrease" below)
-        # and crop the overflow, centered on the clip's crop focus point —
-        # fills a differently-shaped canvas (e.g. 16:9 source into a 9:16
-        # vertical export) with no letterboxing. The cropped frame is
-        # already exactly canvas-sized, so no pad step is needed either way
-        # (`apply_transform` doesn't affect this branch at all) — see
-        # docs/workflows/shorts-export/workflow.md.
-        chain += (
-            f",scale={width}:{height}:force_original_aspect_ratio=increase,format=yuva420p"
-            f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
-            f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
-        )
-    else:
-        # Fit entirely inside the canvas preserving aspect ratio (may leave
-        # black bars, filled in below when this clip isn't Transform-positioned).
-        chain += f",scale={width}:{height}:force_original_aspect_ratio=decrease,format=yuva420p"
-        if not apply_transform:
-            chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-
-    if clip.has_chroma_key:
-        key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
-        chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
-
-    if clip.has_color_correction:
-        chain += (
-            f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
-            f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
-        )
+    # HDR sources are tone-mapped to SDR BT.709 first; then fit/fill
+    # (FILL covers the canvas and crops around the crop focus, see
+    # docs/workflows/shorts-export/workflow.md; FIT is padded to the full
+    # canvas only when not Transform-positioned), ending in yuva420p so alpha
+    # exists for every later step (keying, fades, rotate).
+    chain += _source_color_filters(asset)
+    chain += _fit_or_fill(clip, width, height, pad=not apply_transform, asset=asset)
+    chain += _color_filters(clip)
 
     if apply_transform and clip.reframe_mode != ReframeMode.FILL:
         if abs(clip.transform_scale - 1.0) > 1e-6:
@@ -381,7 +623,8 @@ def _register_speed_ramp_inputs(clip: Clip, input_specs: List[InputSpec]) -> Lis
     segment_specs: List[Tuple[int, float, float, float]] = []
     for seg_in, seg_out, seg_speed in clip.speed_segments:
         idx = len(input_specs)
-        input_specs.append(InputSpec(pre_args=["-ss", f"{max(0.0, seg_in):.3f}"], path=clip.source_path))
+        pre_args = ["-ss", f"{max(0.0, seg_in):.3f}", "-t", f"{(seg_out - seg_in) + INPUT_DURATION_MARGIN:.3f}"]
+        input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
         segment_specs.append((idx, seg_in, seg_out, seg_speed))
     return segment_specs
 
@@ -393,6 +636,7 @@ def _build_speed_ramp_video_chain(
     clip_counter: int,
     filter_lines: List[str],
     input_specs: List[InputSpec],
+    asset: Optional[MediaAsset] = None,
 ) -> Tuple[str, List[Tuple[int, float, float, float]]]:
     """Build a speed-ramped clip's video chain: N segments, each its own
     ``-i``/trim/setpts at that segment's speed, concatenated together.
@@ -419,26 +663,9 @@ def _build_speed_ramp_video_chain(
         seg_chain = f"[{idx}:v]trim=duration={(seg_out - seg_in):.3f},setpts=PTS-STARTPTS"
         if abs(seg_speed - 1.0) > 1e-6:
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
-        if clip.reframe_mode == ReframeMode.FILL:
-            seg_chain += (
-                f",scale={width}:{height}:force_original_aspect_ratio=increase,format=yuva420p"
-                f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
-                f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
-            )
-        else:
-            seg_chain += (
-                f",scale={width}:{height}:force_original_aspect_ratio=decrease"
-                f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-                ",format=yuva420p"
-            )
-        if clip.has_chroma_key:
-            key_color = clip.chroma_key_color.lstrip("#") or "00FF00"
-            seg_chain += f",colorkey=0x{key_color}:{clip.chroma_key_similarity:.3f}:{clip.chroma_key_blend:.3f}"
-        if clip.has_color_correction:
-            seg_chain += (
-                f",eq=brightness={clip.brightness:.3f}:contrast={clip.contrast:.3f}"
-                f":saturation={clip.saturation:.3f}:gamma={clip.gamma:.3f}"
-            )
+        seg_chain += _source_color_filters(asset)
+        seg_chain += _fit_or_fill(clip, width, height, pad=True, asset=asset)
+        seg_chain += _color_filters(clip)
 
         label = f"sr{clip_counter}v{i}"
         filter_lines.append(f"{seg_chain}[{label}]")
@@ -461,17 +688,21 @@ def _maybe_add_speed_ramped_audio(
     filter_lines: List[str],
     audio_labels: List[str],
     probe_cache: Dict[str, bool],
+    window: _Window = _Window(),
+    sample_rate: int = 48000,
 ) -> None:
     """Speed-ramped-clip counterpart to ``_maybe_add_audio``.
 
     Builds one ``atempo``-adjusted audio segment per video segment (reusing
     each segment's already-registered ``-i`` input, see
     ``_build_speed_ramp_video_chain``), concatenates them, then applies
-    fade/volume/timeline-delay once to the whole result — identical
+    fade/volume/placement once to the whole result — identical
     end-to-end behavior to ``_build_audio_chain``, just fed by N segments
-    instead of one continuous stream.
+    instead of one continuous stream. Segment inputs aren't seeked to an
+    export window, so a clip straddling the window's start is trimmed after
+    the fades instead (``_audio_placement(..., seeked=False)``).
     """
-    if clip.muted or clip.volume <= 0:
+    if clip.is_silent:
         return
     if not _clip_has_audio(project, clip, probe_cache):
         return
@@ -493,26 +724,22 @@ def _maybe_add_speed_ramped_audio(
     else:
         base_label = seg_labels[0]
 
-    tail = ""
+    tail = f",{_audio_format_filter(sample_rate)}"
     if clip.has_denoise:
         tail += f",afftdn=nr={clip.denoise_strength:.3f}"
     clip_len = clip.duration
     if clip.fade_in > 0:
-        tail += f",afade=t=in:st=0:d={clip.fade_in:.3f}"
+        tail += "," + _afade("in", 0.0, clip.fade_in)
     if clip.fade_out > 0:
-        fade_start = max(0.0, clip_len - clip.fade_out)
-        tail += f",afade=t=out:st={fade_start:.3f}:d={clip.fade_out:.3f}"
-    if abs(clip.volume - 1.0) > 1e-6:
-        tail += f",volume={clip.volume:.3f}"
-    if clip.timeline_start > 0:
-        tail += f",{_adelay_filter(clip.timeline_start)}"
+        tail += "," + _afade("out", max(0.0, clip_len - clip.fade_out), clip.fade_out)
+    tail += _volume_filter(clip)
+    placement = _audio_placement(clip.timeline_start, window.head(clip.timeline_start), window, seeked=False)
+    if placement:
+        tail += f",{placement}"
 
-    if tail:
-        final_label = f"sr{counter}af"
-        filter_lines.append(f"[{base_label}]{tail.lstrip(',')}[{final_label}]")
-        audio_labels.append(final_label)
-    else:
-        audio_labels.append(base_label)
+    final_label = f"sr{counter}af"
+    filter_lines.append(f"[{base_label}]{tail.lstrip(',')}[{final_label}]")
+    audio_labels.append(final_label)
 
 
 def _crossfade_duration(clip: Clip, next_clip: Clip) -> float:
@@ -547,6 +774,27 @@ def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
     if nxt.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
         return None
     if len(nxt.speed_keyframes) >= 2:
+        return None
+    if abs(nxt.timeline_start - clip.timeline_end) > 0.02:
+        return None
+    if _crossfade_duration(clip, nxt) <= MIN_CROSSFADE_SECONDS:
+        return None
+    return i + 1
+
+
+def _find_audio_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
+    """Audio-track counterpart of :func:`_find_crossfade_partner`.
+
+    Two adjacent audio clips (no gap) where the first has a transition out
+    crossfade with an equal-power curve over the transition duration. As
+    with video transitions, the second clip starts ``d`` seconds early so the
+    two overlap; nothing after it on the track moves.
+    """
+    clip = clips[i]
+    if not clip.has_transition or i + 1 >= len(clips):
+        return None
+    nxt = clips[i + 1]
+    if nxt.media_type != MediaType.AUDIO:
         return None
     if abs(nxt.timeline_start - clip.timeline_end) > 0.02:
         return None
@@ -629,16 +877,26 @@ def build_filter_graph(
     settings: ProjectSettings,
     reframe_override: Optional[ReframeMode] = None,
     trim_range: Optional[Tuple[float, Optional[float]]] = None,
+    audio_only: bool = False,
+    video_only: bool = False,
 ) -> GraphResult:
     """Construct the full FFmpeg input list + filter graph for ``project``.
+
+    ``audio_only`` builds the same audio mix with no picture layers or text
+    (the video output is just the black base) -- used for the loudness
+    measurement pass, which would otherwise pay for a full video render.
+    ``video_only`` is the reverse (the audio output is silence), used for
+    rendering single preview frames (core/frame_render.py).
 
     ``reframe_override``, when given, forces every video/image clip's
     reframe mode for this export only (see ``_project_with_reframe_override``)
     — used by the "auto-fill vertical frame" Shorts option so it doesn't have
-    to be set per-clip. ``trim_range`` (start, end), when given, cuts the
-    final composited output down to that range (end defaults to the
-    project's total duration when ``None``) — used for the Shorts duration
-    cap and general export-range trimming.
+    to be set per-clip. ``trim_range`` (start, end), when given, renders only
+    that span of the timeline (end defaults to the project's total duration
+    when ``None``) — used for the Shorts duration cap and general
+    export-range trimming. The graph is built for the window itself (see
+    :class:`_Window`) rather than rendering the whole timeline and trimming
+    the result, so the cost of a range export follows the range's length.
     """
 
     if reframe_override is not None:
@@ -646,6 +904,18 @@ def build_filter_graph(
 
     duration = max(project.total_duration, 0.1)
     width, height, fps = settings.width, settings.height, settings.fps
+    sample_rate = settings.sample_rate or 48000
+
+    window = _Window()
+    out_duration = duration
+    if trim_range is not None:
+        trim_start, trim_end = trim_range
+        trim_start = max(0.0, trim_start)
+        trim_end = duration if trim_end is None else min(trim_end, duration)
+        if trim_end > trim_start:
+            window = _Window(trim_start, trim_end)
+            out_duration = trim_end - trim_start
+    is_windowed = window.end != math.inf
 
     input_specs: List[InputSpec] = []
     filter_lines: List[str] = []
@@ -660,16 +930,18 @@ def build_filter_graph(
     text_clips: List[Clip] = []
     temp_files: List[str] = []
 
-    # Base canvas: solid black, full project duration.
+    # Base canvas: solid black, as long as the rendered output. Every layer
+    # is composited onto it with eof_action=pass, so it also bounds the
+    # video's length (a clip running past a trim window's end is cut here).
     filter_lines.append(
-        f"color=c=black:s={width}x{height}:d={duration:.3f}:rate={fps}[base]"
+        f"color=c=black:s={width}x{height}:d={out_duration:.3f}:rate={fps_expr(fps)}[base]"
     )
 
     video_tracks = [t for t in project.tracks if t.track_type == TrackType.VIDEO]
     audio_tracks = [t for t in project.tracks if t.track_type == TrackType.AUDIO]
 
     clip_counter = 0
-    probe_cache: Dict[str, bool] = {}
+    probe_cache = _ProbeCache()
 
     # ---- Video tracks (bottom to top = list order) ----
     # A track's `hidden` flag removes its *picture* (video layers and text
@@ -679,8 +951,8 @@ def build_filter_graph(
     # its audio too, and `muted` was ignored entirely for a video track's own
     # embedded audio.)
     for track_order, track in enumerate(video_tracks):
-        render_video = not track.hidden
-        render_audio = not track.muted
+        render_video = not track.hidden and not audio_only
+        render_audio = not track.muted and not video_only
         if not render_video and not render_audio:
             continue
         sorted_clips = track.sorted_clips()
@@ -690,7 +962,7 @@ def build_filter_graph(
             if i in consumed_as_partner:
                 continue
             if clip.media_type == MediaType.TEXT:
-                if render_video:
+                if render_video and window.overlaps(clip.timeline_start, clip.timeline_end):
                     text_clips.append(clip)
                 continue
             if clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
@@ -698,52 +970,69 @@ def build_filter_graph(
 
             partner_i = _find_crossfade_partner(sorted_clips, i)
 
+            if partner_i is None and not window.overlaps(clip.timeline_start, clip.timeline_end):
+                clip_counter += 1  # outside the export window: not in the graph at all
+                continue
+
             if partner_i is None and len(clip.speed_keyframes) >= 2:
                 # Speed ramp: N segments concatenated, rather than one -i +
                 # one chain. Transform's scale/rotation doesn't apply here
                 # (see _build_speed_ramp_video_chain's docstring); position
                 # (static or keyframed) still does, since that's resolved
                 # separately at the compositing/overlay step below.
+                head = window.head(clip.timeline_start)
                 if render_video:
                     body_label, segment_specs = _build_speed_ramp_video_chain(
-                        clip, width, height, clip_counter, filter_lines, input_specs
+                        clip, width, height, clip_counter, filter_lines, input_specs,
+                        asset=project.asset_for_clip(clip),
                     )
-                    suffix = _video_fade_and_opacity_suffix(clip)
-                    if suffix:
-                        faded_label = f"sr{clip_counter}f"
-                        filter_lines.append(f"[{body_label}]{suffix.lstrip(',')}[{faded_label}]")
-                        body_label = faded_label
-                    if clip.timeline_start > 0:
-                        tpad_label = f"v{clip_counter}"
-                        filter_lines.append(
-                            f"[{body_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{tpad_label}]"
-                        )
-                        body_label = tpad_label
-                    video_layer_labels.append((track_order, clip.timeline_start, body_label, _position_expr(clip)))
+                    suffix = _video_fade_and_opacity_suffix(clip).lstrip(",")
+                    placement = _video_placement(clip.timeline_start, head, window, seeked=False)
+                    tail = ",".join(part for part in (suffix, placement) if part)
+                    if tail:
+                        placed_label = f"v{clip_counter}"
+                        filter_lines.append(f"[{body_label}]{tail}[{placed_label}]")
+                        body_label = placed_label
+                    video_layer_labels.append(
+                        (track_order, clip.timeline_start, body_label, _position_expr(clip, window.start))
+                    )
                 elif _clip_is_audible(project, clip, probe_cache):
                     segment_specs = _register_speed_ramp_inputs(clip, input_specs)
                 else:
                     segment_specs = []
                 if render_audio and segment_specs:
                     _before = len(audio_labels)
-                    _maybe_add_speed_ramped_audio(project, clip, segment_specs, clip_counter, filter_lines, audio_labels, probe_cache)
+                    _maybe_add_speed_ramped_audio(
+                        project, clip, segment_specs, clip_counter, filter_lines, audio_labels, probe_cache, window,
+                        sample_rate,
+                    )
                     audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             elif partner_i is None:
-                idx: Optional[int] = None
+                source: Optional[_InputSlice] = None
                 if render_video:
-                    idx = _register_video_input(clip, fps, input_specs)
-                    chain = _build_video_clip_chain(idx, clip, width, height)
-                    if clip.timeline_start > 0:
-                        chain += f",tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0"
+                    source = _register_video_input(clip, fps, input_specs, window)
+                    chain = _build_video_clip_chain(
+                        source.index, clip, width, height, head=source.head, source_length=source.source_length,
+                        asset=project.asset_for_clip(clip),
+                    )
+                    placement = _video_placement(clip.timeline_start, source.head, window, seeked=True)
+                    if placement:
+                        chain += f",{placement}"
                     label = f"v{clip_counter}"
                     filter_lines.append(f"{chain}[{label}]")
-                    video_layer_labels.append((track_order, clip.timeline_start, label, _position_expr(clip)))
+                    video_layer_labels.append(
+                        (track_order, clip.timeline_start, label, _position_expr(clip, window.start))
+                    )
                 if render_audio and _clip_is_audible(project, clip, probe_cache):
-                    if idx is None:
-                        idx = _register_video_input(clip, fps, input_specs)
+                    if source is None:
+                        source = _register_video_input(clip, fps, input_specs, window)
                     _before = len(audio_labels)
-                    _maybe_add_audio(project, clip, idx, filter_lines, audio_labels, clip_counter, probe_cache)
+                    _maybe_add_audio(
+                        project, clip, source.index, filter_lines, audio_labels, clip_counter, probe_cache,
+                        window=window, head=source.head, source_length=source.source_length, seeked=True,
+                        sample_rate=sample_rate,
+                    )
                     audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
             else:
@@ -753,6 +1042,16 @@ def build_filter_graph(
                 partner = sorted_clips[partner_i]
                 d = _crossfade_duration(clip, partner)
                 offset = max(0.0, clip.duration - d)
+                consumed_as_partner.add(partner_i)
+                pair_end = clip.timeline_start + offset + partner.duration
+                if not window.overlaps(clip.timeline_start, pair_end):
+                    clip_counter += 2  # whole pair outside the export window
+                    continue
+                # The merged layer is trimmed to the window after xfade (the
+                # pair's inputs aren't seeked), so a window starting mid-pair
+                # still decodes the pair from its start -- bounded by the
+                # pair's own length, not the timeline's.
+                head = window.head(clip.timeline_start)
 
                 idx_a: Optional[int] = None
                 idx_b: Optional[int] = None
@@ -764,15 +1063,21 @@ def build_filter_graph(
                     # feeding into it. Standalone clips don't need this: overlay
                     # has no such requirement, and the exporter's -r already
                     # fixes the final output rate.
-                    idx_a = _register_video_input(clip, fps, input_specs)
+                    idx_a = _register_video_input(clip, fps, input_specs).index
                     chain_a = (
-                        _build_video_clip_chain(idx_a, clip, width, height, skip_fade_out=True, apply_transform=False)
-                        + f",fps={fps}"
+                        _build_video_clip_chain(
+                            idx_a, clip, width, height, skip_fade_out=True, apply_transform=False,
+                            asset=project.asset_for_clip(clip),
+                        )
+                        + f",fps={fps_expr(fps)}"
                     )
-                    idx_b = _register_video_input(partner, fps, input_specs)
+                    idx_b = _register_video_input(partner, fps, input_specs).index
                     chain_b = (
-                        _build_video_clip_chain(idx_b, partner, width, height, skip_fade_in=True, apply_transform=False)
-                        + f",fps={fps}"
+                        _build_video_clip_chain(
+                            idx_b, partner, width, height, skip_fade_in=True, apply_transform=False,
+                            asset=project.asset_for_clip(partner),
+                        )
+                        + f",fps={fps_expr(fps)}"
                     )
 
                     label_a = f"xf{clip_counter}a"
@@ -786,13 +1091,11 @@ def build_filter_graph(
                         f"[{label_a}][{label_b}]xfade=transition={xfade_name}:duration={d:.3f}:offset={offset:.3f}[{merged_label}]"
                     )
 
-                    final_label = f"v{clip_counter}"
-                    if clip.timeline_start > 0:
-                        filter_lines.append(
-                            f"[{merged_label}]tpad=start_duration={clip.timeline_start:.3f}:color=black@0.0[{final_label}]"
-                        )
-                    else:
-                        final_label = merged_label
+                    final_label = merged_label
+                    placement = _video_placement(clip.timeline_start, head, window, seeked=False)
+                    if placement:
+                        final_label = f"v{clip_counter}"
+                        filter_lines.append(f"[{merged_label}]{placement}[{final_label}]")
                     # Transform/position-keyframes don't apply mid-crossfade (see
                     # _build_video_clip_chain's docstring) — the merged output is
                     # always full-canvas, so center it same as the old behavior.
@@ -805,16 +1108,23 @@ def build_filter_graph(
                 _before = len(audio_labels)
                 if render_audio and _clip_is_audible(project, audio_a, probe_cache):
                     if idx_a is None:
-                        idx_a = _register_video_input(clip, fps, input_specs)
-                    _maybe_add_audio(project, audio_a, idx_a, filter_lines, audio_labels, clip_counter, probe_cache)
+                        idx_a = _register_video_input(clip, fps, input_specs).index
+                    _maybe_add_audio(
+                        project, audio_a, idx_a, filter_lines, audio_labels, clip_counter, probe_cache,
+                        window=window, head=window.head(audio_a.timeline_start), seeked=False,
+                        sample_rate=sample_rate, curve_out="qsin",
+                    )
                 clip_counter += 1
                 if render_audio and _clip_is_audible(project, audio_b, probe_cache):
                     if idx_b is None:
-                        idx_b = _register_video_input(partner, fps, input_specs)
-                    _maybe_add_audio(project, audio_b, idx_b, filter_lines, audio_labels, clip_counter, probe_cache)
+                        idx_b = _register_video_input(partner, fps, input_specs).index
+                    _maybe_add_audio(
+                        project, audio_b, idx_b, filter_lines, audio_labels, clip_counter, probe_cache,
+                        window=window, head=window.head(audio_b.timeline_start), seeked=False,
+                        sample_rate=sample_rate, curve_in="qsin",
+                    )
                 clip_counter += 1
                 audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
-                consumed_as_partner.add(partner_i)
 
     # ---- Composite video layers onto the base canvas, bottom to top ----
     # Position is expressed relative to the *canvas* (main_w/main_h) and the
@@ -841,33 +1151,67 @@ def build_filter_graph(
         out_label = f"text{i}"
         text_path = _write_text_file(style.content)
         temp_files.append(text_path)
-        x_expr = f"(w-text_w)*{style.position_x:.3f}"
-        y_expr = f"(h-text_h)*{style.position_y:.3f}"
-        weight = ":bold=1" if style.bold else ""
-        draw = (
-            f"[{current}]drawtext=textfile={_escape_filter_value(text_path.replace(os.sep, '/'))}:expansion=none"
-            f":fontcolor={style.color}:fontsize={style.font_size}"
-            f":bordercolor={style.outline_color}:borderw={style.outline_width}"
-            f":x={x_expr}:y={y_expr}"
-            f":enable='between(t,{clip.timeline_start:.3f},{clip.timeline_end:.3f})'"
-            f"[{out_label}]"
+        filter_lines.append(
+            f"[{current}]{_drawtext_filter(style, text_path, clip, window, height)}[{out_label}]"
         )
-        filter_lines.append(draw)
         current = out_label
 
     video_out_label = current
 
     # ---- Audio tracks ----
     for track in audio_tracks:
-        if track.muted:
+        if track.muted or video_only:
             continue
-        for clip in track.sorted_clips():
-            if clip.media_type != MediaType.AUDIO or clip.muted or clip.volume <= 0:
+        audio_clips = [c for c in track.sorted_clips() if c.media_type == MediaType.AUDIO]
+        crossfade_sides: Dict[int, Tuple[Clip, str, str]] = {}  # index -> (timing stand-in, curve_in, curve_out)
+        for i in range(len(audio_clips)):
+            partner_i = _find_audio_crossfade_partner(audio_clips, i)
+            if partner_i is None or i in crossfade_sides:
                 continue
+            first, second = audio_clips[i], audio_clips[partner_i]
+            d = _crossfade_duration(first, second)
+            side_a, side_b = _crossfade_audio_clips(first, second, d, max(0.0, first.duration - d))
+            curve_in_a = crossfade_sides.get(i, (None, "", ""))[1]
+            crossfade_sides[i] = (side_a, curve_in_a, "qsin")
+            crossfade_sides[partner_i] = (side_b, "qsin", "")
+        for i, original in enumerate(audio_clips):
+            clip, curve_in, curve_out = crossfade_sides.get(i, (original, "", ""))
+            if clip.is_silent:
+                continue
+            if not window.overlaps(clip.timeline_start, clip.timeline_end):
+                continue
+            if i in crossfade_sides:
+                # A crossfade side starts earlier than its own timeline_start (or
+                # ends in a fade it didn't have): read it whole, trim to the window after.
+                idx = len(input_specs)
+                pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}",
+                            "-t", f"{clip.source_length + INPUT_DURATION_MARGIN:.3f}"]
+                input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
+                label = _build_audio_chain(
+                    idx, clip, filter_lines, clip_counter, window=window,
+                    head=window.head(clip.timeline_start), seeked=False, sample_rate=sample_rate,
+                    curve_in=curve_in, curve_out=curve_out,
+                )
+                audio_labels.append(label)
+                audio_labels_by_track.setdefault(track.id, []).append(label)
+                clip_counter += 1
+                continue
+            speed = clip.speed if clip.speed > 0 else 1.0
+            head = window.head(clip.timeline_start)
+            local_end = window.local_end(clip.timeline_start, clip.duration)
+            if head <= 0 and local_end >= clip.duration:
+                source_in, source_length = clip.source_in, clip.source_length
+            else:
+                source_in = clip.source_in + head * speed
+                source_length = max(0.0, (local_end - head) * speed)
             idx = len(input_specs)
-            pre_args = ["-ss", f"{max(0.0, clip.source_in):.3f}"]
+            pre_args = ["-ss", f"{max(0.0, source_in):.3f}", "-t", f"{source_length + INPUT_DURATION_MARGIN:.3f}"]
             input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
-            label = _build_audio_chain(idx, clip, filter_lines, clip_counter)
+            label = _build_audio_chain(
+                idx, clip, filter_lines, clip_counter,
+                window=window, head=head, source_length=source_length, seeked=True,
+                sample_rate=sample_rate,
+            )
             audio_labels.append(label)
             audio_labels_by_track.setdefault(track.id, []).append(label)
             clip_counter += 1
@@ -880,34 +1224,21 @@ def build_filter_graph(
     _apply_audio_ducking(project, filter_lines, audio_labels, audio_labels_by_track)
 
     has_audio = bool(audio_labels)
+    has_audible_clips = has_audio
     if has_audio:
         joined = "".join(f"[{lbl}]" for lbl in audio_labels)
+        # A clip running past a trim window's end (crossfade/speed-ramp
+        # audio isn't cut at the window's end) mustn't outlast the video.
+        bound = f",atrim=duration={out_duration:.3f}" if is_windowed else ""
         filter_lines.append(
-            f"{joined}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0:normalize=0[aout]"
+            f"{joined}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0:normalize=0"
+            f",{MASTER_LIMITER}{bound}[aout]"
         )
         audio_out_label = "aout"
     else:
-        filter_lines.append(f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration:.3f}[aout]")
+        filter_lines.append(f"anullsrc=channel_layout=stereo:sample_rate={sample_rate}:d={out_duration:.3f}[aout]")
         audio_out_label = "aout"
         has_audio = True  # we always emit a (possibly silent) audio track
-
-    if trim_range is not None:
-        trim_start, trim_end = trim_range
-        trim_start = max(0.0, trim_start)
-        trim_end = duration if trim_end is None else min(trim_end, duration)
-        if trim_end > trim_start:
-            trimmed_video = "trimout_v"
-            trimmed_audio = "trimout_a"
-            filter_lines.append(
-                f"[{video_out_label}]trim=start={trim_start:.3f}:end={trim_end:.3f},"
-                f"setpts=PTS-STARTPTS[{trimmed_video}]"
-            )
-            filter_lines.append(
-                f"[{audio_out_label}]atrim=start={trim_start:.3f}:end={trim_end:.3f},"
-                f"asetpts=PTS-STARTPTS[{trimmed_audio}]"
-            )
-            video_out_label = trimmed_video
-            audio_out_label = trimmed_audio
 
     filter_complex = ";".join(filter_lines)
 
@@ -918,7 +1249,56 @@ def build_filter_graph(
         audio_out_label=audio_out_label,
         has_audio=has_audio,
         temp_files=temp_files,
+        has_audible_clips=has_audible_clips,
+        warnings=list(probe_cache.warnings),
     )
+
+
+# drawtext text_align flag per TextStyle.alignment.
+_TEXT_ALIGN_FLAGS = {"left": "L", "center": "C", "right": "R"}
+
+# TextStyle sizes (font size, outline width, shadow offset, box padding) are
+# "pixels at 1080p": scaled by output height / REFERENCE_TEXT_HEIGHT so a
+# title covers the same share of the frame at 720p, 1080p, 4K or vertical.
+REFERENCE_TEXT_HEIGHT = 1080
+
+
+def _scaled_text_px(value: float, height: int, minimum: int = 0) -> int:
+    return max(minimum, int(round(value * height / REFERENCE_TEXT_HEIGHT)))
+
+
+def _drawtext_filter(style, text_path: str, clip: Clip, window: _Window, height: int) -> str:
+    """One text overlay's ``drawtext`` filter (unbracketed), enabled over the clip's span of output time.
+
+    The box position (``position_x``/``position_y``) keeps its long-standing
+    meaning: 0 = flush left/top, 1 = flush right/bottom of the frame.
+    ``alignment`` aligns lines *within* the text block (``text_align``), so
+    single-line titles in existing projects don't move.
+    """
+    from core.fonts import resolve_font_file
+
+    x_expr = f"(w-text_w)*{style.position_x:.3f}"
+    y_expr = f"(h-text_h)*{style.position_y:.3f}"
+    start = clip.timeline_start - window.start
+    end = clip.timeline_end - window.start
+    parts = [f"drawtext=textfile={_escape_filter_value(text_path.replace(os.sep, '/'))}:expansion=none"]
+    font_file = resolve_font_file(style.font_family, style.bold, style.italic)
+    if font_file:
+        parts.append(f":fontfile={_escape_filter_value(font_file.replace(os.sep, '/'))}")
+    parts.append(f":fontcolor={style.color}:fontsize={_scaled_text_px(style.font_size, height, 1)}")
+    parts.append(f":bordercolor={style.outline_color}:borderw={_scaled_text_px(style.outline_width, height)}")
+    parts.append(f":text_align={_TEXT_ALIGN_FLAGS.get(style.alignment, 'C')}")
+    if style.shadow_enabled:
+        offset = _scaled_text_px(style.shadow_offset, height)
+        parts.append(f":shadowcolor={style.shadow_color}:shadowx={offset}:shadowy={offset}")
+    if style.box_enabled:
+        opacity = max(0.0, min(1.0, style.box_opacity))
+        parts.append(
+            f":box=1:boxcolor={style.box_color}@{opacity:.2f}:boxborderw={_scaled_text_px(style.box_padding, height)}"
+        )
+    parts.append(f":x={x_expr}:y={y_expr}")
+    parts.append(f":enable='between(t,{start:.3f},{end:.3f})'")
+    return "".join(parts)
 
 
 def _maybe_add_audio(
@@ -929,16 +1309,30 @@ def _maybe_add_audio(
     audio_labels: List[str],
     counter: int,
     probe_cache: Dict[str, bool],
+    window: "_Window" = _Window(),
+    head: float = 0.0,
+    source_length: Optional[float] = None,
+    seeked: bool = True,
+    sample_rate: int = 48000,
+    curve_in: str = "",
+    curve_out: str = "",
 ) -> None:
     """Append clip's audio chain to ``audio_labels`` if it's actually audible.
 
     Shared by every place a video/image clip's own audio needs handling
     (standalone clips and both sides of a crossfade pair) so the has-audio /
-    muted / volume checks can't drift out of sync between them.
+    muted / volume checks can't drift out of sync between them. The window
+    arguments are passed through to :func:`_build_audio_chain`.
     """
     if not _clip_is_audible(project, clip, probe_cache):
         return
-    audio_labels.append(_build_audio_chain(input_index, clip, filter_lines, counter))
+    audio_labels.append(
+        _build_audio_chain(
+            input_index, clip, filter_lines, counter,
+            window=window, head=head, source_length=source_length, seeked=seeked,
+            sample_rate=sample_rate, curve_in=curve_in, curve_out=curve_out,
+        )
+    )
 
 
 def _clip_is_audible(project: Project, clip: Clip, probe_cache: Dict[str, bool]) -> bool:
@@ -951,7 +1345,7 @@ def _clip_is_audible(project: Project, clip: Clip, probe_cache: Dict[str, bool])
     """
     if clip.media_type == MediaType.IMAGE:
         return False
-    if clip.muted or clip.volume <= 0:
+    if clip.is_silent:
         return False
     return _clip_has_audio(project, clip, probe_cache)
 
@@ -984,9 +1378,28 @@ def _build_audio_chain(
     clip: Clip,
     filter_lines: List[str],
     counter: int,
+    window: _Window = _Window(),
+    head: float = 0.0,
+    source_length: Optional[float] = None,
+    seeked: bool = True,
+    sample_rate: int = 48000,
+    curve_in: str = "",
+    curve_out: str = "",
 ) -> str:
+    """A clip's audio chain, placed on the output timeline, ending in ``[a<counter>]``.
+
+    ``curve_in``/``curve_out`` set the fade curve of a crossfade side's
+    fade (``qsin``, equal power); ordinary fades stay linear.
+
+    ``seeked=True`` means the input was already seeked ``head`` clip-local
+    seconds past the clip's start (and holds ``source_length`` source
+    seconds); its samples are re-stamped to clip-local time so the fades
+    below land where they would for the whole clip. ``seeked=False`` inputs
+    start at the clip's own start and are trimmed by ``head`` afterwards.
+    """
     label = f"a{counter}"
-    chain = f"[{input_index}:a]atrim=duration={clip.source_length:.3f},asetpts=PTS-STARTPTS"
+    length = clip.source_length if source_length is None or not seeked else source_length
+    chain = f"[{input_index}:a]atrim=duration={length:.3f},asetpts=PTS-STARTPTS,{_audio_format_filter(sample_rate)}"
 
     speed = clip.speed if clip.speed > 0 else 1.0
     if abs(speed - 1.0) > 1e-6:
@@ -998,21 +1411,23 @@ def _build_audio_chain(
     if clip.has_denoise:
         chain += f",afftdn=nr={clip.denoise_strength:.3f}"
 
+    if seeked and head > 0:
+        chain += f",asetpts=PTS+{head:.6f}/TB"
+
     # Fade in/out apply to a clip's audio too, not just its video alpha —
     # otherwise the Properties panel's Fade sliders silently do nothing for
     # an audio-only clip (and don't duck a video clip's own audio either).
     clip_len = clip.duration
     if clip.fade_in > 0:
-        chain += f",afade=t=in:st=0:d={clip.fade_in:.3f}"
+        chain += "," + _afade("in", 0.0, clip.fade_in, curve_in)
     if clip.fade_out > 0:
-        fade_start = max(0.0, clip_len - clip.fade_out)
-        chain += f",afade=t=out:st={fade_start:.3f}:d={clip.fade_out:.3f}"
+        chain += "," + _afade("out", max(0.0, clip_len - clip.fade_out), clip.fade_out, curve_out)
 
-    if abs(clip.volume - 1.0) > 1e-6:
-        chain += f",volume={clip.volume:.3f}"
+    chain += _volume_filter(clip)
 
-    if clip.timeline_start > 0:
-        chain += f",{_adelay_filter(clip.timeline_start)}"
+    placement = _audio_placement(clip.timeline_start, head, window, seeked)
+    if placement:
+        chain += f",{placement}"
 
     filter_lines.append(f"{chain}[{label}]")
     return label

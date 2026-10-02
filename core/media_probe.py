@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
 from typing import Optional
 
 from core.ffmpeg_utils import find_binary, run
@@ -13,6 +15,9 @@ from core.media_asset import MediaAsset
 # Extensions ffprobe would otherwise report as a single-frame "video" stream
 # (still images have no true duration/audio) — treated as images instead.
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+
+PROBE_TIMEOUT_S = 30.0
+THUMBNAIL_TIMEOUT_S = 30.0
 
 
 class MediaProbeError(Exception):
@@ -47,7 +52,12 @@ def probe_file(path: str) -> MediaAsset:
         "-show_streams",
         path,
     ]
-    result = run(args)
+    try:
+        result = run(args, timeout=PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise MediaProbeError(
+            f"ffprobe did not finish within {PROBE_TIMEOUT_S:.0f} s (damaged file or slow drive?)."
+        ) from exc
     if result.returncode != 0 or not result.stdout:
         detail = (result.stderr or "").strip().splitlines()
         raise MediaProbeError(
@@ -75,6 +85,7 @@ def probe_file(path: str) -> MediaAsset:
             asset.codec = stream.get("codec_name", "")
             rate = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"
             asset.fps = _parse_fraction(rate)
+            _read_color_description(asset, stream)
             if asset.duration == 0.0:
                 try:
                     asset.duration = float(stream.get("duration", 0.0))
@@ -102,6 +113,28 @@ def probe_file(path: str) -> MediaAsset:
     return asset
 
 
+def _read_color_description(asset: MediaAsset, stream: dict) -> None:
+    """Fill the asset's pixel format, bit depth and colour tags from an ffprobe video stream."""
+    asset.pix_fmt = stream.get("pix_fmt", "") or ""
+    raw_depth = stream.get("bits_per_raw_sample")
+    try:
+        asset.bit_depth = int(raw_depth) if raw_depth else bit_depth_of(asset.pix_fmt)
+    except (TypeError, ValueError):
+        asset.bit_depth = bit_depth_of(asset.pix_fmt)
+    asset.color_transfer = stream.get("color_transfer", "") or ""
+    asset.color_primaries = stream.get("color_primaries", "") or ""
+    asset.color_space = stream.get("color_space", "") or ""
+    asset.color_range = stream.get("color_range", "") or ""
+
+
+def bit_depth_of(pix_fmt: str) -> int:
+    """Bit depth implied by an FFmpeg pixel format name (``yuv420p10le`` -> 10, ``p010le`` -> 10)."""
+    match = re.search(r"p(\d{2})(le|be)$", pix_fmt or "")
+    if match:
+        return int(match.group(1))
+    return 10 if (pix_fmt or "").startswith("p010") else 8
+
+
 def _parse_fraction(value: str) -> float:
     try:
         if "/" in value:
@@ -111,6 +144,13 @@ def _parse_fraction(value: str) -> float:
         return float(value)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def safe_thumbnail_time(duration: float, preferred: float = 1.0) -> float:
+    """A thumbnail timestamp inside the source (``-ss 1`` past the end of a sub-second clip gave no frame)."""
+    if duration and duration > 0:
+        return min(preferred, duration / 2.0)
+    return preferred
 
 
 def generate_thumbnail(path: str, cache_dir: str, timestamp: float = 1.0) -> Optional[str]:
@@ -145,7 +185,10 @@ def generate_thumbnail(path: str, cache_dir: str, timestamp: float = 1.0) -> Opt
         args += ["-ss", str(max(0.0, timestamp))]
     args += ["-i", path, "-frames:v", "1", "-vf", "scale=320:-1", out_path]
 
-    result = run(args)
+    try:
+        result = run(args, timeout=THUMBNAIL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0 or not os.path.exists(out_path):
         return None
     return out_path

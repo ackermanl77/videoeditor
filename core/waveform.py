@@ -16,6 +16,7 @@ import array
 import hashlib
 import json
 import os
+import subprocess
 from typing import List, Optional, Tuple
 
 from core.ffmpeg_utils import find_binary, run_binary
@@ -36,7 +37,12 @@ def _cache_path(path: str, cache_dir: str) -> str:
     return os.path.join(cache_dir, f"{key}.waveform.json")
 
 
-def generate_waveform(path: str, cache_dir: str) -> Optional[str]:
+def waveform_timeout(duration: float) -> float:
+    """Decode budget: 60 s plus 1 s per 20 s of audio (decoding to 4 kHz mono runs far faster)."""
+    return 60.0 + max(0.0, duration or 0.0) / 20.0
+
+
+def generate_waveform(path: str, cache_dir: str, duration: float = 0.0) -> Optional[str]:
     """Extract and cache peak amplitude data for ``path``'s audio track.
 
     Returns the cache file's path on success, or ``None`` if FFmpeg is
@@ -65,7 +71,10 @@ def generate_waveform(path: str, cache_dir: str) -> Optional[str]:
         "-acodec", "pcm_s16le",
         "pipe:1",
     ]
-    result = run_binary(args)
+    try:
+        result = run_binary(args, timeout=waveform_timeout(duration))
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0 or not result.stdout:
         return None
 

@@ -21,7 +21,7 @@ Turning on **every** clip's Fill Frame individually for a one-off vertical expor
 
 ## Duration cap / Trim Range
 
-`build_filter_graph()` also accepts a `trim_range: (start, end)` — when given, the final composited video and audio outputs are wrapped in `trim=start=...:end=...,setpts=PTS-STARTPTS` / `atrim=...,asetpts=PTS-STARTPTS` before being mapped to the output, cutting the rendered file down to that window (an `end` of `None` means "to the project's end"). `ExportSettings.trim_start`/`trim_end` (`core/exporter.py`) carry this through `Exporter.export()`.
+`build_filter_graph()` also accepts a `trim_range: (start, end)` — when given, the graph is built for that window only (clips outside it are left out, straddling clips are seeked to it, everything is placed relative to its start; see [export/workflow.md](../export/workflow.md)), so a 60 s Short cut from a long timeline costs about 60 s of rendering (an `end` of `None` means "to the project's end"). It used to render the whole timeline and trim the result. `ExportSettings.trim_start`/`trim_end` (`core/exporter.py`) carry this through `Exporter.export()`.
 
 In the Export dialog, **Trim Range**'s **Limit duration** checkbox enables Start/End spinboxes (seconds). Selecting a **Shorts Platform** preset with a duration cap (currently YouTube Shorts, 60s) auto-checks it, sets Start to 0, and clamps End's own spinbox *maximum* to the cap — so a manual edit afterward can't exceed it while that platform stays selected, not just a one-time default value.
 
