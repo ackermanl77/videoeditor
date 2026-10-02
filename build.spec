@@ -79,19 +79,17 @@ from version_info import write_version_file  # noqa: E402
 
 version_path = write_version_file(workpath)
 
-# Single-file build: a.binaries/a.zipfiles/a.datas are passed straight into
-# EXE (rather than via COLLECT), which is what makes PyInstaller produce one
-# self-contained VideoEditor.exe under dist/ instead of a dist/VideoEditor/
-# folder. This trades a couple of seconds of startup time (the exe unpacks
-# itself to a temp dir on each launch) for the simplicity of "one file to
-# share" that most end users expect from "an executable".
+# Folder (onedir) build: dist/VideoEditor/VideoEditor.exe plus an _internal/
+# folder, installed by installer/VideoEditor.iss. The earlier one-file exe
+# unpacked ~293 MB (205 MB of it FFmpeg) into %TEMP%\_MEI* on every launch,
+# which took seconds and was left behind whenever the app was killed.
+# Bundled files (FFmpeg included, destination ".") land in _internal/, which
+# is sys._MEIPASS, so core/ffmpeg_utils.py finds them the same way.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="VideoEditor",
     debug=False,
     bootloader_ignore_signals=False,
@@ -100,8 +98,6 @@ exe = EXE(
     # triggers antivirus heuristics and can break CFG-protected DLLs. Explicit,
     # so a machine that happens to have upx on PATH builds the same exe.
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -110,4 +106,15 @@ exe = EXE(
     entitlements_file=None,
     icon=icon_path if os.path.exists(icon_path) else None,
     version=version_path if os.path.exists(version_path) else None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="VideoEditor",
 )

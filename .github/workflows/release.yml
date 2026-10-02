@@ -1,6 +1,7 @@
 name: Release
 
-# Builds VideoEditor.exe and publishes it as a GitHub Release asset -- unlike
+# Builds the app folder and its installer and publishes the installer plus a
+# portable zip of the folder as GitHub Release assets -- unlike
 # a workflow-run artifact, it doesn't expire after 90 days. Note: this only
 # means "download without a GitHub login" on a PUBLIC repo. As long as this
 # repository stays private, downloading a release asset still requires a
@@ -65,27 +66,49 @@ jobs:
       - name: Download and bundle the pinned FFmpeg (ffmpeg.lock)
         run: python scripts/fetch_ffmpeg.py
 
-      - name: Build the executable
-        run: python build.py
-
-      - name: Verify the exe was produced
+      # Inno Setup 6 compiles installer/VideoEditor.iss; install it only if the
+      # runner image doesn't already have it.
+      - name: Make sure Inno Setup 6 is available
         run: |
-          if (-not (Test-Path "dist\VideoEditor.exe")) {
-            Write-Error "dist\VideoEditor.exe was not produced by the build"
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # A folder build (dist\VideoEditor\) plus its installer
+      # (dist\installer\VideoEditor-<version>-setup.exe).
+      - name: Build the app folder and the installer
+        run: python build.py --installer
+
+      - name: Verify the build was produced
+        run: |
+          if (-not (Test-Path "dist\VideoEditor\VideoEditor.exe")) {
+            Write-Error "dist\VideoEditor\VideoEditor.exe was not produced by the build"
             exit 1
           }
-          Get-Item "dist\VideoEditor.exe" | Select-Object Name, Length
+          $setup = Get-ChildItem "dist\installer\VideoEditor-*-setup.exe" -ErrorAction SilentlyContinue
+          if (-not $setup) {
+            Write-Error "the installer was not produced by the build"
+            exit 1
+          }
+          $setup | Select-Object Name, Length
 
       # The exe is windowed (no console), so check its exit code; the report
       # is written to %TEMP%\VideoEditor-selftest.txt (core/selftest.py).
       - name: Self-test the built exe (bundled FFmpeg, filters, a real export)
         run: |
-          $p = Start-Process -FilePath "dist\VideoEditor.exe" -ArgumentList "--self-test" -Wait -PassThru
+          $p = Start-Process -FilePath "dist\VideoEditor\VideoEditor.exe" -ArgumentList "--self-test" -Wait -PassThru
           Get-Content "$env:TEMP\VideoEditor-selftest.txt" -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) {
             Write-Error "VideoEditor.exe --self-test failed (exit code $($p.ExitCode))"
             exit 1
           }
+
+      # The same folder as a zip, for people who'd rather not install.
+      - name: Zip the portable folder
+        run: |
+          $version = python -c "import core; print(core.__version__)"
+          Compress-Archive -Path "dist\VideoEditor" -DestinationPath "dist\VideoEditor-$version-portable.zip" -Force
 
       - name: Publish GitHub Release
         env:
@@ -100,11 +123,13 @@ jobs:
             $isPrerelease = $true
           }
 
+          # pwsh doesn't expand globs for native commands: list the files explicitly.
+          $assets = @(Get-ChildItem "dist\installer\VideoEditor-*-setup.exe", "dist\VideoEditor-*-portable.zip" | ForEach-Object { $_.FullName })
           gh release view $tagName 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tagName "dist/VideoEditor.exe" --clobber
+            gh release upload $tagName @assets --clobber
           } else {
-            $createArgs = @($tagName, "dist/VideoEditor.exe", "--title", "Open Video Editor $tagName", "--generate-notes")
+            $createArgs = @($tagName) + $assets + @("--title", "Open Video Editor $tagName", "--generate-notes")
             if ($isPrerelease) { $createArgs += "--prerelease" }
             gh release create @createArgs
           }

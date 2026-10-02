@@ -157,12 +157,12 @@ It prints the version, the FFmpeg it found, NVENC availability and the required 
 
 ## Building a standalone executable
 
-This packages the app (with the Qt runtime) into a **single executable
-file** — `VideoEditor.exe` on Windows — that your users can double-click
-to run, no Python installation required on their machine. (It takes a
-couple of seconds longer to start than the Python version, since a
-one-file build unpacks itself to a temp folder on each launch — a
-worthwhile trade for "just one file to share".)
+This packages the app (with the Qt runtime) into a **folder**,
+`dist\VideoEditor\` — `VideoEditor.exe` plus its `_internal\` folder — that
+runs with no Python installation on the user's machine, and (on Windows)
+into a per-user **installer** for that folder. The folder starts without
+unpacking anything; the earlier single-file exe unpacked ~293 MB into
+`%TEMP%` on every launch and left it behind whenever the app was killed.
 
 ### Windows, step by step
 
@@ -180,11 +180,16 @@ worthwhile trade for "just one file to share".)
    folder at the root of this project (next to `build.spec`).
 4. Build:
    ```powershell
-   python build.py
+   python build.py               # the folder only
+   python build.py --installer   # the folder, then the installer (needs Inno Setup 6)
    ```
-5. Your app is at `dist\VideoEditor.exe`. Double-click it to run, or send
-   that one file to anyone (if you skipped step 3, they'll also need
-   FFmpeg installed and on their `PATH`).
+5. Your app is at `dist\VideoEditor\VideoEditor.exe` — share the whole
+   `dist\VideoEditor\` folder (zipped), not just the exe. With
+   `--installer`, `dist\installer\VideoEditor-<version>-setup.exe` installs
+   it per user (no administrator rights) under
+   `%LOCALAPPDATA%\Programs\OpenVideoEditor`, adds a Start menu entry and
+   opens `.vproj` projects on double-click. (If you skipped step 3, users
+   also need FFmpeg installed and on their `PATH`.)
 
 ### macOS / Linux
 
@@ -197,7 +202,8 @@ pip install -r requirements.txt
 python build.py
 ```
 
-The output is `dist/VideoEditor` (no extension).
+The output is the `dist/VideoEditor/` folder (the executable inside has no
+extension); the installer is Windows-only.
 
 Always build on the same OS you're targeting — PyInstaller does not
 cross-compile (build on Windows for a `.exe`, on macOS for a macOS app).
@@ -205,9 +211,10 @@ cross-compile (build on Windows for a `.exe`, on macOS for a macOS app).
 ### Automated builds
 
 Push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) and
-`.github/workflows/release.yml` builds `VideoEditor.exe` on GitHub's own
-Windows runner (FFmpeg bundled) and publishes it as a
-[GitHub Release](https://github.com/ackermanl77/videoeditor/releases) asset
+`.github/workflows/release.yml` builds the app on GitHub's own Windows
+runner (FFmpeg bundled), self-tests it, and publishes the installer
+(`VideoEditor-<version>-setup.exe`) and a portable zip of the folder as
+[GitHub Release](https://github.com/ackermanl77/videoeditor/releases) assets
 — no local build needed. This repo is currently **private**, so downloading
 it still needs a GitHub account with access to the repo (that becomes a
 plain, no-login download only if the repo's visibility is ever changed to

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Package the app (with the Qt runtime) into a single executable file end users can double-click, with no Python installation required.
+Package the app (with the Qt runtime) into a folder that runs with no Python installation required, and on Windows into a per-user installer for that folder.
 
 ## Steps
 
@@ -13,8 +13,10 @@ Package the app (with the Qt runtime) into a single executable file end users ca
    To get exactly the build the release uses, run `python scripts/fetch_ffmpeg.py`: it downloads the FFmpeg version pinned in `ffmpeg.lock` (URL, archive SHA256 and each binary's SHA256) and installs `ffmpeg.exe`/`ffprobe.exe` into `bin/`, failing on any hash mismatch. `release.yml` and CI's integration job use the same script.
 
    `build.spec` excludes `imageio_ffmpeg` whenever `bin/` holds FFmpeg (its own 87.6 MB `ffmpeg` was never used in the packaged app) and drops the Qt Quick/Qml/Pdf modules and DLLs (plus the `qpdf` image plugin): walking the PE import tables of every Qt module/plugin the app uses reaches none of them. `opengl32sw.dll` (Qt's software-OpenGL fallback) is excluded too: the preview's `QVideoWidget` renders through D3D11/raster, and in a built exe it was never loaded, neither at launch nor during QMediaPlayer playback (even with `QT_OPENGL=software`). Measured on a 2026-10-01 build (PySide6 6.11.2, FFmpeg 9.0.1 essentials): `dist/VideoEditor.exe` is 117.4 MB and unpacks 293 MB / 260 files per launch (163.5 MB / 435.5 MB before these exclusions); dropping `opengl32sw.dll` alone saved 7.6 MB / 20.6 MB.
-3. Run `python build.py` (a thin wrapper around `pyinstaller build.spec`).
-4. The output is `dist/VideoEditor.exe` (Windows) or `dist/VideoEditor` (macOS/Linux, no extension) — a one-file build that unpacks itself to a temp folder on each launch (a couple of seconds slower to start than the source version, traded for "just one file to share").
+3. Run `python build.py` (a thin wrapper around `pyinstaller build.spec`), or `python build.py --installer` to also compile `installer/VideoEditor.iss` with Inno Setup 6 (`ISCC.exe` on `PATH` or in its default install folder; the version comes from `core.__version__`).
+4. The output is the `dist/VideoEditor/` folder: `VideoEditor.exe` (no extension on macOS/Linux) plus `_internal/`, which holds Python, Qt and the bundled FFmpeg. Ship the whole folder. `--installer` adds `dist/installer/VideoEditor-<version>-setup.exe`: a per-user install (`PrivilegesRequired=lowest`, every registry entry under HKCU) into `%LOCALAPPDATA%\Programs\OpenVideoEditor`, with a Start menu entry, an optional desktop shortcut, an uninstaller, and the `.vproj` association (`OpenVideoEditor.Project`; `main.py` opens a `.vproj` given as its argument). An upgrade deletes the old `_internal\` first, so no stale files survive.
+
+   This used to be a one-file exe, which unpacked ~293 MB (205 MB of it FFmpeg) into `%TEMP%\_MEI*` on every launch, took seconds to do so, and left the folder behind whenever the app was killed. Measured on the first onedir build (2026-10-02, PySide6 6.11.2, PyInstaller 6.22.3, FFmpeg 9.0.1 essentials): 296 MB in 261 files, `--self-test` passes, and `VideoEditor.exe "<project>.vproj"` shows the window with that project loaded after 2.2 s (the one-file exe took 3.5–3.8 s to show an empty window), with nothing written to `%TEMP%`. The installer itself has not been compiled locally (Inno Setup isn't installed on the dev machine); `release.yml` compiles it.
 
 ## Cross-compilation
 
@@ -22,25 +24,17 @@ PyInstaller does not cross-compile — build on the same OS you're targeting (Wi
 
 ## Where the bundle is found at runtime
 
-`core/ffmpeg_utils.py::_bundle_dir()` uses `sys._MEIPASS` (set by a PyInstaller one-file build when unpacked) to locate a bundled `ffmpeg`/`ffprobe` next to the running executable or in its `bin/` subfolder, before falling back to `PATH`. `main.py` shows a non-fatal warning dialog if FFmpeg can't be found by any of those routes, since media import, thumbnails, preview, and export all depend on it.
+`core/ffmpeg_utils.py::_bundle_dir()` uses `sys._MEIPASS` (the `_internal/` folder of the onedir build) to locate a bundled `ffmpeg`/`ffprobe` next to the running executable or in its `bin/` subfolder, before falling back to `PATH`. `main.py` shows a non-fatal warning dialog if FFmpeg can't be found by any of those routes, since media import, thumbnails, preview, and export all depend on it.
 
 ## Validation
 
 There is no automated test for the packaged build (PyInstaller output isn't something `unittest` exercises). Verify manually after each `python build.py`: launch the produced executable on a clean machine/VM without the dev virtual environment active, confirm the splash screen and taskbar icon appear, and exercise the FFmpeg-dependent path (import a file, play it, export a short clip) — with and without a bundled `bin/ffmpeg.exe` present, to confirm both the bundled-binary and system-`PATH` lookup paths work.
 
-Confirming *what actually got bundled* doesn't need a second machine, and catches a stale/wrong build before ever launching the exe: PyInstaller's own `PyInstaller.archive.readers.CArchiveReader`/`ZlibArchiveReader` can inspect a built one-file exe directly —
-
-```python
-from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
-car = CArchiveReader("dist/VideoEditor.exe")
-print([n for n in car.toc.keys() if "ffmpeg" in n.lower() or "ffprobe" in n.lower()])  # confirms the binaries are embedded, not just present in bin/ at build time
-```
-
-and, for confirming a specific *source-code* change actually made it into the build (not just an old cached copy under `build/`), extracting a module's compiled bytecode out of the `PYZ.pyz` entry and checking its `co_consts` for a string that only exists in the new code — this is how the Shorts-export UI strings were confirmed present after a rebuild, and how a stale pre-Shorts `dist/VideoEditor.exe` (whose timestamp predated every commit in the repo) was caught in the first place. Also always sanity-check the bundled `ffmpeg.exe`/`ffprobe.exe` themselves still run standalone (`bin/ffmpeg.exe -version`) before packaging — a build that embeds a corrupted or partially-downloaded binary would otherwise only surface as an export failure deep inside the packaged app.
+Confirming *what actually got bundled* doesn't need a second machine, and catches a stale/wrong build before ever launching the exe: with the onedir build the binaries are plain files (`dist/VideoEditor/_internal/ffmpeg.exe`, `ffprobe.exe`), and the Python modules sit in `_internal/base_library.zip` and the `PYZ` archive inside `VideoEditor.exe`, which `PyInstaller.archive.readers.CArchiveReader`/`ZlibArchiveReader` can open — useful for confirming a specific *source-code* change actually made it into the build (not just an old cached copy under `build/`), extracting a module's compiled bytecode out of the `PYZ.pyz` entry and checking its `co_consts` for a string that only exists in the new code — this is how the Shorts-export UI strings were confirmed present after a rebuild, and how a stale pre-Shorts `dist/VideoEditor.exe` (whose timestamp predated every commit in the repo) was caught in the first place. Also always sanity-check the bundled `ffmpeg.exe`/`ffprobe.exe` themselves still run standalone (`bin/ffmpeg.exe -version`) before packaging — a build that embeds a corrupted or partially-downloaded binary would otherwise only surface as an export failure deep inside the packaged app.
 
 ## Version, self-test and UPX (P2)
 
 - `core/__init__.py: __version__` is the single version source: `build.spec` renders the exe's Windows version resource from it (`scripts/version_info.py`, `version_info.txt` is the template), the About box and `.vproj` files show it, and `release.yml` fails when the pushed tag isn't `v<__version__>`.
 - `VideoEditor.exe --self-test` (or `python main.py --self-test`) runs before any `QApplication`: version, FFmpeg/FFprobe paths and versions, NVENC, 18 required filters, and a real one-second export checked with ffprobe; exit code 0/1, report also in `%TEMP%\VideoEditor-selftest.txt` (the exe has no console). `release.yml` runs it on the built exe before publishing.
 - `upx=False` is explicit. `docs/USER_GUIDE.md` is bundled for **Help > User Guide**.
-- Still one-file, with static FFmpeg binaries: switching to onedir + an installer, or to a shared FFmpeg build, needs a build and installer verified on a real machine.
+- FFmpeg is still the static "essentials" build; a shared-library FFmpeg (K3) would avoid linking the codecs into both ffmpeg.exe and ffprobe.exe.

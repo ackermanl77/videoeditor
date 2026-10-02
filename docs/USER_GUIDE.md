@@ -50,11 +50,16 @@ and a timeline across the bottom.
 
 ## Installing and running
 
-**If you just want to use the app** (Windows): download `VideoEditor.exe`
-from the project's [Releases page](https://github.com/ackermanl77/videoeditor/releases)
-and double-click it. No Python installation needed — it's a single
-self-contained file. It takes a couple of seconds to start (a one-file
-build unpacks itself to a temp folder each launch) — that's normal.
+**If you just want to use the app** (Windows): download
+`VideoEditor-<version>-setup.exe` from the project's
+[Releases page](https://github.com/ackermanl77/videoeditor/releases) and run
+it. It installs for your user only (no administrator rights needed), adds
+Open Video Editor to the Start menu, and makes double-clicking a `.vproj`
+project open it in the editor. Uninstall it from Windows Settings > Apps.
+No Python installation is needed. If you'd rather not install anything,
+download `VideoEditor-<version>-portable.zip` instead, unzip it anywhere and
+run `VideoEditor.exe` from that folder (keep the `_internal` folder next to
+it).
 
 **If you're running it from source:**
 
