@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 
 from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
 from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand, property_change_overlaps
-from core.effects import REGISTRY, EffectInstance
+from core.effects import LEGACY_FIELDS, REGISTRY, EffectInstance
 from core.history import History
 from core.project import Project
 
@@ -418,7 +418,7 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.chroma_group)
 
         # ---- Effects group (video/image only): the generic effect stack (B7) ----
-        self.effects_group = CollapsibleGroupBox("Effects (LUT, Key, Sharpen, Blur...)", start_expanded=False)
+        self.effects_group = CollapsibleGroupBox("Effects (Color, Keys, LUT, Stabilize...)", start_expanded=False)
         effects_layout = QVBoxLayout(self.effects_group)
         add_row = QHBoxLayout()
         self.effect_kind_combo = QComboBox()
@@ -755,9 +755,14 @@ class PropertiesPanel(QWidget):
             return False
         if self._refuse_if_overlapping(attribute, value):
             return False
+        kinds_before = [e.kind for e in clip.effects]
         self.history.execute(
             UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label, mergeable=mergeable)
         )
+        if attribute in LEGACY_FIELDS and [e.kind for e in clip.effects] != kinds_before:
+            # The Color Correction / Chroma Key groups edit effects in the
+            # stack; the first edit adds one, so show it in the Effects list.
+            self._refresh_effects_list(clip)
         self.clip_changed.emit(self.clip_id)
         self.project_modified.emit()
         return True
@@ -958,7 +963,78 @@ class PropertiesPanel(QWidget):
         for spec in effect.spec.params:
             self.effect_params_form.addRow(spec.label, self._param_editor(row, spec, values[spec.name]))
 
+    def key_effect_param_at_playhead(self, row: int, name: str) -> bool:
+        """Add/replace a keyframe of effect ``row``'s parameter ``name`` at the playhead (its current value).
+
+        Same rules as the other keyframe buttons: clip-local seconds, the
+        playhead must be over the clip, 2+ keyframes animate the parameter.
+        """
+        clip = self._current_clip()
+        effects = self._effects_copy()
+        if clip is None or effects is None or not (0 <= row < len(effects)):
+            return False
+        spec = effects[row].param_spec(name)
+        if spec is None or not spec.animatable:
+            return False
+        local = self.playhead_time - clip.timeline_start
+        if not (-1e-6 <= local <= clip.duration + 1e-6):
+            self.status_message.emit("Move the playhead over the selected clip to add a keyframe there.")
+            return False
+        local = min(max(0.0, local), clip.duration)
+        value = float(effects[row].resolved_params()[name])
+        keys = [tuple(k) for k in effects[row].keyframes.get(name, []) if abs(k[0] - local) > 1e-3]
+        effects[row].keyframes[name] = sorted(keys + [(local, value)])
+        self._commit_effects(effects, f"Key {spec.label} at Playhead", row)
+        if len(effects[row].keyframes[name]) == 1:
+            self.status_message.emit(f"{spec.label} keyframe added. Add a second one to start animating.")
+        return True
+
+    def clear_effect_param_keyframes(self, row: int, name: str) -> bool:
+        effects = self._effects_copy()
+        if effects is None or not (0 <= row < len(effects)) or not effects[row].keyframes.get(name):
+            return False
+        del effects[row].keyframes[name]
+        self._commit_effects(effects, "Clear Effect Keyframes", row)
+        return True
+
+    @staticmethod
+    def _keyframe_summary(keys) -> str:
+        if not keys:
+            return "not animated"
+        text = f"{len(keys)} key{'s' if len(keys) != 1 else ''}"
+        return text + (" (add one more to animate)" if len(keys) == 1 else "")
+
+    def _with_effect_key_buttons(self, row: int, spec, editor: QWidget, keys) -> QWidget:
+        """``editor`` plus a keyframe-at-playhead button, a key count and a Clear button."""
+        holder = QWidget()
+        line = QHBoxLayout(holder)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.addWidget(editor, 1)
+        key_btn = QPushButton("\u25c6")
+        key_btn.setFixedWidth(28)
+        key_btn.setToolTip(f"Add/update a {spec.label} keyframe at the playhead from the current value")
+        key_btn.setAccessibleName(f"Key {spec.label} at playhead")
+        key_btn.clicked.connect(lambda: self.key_effect_param_at_playhead(row, spec.name))
+        count = QLabel(self._keyframe_summary(keys))
+        count.setToolTip(", ".join(f"{t:.2f}s = {v:.2f}" for t, v in sorted(keys)) or "No keyframes")
+        clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip(f"Remove every {spec.label} keyframe")
+        clear_btn.setEnabled(bool(keys))
+        clear_btn.clicked.connect(lambda: self.clear_effect_param_keyframes(row, spec.name))
+        for widget in (key_btn, count, clear_btn):
+            line.addWidget(widget)
+        holder.key_button, holder.key_count_label = key_btn, count  # for tests
+        return holder
+
     def _param_editor(self, row: int, spec, value) -> QWidget:
+        editor = self._plain_param_editor(row, spec, value)
+        if not spec.animatable:
+            return editor
+        clip = self._current_clip()
+        keys = clip.effects[row].keyframes.get(spec.name, []) if clip is not None and row < len(clip.effects) else []
+        return self._with_effect_key_buttons(row, spec, editor, keys)
+
+    def _plain_param_editor(self, row: int, spec, value) -> QWidget:
         name = spec.name
         if spec.kind in ("float", "int"):
             box = QDoubleSpinBox() if spec.kind == "float" else QSpinBox()

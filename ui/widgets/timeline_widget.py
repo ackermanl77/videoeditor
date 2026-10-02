@@ -57,6 +57,8 @@ from core.edit_ops import (
     build_overwrite_command,
     build_paste_attributes_command,
     build_paste_command,
+    build_ripple_move_command,
+    build_roll_at_edge,
     build_roll_command,
     build_slide_command,
     build_slip_command,
@@ -77,6 +79,7 @@ from core.timeline_nav import (
 from core.track import Track, TrackType
 from ui import theme
 from ui.media_bin import MEDIA_MIME_TYPE
+from ui.widgets import timeline_accessibility
 from ui.widgets.timeline_items import (
     HEADER_WIDTH,
     RULER_HEIGHT,
@@ -375,6 +378,7 @@ class TimelineWidget(QWidget):
         self.ripple_enabled = False
 
         self.signals = TimelineSignals()
+        timeline_accessibility.install()  # screen readers see tracks and clips, not one picture
         self._build_ui()
         self._connect_signals()
 
@@ -488,6 +492,7 @@ class TimelineWidget(QWidget):
         self.signals.clip_razor.connect(self._on_clip_razor)
         self.signals.clip_moved.connect(self._on_clip_moved)
         self.signals.clip_trimmed.connect(self._on_clip_trimmed)
+        self.signals.clip_edit_gesture.connect(self._on_clip_edit_gesture)
         self.signals.clip_double_clicked.connect(self._on_clip_selected)
         self.signals.track_mute_toggled.connect(self._on_track_mute_toggled)
         self.signals.track_lock_toggled.connect(self._on_track_lock_toggled)
@@ -1327,6 +1332,54 @@ class TimelineWidget(QWidget):
             self.status_message.emit("Can't slide there: the neighbouring clips don't have enough media, or it would overlap.")
         return ok
 
+    def ripple_move_selected(self, delta: Optional[float] = None) -> bool:
+        """Move the selected clip and every later clip on its track (Shift+drag, or Edit menu)."""
+        if self.project is None or self.selected_clip_id is None:
+            return False
+        if delta is None:
+            delta, ok = QInputDialog.getDouble(
+                self, "Ripple Move", "Move the clip and everything after it by (seconds):", 0.0, -3600, 3600, 2)
+            if not ok:
+                return False
+        ok = self._execute_and_select(build_ripple_move_command(self.project, self.selected_clip_id, delta), False)
+        if not ok:
+            self.status_message.emit("Can't ripple move there: the clips would overlap an earlier clip or start before 0.")
+        return ok
+
+    def _on_clip_edit_gesture(self, clip_id: str, gesture: str, value: float) -> None:
+        """A Ctrl/Alt/Shift drag finished on a clip (see ui.widgets.timeline_items.drag_mode_for).
+
+        Ctrl+edge = roll, Alt+body = slip, Ctrl+Alt+body = slide, Shift+body
+        = ripple move. Each becomes the same core command as its menu entry,
+        so it is one undo step and refused (with a message) when impossible.
+        """
+        clip = self.project.find_clip(clip_id) if self.project is not None else None
+        if clip is None or self.history is None:
+            self.rebuild()
+            return
+        command, refusal = None, ""
+        if gesture in ("roll_left", "roll_right"):
+            edge = gesture.split("_")[1]
+            original = clip.timeline_start if edge == "left" else clip.timeline_end
+            if abs(value - original) > 1e-4:
+                command = build_roll_at_edge(self.project, clip_id, edge, value)
+                refusal = "Roll needs a clip touching that edge, and enough media on both sides."
+        elif gesture == "slip" and abs(value) > 1e-4:
+            command = build_slip_command(self.project, clip_id, value)
+            refusal = "Can't slip this clip (only video/audio clips with spare media can slip)."
+        elif gesture == "slide" and abs(value) > 1e-4:
+            command = build_slide_command(self.project, clip_id, value)
+            refusal = "Can't slide there: the neighbouring clips don't have enough media, or it would overlap."
+        elif gesture == "ripple_move" and abs(value) > 1e-4:
+            command = build_ripple_move_command(self.project, clip_id, value)
+            refusal = "Can't ripple move there: the clips would overlap an earlier clip or start before 0."
+        if command is not None:
+            self.history.execute(command)
+            self._emit_modified()
+        elif refusal:
+            self.status_message.emit(refusal)
+        self.rebuild()
+
     def nudge_selected(self, frames: int) -> bool:
         """Move the selected clips by whole frames (Alt+Left / Alt+Right)."""
         if self.project is None or self.history is None:
@@ -1350,6 +1403,17 @@ class TimelineWidget(QWidget):
         else:
             index = 0 if direction > 0 else len(ids) - 1
         self._on_clip_selected(ids[index])
+        self.focus_clip(ids[index])
+
+    def focus_clip(self, clip_id: str) -> None:
+        """Give keyboard focus to a clip's item, scroll it into view and tell a screen reader about it."""
+        item = self._clip_items.get(clip_id)
+        if item is None:
+            return
+        self.view.ensureVisible(item)
+        self.view.setFocus()
+        item.setFocus()
+        timeline_accessibility.notify_focus(item)
 
     def go_to_keyframe(self, direction: int) -> None:
         """Previous/next keyframe of the selected clip (F12)."""
@@ -1384,6 +1448,7 @@ class TimelineWidget(QWidget):
             ("Roll Edit to Playhead", self.roll_selected_to_playhead),
             ("Slip...", self.slip_selected),
             ("Slide...", self.slide_selected),
+            ("Ripple Move...", self.ripple_move_selected),
             (None, None),
             ("Reveal in Media Bin", lambda: self._reveal_asset(clip_id)),
             ("Properties", lambda: self.selection_changed.emit(clip_id)),

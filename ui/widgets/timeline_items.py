@@ -74,6 +74,38 @@ CLIP_LABEL_FONT_PT = 9
 MEDIA_KIND_NAMES = {MediaType.VIDEO: "Video", MediaType.AUDIO: "Audio", MediaType.IMAGE: "Image", MediaType.TEXT: "Text"}
 
 
+#: Drag gestures that are not plain move/trim: the timeline turns each into a
+#: core edit command on release (see TimelineWidget._on_clip_edit_gesture).
+EDIT_GESTURES = ("roll_left", "roll_right", "slip", "slide", "ripple_move")
+GESTURE_HINTS = {
+    "roll_left": "Roll edit (Ctrl+drag edge): this clip's in point and the previous clip's out point move together",
+    "roll_right": "Roll edit (Ctrl+drag edge): this clip's out point and the next clip's in point move together",
+    "slip": "Slip (Alt+drag): change which part of the source plays; the clip stays in place",
+    "slide": "Slide (Ctrl+Alt+drag): move the clip; its neighbours trim to keep the gap closed",
+    "ripple_move": "Ripple move (Shift+drag): this clip and every later clip on the track move together",
+}
+
+
+def drag_mode_for(x: float, width: float, modifiers) -> str:
+    """The drag a mouse press starts at item-local ``x`` with these keyboard modifiers.
+
+    Edges: plain = trim, Ctrl = roll with the touching neighbour. Body:
+    plain = move, Alt = slip, Ctrl+Alt = slide, Shift = ripple move.
+    (Ctrl+click in the body still toggles the selection; see mousePressEvent.)
+    """
+    ctrl = bool(modifiers & Qt.ControlModifier)
+    alt = bool(modifiers & Qt.AltModifier)
+    shift = bool(modifiers & Qt.ShiftModifier)
+    if x <= HANDLE_WIDTH or x >= width - HANDLE_WIDTH:
+        side = "left" if x <= HANDLE_WIDTH else "right"
+        return f"roll_{side}" if ctrl else f"trim_{side}"
+    if alt:
+        return "slide" if ctrl else "slip"
+    if shift:
+        return "ripple_move"
+    return "toggle_select" if ctrl else "move"
+
+
 def row_at_scene_y(scene_y: float) -> int:
     """Track row under a scene y coordinate (e.g. the mouse position of a drop).
 
@@ -88,18 +120,21 @@ def _active_effect_badges(clip: Clip) -> List[Tuple[str, str]]:
     return [(letter, color) for attr, letter, color in EFFECT_INDICATORS if getattr(clip, attr)]
 
 
-def clip_description(clip: Clip, track_name: str = "", fps: float = 30.0, offline: bool = False) -> str:
-    """Spoken-style description of a clip, used as its tooltip (the timeline's accessible text).
-
-    e.g. "Video clip Arbol.mp4, 00:00:12:00 to 00:00:20:00, track Video 1. Effects: Color Correction."
-    """
+def clip_accessible_name(clip: Clip, track_name: str = "", fps: float = 30.0) -> str:
+    """What a screen reader announces for a clip, e.g. "Video clip Arbol.mp4, 00:00:12:00 to 00:00:20:00, track Video 1"."""
     text = (
         f"{MEDIA_KIND_NAMES.get(clip.media_type, 'Clip')} clip {clip.name}, "
         f"{format_timecode(clip.timeline_start, fps)} to {format_timecode(clip.timeline_end, fps)}"
     )
-    if track_name:
-        text += f", track {track_name}"
-    text += "."
+    return text + (f", track {track_name}" if track_name else "")
+
+
+def clip_description(clip: Clip, track_name: str = "", fps: float = 30.0, offline: bool = False) -> str:
+    """Spoken-style description of a clip: its tooltip and accessible description.
+
+    e.g. "Video clip Arbol.mp4, 00:00:12:00 to 00:00:20:00, track Video 1. Effects: Color Correction."
+    """
+    text = clip_accessible_name(clip, track_name, fps) + "."
     badges = [EFFECT_NAMES[letter] for letter, _color in _active_effect_badges(clip)]
     if badges:
         text += " Effects: " + ", ".join(badges) + "."
@@ -119,6 +154,9 @@ class TimelineSignals(QObject):
     clip_razor = Signal(str, float)  # clip id, timeline seconds to split at (Razor tool)
     clip_moved = Signal(str, float, int)  # clip_id, new_start, new_track_row
     clip_trimmed = Signal(str, float, float, float)  # clip_id, in, out, start
+    # clip_id, gesture (an EDIT_GESTURES name), value: the new edit time for a
+    # roll, source seconds for a slip, timeline seconds moved for slide/ripple.
+    clip_edit_gesture = Signal(str, str, float)
     clip_double_clicked = Signal(str)
     track_mute_toggled = Signal(int)
     track_lock_toggled = Signal(int)
@@ -176,16 +214,20 @@ class ClipItem(QGraphicsObject):
         # instead of assuming one constant speed.
         self._model = clip.with_source_range(clip.source_in, clip.source_out)
         self._keyframe_times = [t - clip.timeline_start for t in clip_keyframe_points(clip)]
-        self.setToolTip(clip_description(clip, track_name, fps, offline))
+        self._describe(clip)
 
+        # Focusable so keyboard selection (Tab) moves real focus, which screen
+        # readers follow (see ui/widgets/timeline_accessibility.py).
         self.setFlags(
             QGraphicsItem.ItemIsMovable
             | QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemIsFocusable
             | QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
         self.setZValue(10)
-        self._drag_mode: Optional[str] = None  # None | "move" | "trim_left" | "trim_right"
+        # None | "move" | "trim_left" | "trim_right" | one of EDIT_GESTURES
+        self._drag_mode: Optional[str] = None
         self._press_scene_x = 0.0
         self._press_start = 0.0
         self._press_duration = 0.0
@@ -206,10 +248,16 @@ class ClipItem(QGraphicsObject):
         self._effect_badges = _active_effect_badges(clip)
         self._model = clip.with_source_range(clip.source_in, clip.source_out)
         self._keyframe_times = [t - clip.timeline_start for t in clip_keyframe_points(clip)]
-        self.setToolTip(clip_description(clip, self.track_name, self.fps, self.offline))
+        self._describe(clip)
         self._sync_position()
         self.prepareGeometryChange()
         self.update()
+
+    def _describe(self, clip: Clip) -> None:
+        """Tooltip and accessible name/description (the screen reader's view of this clip)."""
+        self.accessible_name = clip_accessible_name(clip, self.track_name, self.fps)
+        self.accessible_description = clip_description(clip, self.track_name, self.fps, self.offline)
+        self.setToolTip(self.accessible_description)
 
     def keyframe_times(self) -> List[float]:
         """Clip-local times of the keyframe ticks drawn on this clip."""
@@ -453,7 +501,8 @@ class ClipItem(QGraphicsObject):
             self.signals.clip_razor.emit(self.clip_id, seconds)
             event.accept()
             return
-        if event.modifiers() & Qt.ControlModifier:
+        mode = drag_mode_for(event.pos().x(), self.boundingRect().width(), event.modifiers())
+        if mode == "toggle_select":
             self.signals.clip_toggle_selected.emit(self.clip_id)
             event.accept()
             return
@@ -461,32 +510,30 @@ class ClipItem(QGraphicsObject):
         if self._locked:
             event.accept()
             return
-        x = event.pos().x()
-        width = self.boundingRect().width()
-        if x <= HANDLE_WIDTH:
-            self._drag_mode = "trim_left"
-        elif x >= width - HANDLE_WIDTH:
-            self._drag_mode = "trim_right"
+        self.begin_drag(mode, event.scenePos().x())
+        if mode == "move":
+            super().mousePressEvent(event)
         else:
-            self._drag_mode = "move"
-        self._press_scene_x = event.scenePos().x()
+            event.accept()  # trims and edit gestures are drawn by this item, not moved by Qt
+
+    def begin_drag(self, mode: str, scene_x: float) -> None:
+        """Start a drag (``drag_mode_for``'s result) at scene x ``scene_x``."""
+        self._drag_mode = mode
+        self._press_scene_x = scene_x
         self._press_start = self._start
         self._press_duration = self._duration
         self._press_source_in = self._source_in
         self._press_source_out = self._source_out
-        super().mousePressEvent(event)
+        if mode in GESTURE_HINTS:
+            self.setToolTip(GESTURE_HINTS[mode])
 
-    def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        if self._locked:
+    def update_drag(self, scene_x: float) -> None:
+        """Follow the mouse during a trim or edit gesture (a plain move is Qt's own item move)."""
+        if self._drag_mode in (None, "move"):
             return
-        if self._drag_mode == "move":
-            super().mouseMoveEvent(event)
-            return
-
-        delta_px = event.scenePos().x() - self._press_scene_x
-        delta_timeline_s = delta_px / self.pixels_per_second
-
-        if self._drag_mode == "trim_left":
+        delta_timeline_s = (scene_x - self._press_scene_x) / self.pixels_per_second
+        mode = self._drag_mode
+        if mode in ("trim_left", "roll_left"):
             self._apply_trim_left(delta_timeline_s)
             snap_t = self._nearest_target(self._start, self._snap_targets())
             if snap_t is not None:
@@ -495,9 +542,7 @@ class ClipItem(QGraphicsObject):
             else:
                 self.signals.snap_guide_hide.emit()
             self._sync_position()
-            self.prepareGeometryChange()
-            self.update()
-        elif self._drag_mode == "trim_right":
+        elif mode in ("trim_right", "roll_right"):
             self._apply_trim_right(delta_timeline_s)
             snap_t = self._nearest_target(self._start + self._duration, self._snap_targets())
             if snap_t is not None:
@@ -505,8 +550,39 @@ class ClipItem(QGraphicsObject):
                 self._apply_trim_right(snap_t - self._start - self._press_duration)
             else:
                 self.signals.snap_guide_hide.emit()
-            self.prepareGeometryChange()
-            self.update()
+        elif mode in ("slide", "ripple_move"):
+            self._start = max(0.0, self._press_start + delta_timeline_s)
+            self._sync_position()
+        elif mode == "slip":
+            # Content moves with the mouse: dragging right shows earlier source.
+            shift = -self._model.source_offset_at(delta_timeline_s)
+            self._source_in = self._press_source_in + shift
+            self._source_out = self._press_source_out + shift
+        self.prepareGeometryChange()
+        self.update()
+
+    def finish_drag(self) -> None:
+        """End the drag: emit the trim or edit gesture for the timeline to apply (it rebuilds the item)."""
+        mode, self._drag_mode = self._drag_mode, None
+        self.signals.snap_guide_hide.emit()
+        if mode in ("trim_left", "trim_right"):
+            self.signals.clip_trimmed.emit(self.clip_id, self._source_in, self._source_out, self._start)
+        elif mode == "roll_left":
+            self.signals.clip_edit_gesture.emit(self.clip_id, mode, self._start)
+        elif mode == "roll_right":
+            self.signals.clip_edit_gesture.emit(self.clip_id, mode, self._start + self._duration)
+        elif mode == "slip":
+            self.signals.clip_edit_gesture.emit(self.clip_id, mode, self._source_in - self._press_source_in)
+        elif mode in ("slide", "ripple_move"):
+            self.signals.clip_edit_gesture.emit(self.clip_id, mode, self._start - self._press_start)
+
+    def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if self._locked:
+            return
+        if self._drag_mode == "move":
+            super().mouseMoveEvent(event)
+            return
+        self.update_drag(event.scenePos().x())
 
     def _min_source_length(self) -> float:
         return 0.1 * self._model.speed_at(0.0)
@@ -551,10 +627,10 @@ class ClipItem(QGraphicsObject):
                 y = self.pos().y()
                 new_row = max(0, round((y - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP)))
             new_start = max(0.0, (self.pos().x() - HEADER_WIDTH) / self.pixels_per_second)
+            self._drag_mode = None
             self.signals.clip_moved.emit(self.clip_id, new_start, new_row)
-        elif self._drag_mode in ("trim_left", "trim_right"):
-            self.signals.clip_trimmed.emit(self.clip_id, self._source_in, self._source_out, self._start)
-        self._drag_mode = None
+            return
+        self.finish_drag()
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         self.signals.clip_double_clicked.emit(self.clip_id)

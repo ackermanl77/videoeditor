@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
 from core import __version__
 from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip
-from core.ffmpeg_utils import binary_version, nvenc_available
+from core.ffmpeg_utils import binary_version, encoder_supports_10bit, nvenc_available
 from core.history import History
 from core.media_asset import MediaAsset
 from core.project import Project, write_backup_copy
@@ -38,6 +39,7 @@ from ui.export_dialog import ExportDialog
 from ui.help_dialogs import ShortcutsDialog, UserGuideDialog
 from ui.import_worker import ImportWorker
 from ui.relink_dialog import RelinkDialog
+from ui.render_queue import RenderQueueWidget
 from ui.media_bin import MediaBinWidget
 from ui.preview_player import PreviewPlayer
 from ui.properties_panel import PropertiesPanel
@@ -149,12 +151,19 @@ class MainWindow(QMainWindow):
         # Warm core.ffmpeg_utils.nvenc_available()'s cache off the UI thread:
         # it now does a real (~1-2 s) NVENC test encode, and the Export
         # dialog would otherwise block on it the first time it opens.
-        threading.Thread(target=nvenc_available, name="nvenc-probe", daemon=True).start()
+        threading.Thread(target=self._warm_encoder_probes, name="encoder-probe", daemon=True).start()
 
         self._restore_window_state()
 
         # Deferred so the window is fully shown before a possible recovery dialog pops up.
         QTimer.singleShot(0, self._offer_autosave_recovery)
+
+    @staticmethod
+    def _warm_encoder_probes() -> None:
+        """Fill the NVENC / 10-bit encoder probe caches the Export dialog reads (each is a real test encode)."""
+        nvenc_available()
+        for encoder in ("libx265", "libaom-av1", "prores_ks", "dnxhd", "hevc_nvenc", "av1_nvenc"):
+            encoder_supports_10bit(encoder)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -208,6 +217,15 @@ class MainWindow(QMainWindow):
         self.time_status_label = QLabel("00:00:00:00 / 00:00:00:00")
         self.status_bar.addPermanentWidget(self.time_status_label)
 
+        # Render queue (F4): a dock, hidden until something is queued.
+        self.render_queue = RenderQueueWidget()
+        self.render_queue.job_finished.connect(self._on_queue_job_finished)
+        self.render_queue_dock = QDockWidget("Render Queue", self)
+        self.render_queue_dock.setObjectName("RenderQueueDock")
+        self.render_queue_dock.setWidget(self.render_queue)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.render_queue_dock)
+        self.render_queue_dock.hide()
+
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
 
@@ -226,6 +244,10 @@ class MainWindow(QMainWindow):
         self.import_action = self._add_action(file_menu, "Import Media...", self.import_media_dialog, "Ctrl+I", icon="import")
         self.relink_action = self._add_action(file_menu, "Relink Media...", self.open_relink_dialog)
         self.export_action = self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
+        self.render_queue_action = self.render_queue_dock.toggleViewAction()
+        self.render_queue_action.setText("Render Queue")
+        self.render_queue_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        file_menu.addAction(self.render_queue_action)
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close, "Ctrl+Q")
 
@@ -250,6 +272,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Roll Edit to Playhead", self.timeline.roll_selected_to_playhead, "Ctrl+R")
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
+        self._add_action(edit_menu, "Ripple Move Clip...", self.timeline.ripple_move_selected)
         self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
         self.razor_action.setCheckable(True)
 
@@ -304,6 +327,7 @@ class MainWindow(QMainWindow):
             ("Nudge Selection Right 1 Frame", "Alt+Right", lambda: self.timeline.nudge_selected(1)),
             ("Select Next Clip", "Tab", lambda: self.timeline.select_adjacent_clip(1)),
             ("Select Previous Clip", "Shift+Tab", lambda: self.timeline.select_adjacent_clip(-1)),
+            ("Edit Selected Clip's Properties", "Return", self.focus_properties),
         )
         self.transport_actions: List[QAction] = []
         for text, key, slot in scoped:
@@ -1008,11 +1032,24 @@ class MainWindow(QMainWindow):
         if not self.project.tracks or self.project.total_duration <= 0:
             QMessageBox.information(self, "Export Video", "Add some clips to the timeline before exporting.")
             return
-        dialog = ExportDialog(self.project, self, in_out_range=self.timeline.in_out_range())
+        dialog = ExportDialog(self.project, self, in_out_range=self.timeline.in_out_range(), queue_available=True)
+        dialog.queue_requested.connect(self.queue_export)
         dialog.setModal(False)
         self._export_dialogs.append(dialog)
         dialog.destroyed.connect(lambda _obj=None, d=dialog: self._forget_export_dialog(d))
         dialog.show()
+
+    def queue_export(self, settings) -> None:
+        """Queue an export of the project as it is right now (a snapshot) and show the queue."""
+        job = self.render_queue.add_job(self.project, settings)
+        self.render_queue_dock.show()
+        self.render_queue_dock.raise_()
+        self.status_bar.showMessage(f"Queued: {job.name}", 5000)
+
+    def _on_queue_job_finished(self, job_id: str, status: str) -> None:
+        job = self.render_queue.queue.find(job_id)
+        if job is not None:
+            self.status_bar.showMessage(f"Render queue: {job.name} -- {status}", 8000)
 
     def _forget_export_dialog(self, dialog) -> None:
         if dialog in self._export_dialogs:
@@ -1027,6 +1064,16 @@ class MainWindow(QMainWindow):
             except RuntimeError:  # already deleted
                 self._forget_export_dialog(dialog)
         return alive
+
+    def focus_properties(self) -> None:
+        """Enter on the timeline: move keyboard focus into the Properties panel for the selected clip."""
+        if self.timeline.selected_clip_id is None:
+            return
+        self.properties.set_selected_clip(self.timeline.selected_clip_id)
+        for widget in self.properties.findChildren(QWidget):
+            if widget.isVisible() and widget.isEnabled() and widget.focusPolicy() & Qt.TabFocus:
+                widget.setFocus(Qt.TabFocusReason)
+                return
 
     def show_shortcuts(self) -> None:
         ShortcutsDialog(self.findChildren(QAction), self).exec()
@@ -1051,6 +1098,14 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, f"About {APP_NAME}", self.about_text())
 
     def closeEvent(self, event) -> None:
+        if self.render_queue.queue.pending_count():
+            result = QMessageBox.question(
+                self, "Render Queue", "Queued exports haven't finished. Cancel them and quit?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if result != QMessageBox.Yes or not self.render_queue.cancel_all_and_wait():
+                event.ignore()
+                return
         running = self.running_exports()
         if running:
             result = QMessageBox.question(

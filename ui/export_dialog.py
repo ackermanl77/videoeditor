@@ -32,6 +32,7 @@ from core.export_presets import (
     BUILTIN_PRESETS,
     FPS_CHOICES,
     delete_user_preset,
+    hdr_passthrough_choice,
     load_user_presets,
     save_user_preset,
     source_defaults,
@@ -43,6 +44,7 @@ from core.exporter import (
     CODEC_ENCODERS,
     LOUDNESS_TARGETS,
     QUALITY_PRESETS,
+    TEN_BIT_CODECS,
     TWO_PASS_ENCODERS,
     VIDEO_CODEC_CHOICES,
     ExportCancelled,
@@ -50,7 +52,8 @@ from core.exporter import (
     ExportSettings,
     Exporter,
 )
-from core.ffmpeg_utils import nvenc_available
+from core.ffmpeg_utils import encoder_supports_10bit, nvenc_available
+from core.output_color import COLOR_MODE_LABELS
 from core.project import Project
 
 RESOLUTION_PRESETS = {
@@ -141,21 +144,52 @@ class ExportWorker(QObject):
         self.exporter.cancel()
 
 
+def color_modes_for(codec_key: str, ext: str, hdr_choice: Optional[str], ten_bit_ok) -> list:
+    """Colour modes (core.output_color keys) the dialog offers for a codec choice, 8-bit SDR first.
+
+    10-bit SDR needs a 10-bit codec (HEVC, AV1, ProRes, DNxHR) whose encoder
+    really encodes 10-bit here (``ten_bit_ok(codec_key)``); HDR passthrough
+    additionally needs HDR sources that share one transfer (``hdr_choice``).
+    Anything the machine or the timeline can't do is not listed at all.
+    """
+    modes = ["sdr8"]
+    if ext == GIF_EXTENSION or codec_key not in TEN_BIT_CODECS or not ten_bit_ok(codec_key):
+        return modes
+    modes.append("sdr10")
+    if hdr_choice:
+        modes.append(hdr_choice)
+    return modes
+
+
+def _cpu_encoder_10bit(codec_key: str) -> bool:
+    try:
+        return encoder_supports_10bit(CODEC_ENCODERS[codec_key])
+    except Exception:  # noqa: BLE001 - a failed probe just hides the option
+        return False
+
+
 class ExportDialog(QDialog):
     """Dialog to configure export settings and watch render progress.
 
     Non-modal (the editor stays usable during a render, which works on a
     project snapshot), deleted when closed, and Esc/Cancel during a render
-    cancels it instead of hiding it.
+    cancels it instead of hiding it. With a render queue attached
+    (``queue_requested`` connected), "Add to Queue" hands the settings to it
+    instead of rendering here.
     """
+
+    #: ExportSettings for the render queue (see ui/render_queue.py).
+    queue_requested = Signal(object)
 
     def __init__(
         self,
         project: Project,
         parent: Optional[QWidget] = None,
         in_out_range: Optional[Tuple[float, float]] = None,
+        queue_available: bool = False,
     ):
         super().__init__(parent)
+        self._queue_available = queue_available
         self.project = project
         self._in_out_range = in_out_range
         self.setWindowTitle("Export Video")
@@ -242,6 +276,22 @@ class ExportDialog(QDialog):
         self.quality_combo.addItems(list(QUALITY_PRESETS.keys()))
         self.quality_combo.setCurrentText("Balanced (CRF 23)")
         form.addRow("Quality", self.quality_combo)
+
+        # Bit depth / dynamic range. Only modes this codec, this machine's
+        # encoders and this timeline's sources support are listed.
+        self._hdr_choice = hdr_passthrough_choice(self.project)
+        self.color_combo = QComboBox()
+        self.color_combo.setToolTip(
+            "8-bit SDR plays everywhere. 10-bit (HEVC, AV1, ProRes, DNxHR) avoids banding in gradients. "
+            "HDR keeps HDR footage in HDR (PQ or HLG, BT.2020); SDR clips and titles sit at HDR reference white."
+        )
+        self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
+        form.addRow("Color", self.color_combo)
+        self.color_note_label = QLabel("")
+        self.color_note_label.setWordWrap(True)
+        self.color_note_label.setStyleSheet("color: #9aa1ad; font-size: 11px;")
+        self.color_note_label.setVisible(False)
+        form.addRow("", self.color_note_label)
 
         # Probed once (cached in core.ffmpeg_utils.nvenc_available) against
         # whichever ffmpeg binary this app resolves to -- bundled or the
@@ -374,7 +424,16 @@ class ExportDialog(QDialog):
         self.export_btn = QPushButton("Export")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.clicked.connect(self._on_export)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip(
+            "Queue this export with a snapshot of the project as it is now; queued exports render one "
+            "after another in the background (View > Render Queue)."
+        )
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        self.queue_btn.setVisible(self._queue_available)
+        self.gpu_checkbox.toggled.connect(self._on_color_mode_changed)
         buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.queue_btn)
         buttons.addWidget(self.export_btn)
         layout.addLayout(buttons)
 
@@ -417,6 +476,42 @@ class ExportDialog(QDialog):
         intermediate = self.current_codec() in ("prores", "dnxhr")
         self.quality_combo.setEnabled(not is_gif and not intermediate and not self.two_pass_checkbox.isChecked())
         self._refresh_gpu_checkbox_enabled()
+        self._refresh_color_combo()
+
+    # ------------------------------------------------------------------
+    # Colour (bit depth / HDR)
+    # ------------------------------------------------------------------
+    def current_color_mode(self) -> str:
+        return self.color_combo.currentData() or "sdr8"
+
+    def _refresh_color_combo(self) -> None:
+        if not hasattr(self, "color_combo"):
+            return
+        current = self.current_color_mode()
+        modes = color_modes_for(self.current_codec(), self.container_combo.currentText(), self._hdr_choice,
+                                _cpu_encoder_10bit)
+        self.color_combo.blockSignals(True)
+        self.color_combo.clear()
+        for mode in modes:
+            self.color_combo.addItem(COLOR_MODE_LABELS[mode], mode)
+        index = self.color_combo.findData(current)
+        self.color_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.color_combo.setEnabled(len(modes) > 1)
+        self.color_combo.blockSignals(False)
+        self._on_color_mode_changed()
+
+    def _on_color_mode_changed(self, *_args) -> None:
+        mode = self.current_color_mode()
+        note = ""
+        if self.color_combo.count() <= 1 and self.container_combo.currentText() != GIF_EXTENSION:
+            note = "10-bit and HDR need the HEVC, AV1, ProRes or DNxHR codec."
+        elif mode == "pq":
+            note = ("HDR10 mastering metadata (display primaries, MaxCLL) is written by the CPU HEVC encoder; "
+                    "GPU and AV1 exports carry the HDR colour tags only.")
+        elif mode in ("pq", "hlg", "sdr10") and self.gpu_checkbox.isChecked():
+            note = "Uses the GPU encoder when it supports 10-bit, otherwise the CPU encoder."
+        self.color_note_label.setText(note)
+        self.color_note_label.setVisible(bool(note))
 
     def _on_two_pass_toggled(self, checked: bool) -> None:
         self.target_size_spin.setEnabled(checked)
@@ -543,6 +638,7 @@ class ExportDialog(QDialog):
             "gpu_target_size": self.gpu_target_checkbox.isChecked(),
             "audio_bitrate": self.audio_bitrate_combo.currentData(),
             "loudness": self.loudness_combo.currentData(),
+            "color_mode": self.current_color_mode(),
             "output_dir": os.path.dirname(self.path_edit.text().strip()),
         }
 
@@ -569,6 +665,10 @@ class ExportDialog(QDialog):
             index = self.loudness_combo.findData(data["loudness"])
             if index >= 0:
                 self.loudness_combo.setCurrentIndex(index)
+        if "color_mode" in data:
+            index = self.color_combo.findData(data["color_mode"])  # absent (unsupported here): left as is
+            if index >= 0:
+                self.color_combo.setCurrentIndex(index)
         if "use_gpu" in data and self.gpu_checkbox.isEnabled():
             self.gpu_checkbox.setChecked(bool(data["use_gpu"]))
         if "two_pass" in data and self.two_pass_checkbox.isEnabled():
@@ -660,11 +760,27 @@ class ExportDialog(QDialog):
     def is_running(self) -> bool:
         return self._worker is not None and self._thread is not None and self._thread.isRunning()
 
+    def _on_add_to_queue(self) -> None:
+        settings = self.build_settings()
+        if settings is None:
+            return
+        self._remember_settings()
+        self.queue_requested.emit(settings)
+        self.accept()
+
     def _on_export(self) -> None:
+        settings = self.build_settings()
+        if settings is None:
+            return
+        self._remember_settings()
+        self._start(settings)
+
+    def build_settings(self) -> Optional[ExportSettings]:
+        """The ExportSettings for the current controls, or None (after telling the user) when invalid."""
         output_path = self.path_edit.text().strip()
         if not output_path:
             QMessageBox.warning(self, "Export Video", "Please choose an output file.")
-            return
+            return None
         ext = self.container_combo.currentText()
         if container_of(output_path) != ext:
             output_path = apply_container_extension(output_path, ext)
@@ -678,12 +794,12 @@ class ExportDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No,
             )
             if result != QMessageBox.Yes:
-                return
+                return None
 
         trim_enabled = self.trim_checkbox.isChecked()
         if trim_enabled and self.trim_start_spin.value() >= self.trim_end_spin.value():
             QMessageBox.warning(self, "Export Video", "Trim Range Start must be less than End.")
-            return
+            return None
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -703,10 +819,13 @@ class ExportDialog(QDialog):
             loudness_target=self.loudness_combo.currentData(),
             video_codec=self.current_codec(),
             gpu_target_size=self.gpu_target_checkbox.isChecked() and self.gpu_target_checkbox.isEnabled(),
+            color_mode=self.current_color_mode(),
         )
-        self._remember_settings()
+        return settings
 
+    def _start(self, settings: ExportSettings) -> None:
         self.export_btn.setEnabled(False)
+        self.queue_btn.setEnabled(False)
         self.status_label.setText("Starting export...")
 
         self._thread = QThread(self)
@@ -717,8 +836,10 @@ class ExportDialog(QDialog):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
+        # Direct: a queued quit() never runs while cancel_and_wait() blocks the
+        # GUI thread in wait(), which then always timed out (5 s and a warning).
+        self._worker.finished.connect(self._thread.quit, Qt.DirectConnection)
+        self._worker.failed.connect(self._thread.quit, Qt.DirectConnection)
 
         self._thread.start()
 
@@ -729,6 +850,7 @@ class ExportDialog(QDialog):
     def _on_finished(self, path: str) -> None:
         self.status_label.setText(f"Export complete: {path}")
         self.export_btn.setEnabled(True)
+        self.queue_btn.setEnabled(True)
         self.warnings = list(self._worker.exporter.warnings) if self._worker is not None else []
         message = f"Video exported successfully to:\n{path}"
         if self.warnings:
@@ -741,6 +863,7 @@ class ExportDialog(QDialog):
         # status label gets just the headline, the dialog below the full text.
         self.status_label.setText(message.splitlines()[0] if message else message)
         self.export_btn.setEnabled(True)
+        self.queue_btn.setEnabled(True)
         QMessageBox.critical(self, "Export Video", message)
 
     def _on_cancel(self) -> None:
