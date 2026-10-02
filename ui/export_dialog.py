@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import os
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QSettings, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,6 +16,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -25,7 +28,28 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import ReframeMode
-from core.exporter import ExportCancelled, ExportError, ExportSettings, Exporter, QUALITY_PRESETS
+from core.export_presets import (
+    BUILTIN_PRESETS,
+    FPS_CHOICES,
+    delete_user_preset,
+    load_user_presets,
+    save_user_preset,
+    source_defaults,
+)
+from core.exporter import (
+    AUDIO_BITRATE_KBPS,
+    AUDIO_BITRATE_OPTIONS_KBPS,
+    CODEC_CONTAINERS,
+    CODEC_ENCODERS,
+    LOUDNESS_TARGETS,
+    QUALITY_PRESETS,
+    TWO_PASS_ENCODERS,
+    VIDEO_CODEC_CHOICES,
+    ExportCancelled,
+    ExportError,
+    ExportSettings,
+    Exporter,
+)
 from core.ffmpeg_utils import nvenc_available
 from core.project import Project
 
@@ -38,7 +62,9 @@ RESOLUTION_PRESETS = {
     "Custom": None,
 }
 
-FPS_OPTIONS = ["24", "25", "30", "50", "60"]
+FPS_OPTIONS = [label for label, _value in FPS_CHOICES]
+FPS_VALUES = dict(FPS_CHOICES)
+LAST_SETTINGS_KEY = "export/last_settings"
 CONTAINER_OPTIONS = [".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".gif"]
 GIF_EXTENSION = ".gif"
 
@@ -55,6 +81,39 @@ PLATFORM_DURATION_CAPS = {
 SHORTS_PLATFORM_OPTIONS = [SHORTS_PLATFORM_NONE] + list(PLATFORM_DURATION_CAPS.keys())
 
 
+def container_of(path: str) -> Optional[str]:
+    """The path's extension if it is one of CONTAINER_OPTIONS (lower-cased), else None."""
+    ext = os.path.splitext(path)[1].lower()
+    return ext if ext in CONTAINER_OPTIONS else None
+
+
+def apply_container_extension(path: str, ext: str) -> str:
+    """``path`` with the chosen container's extension: a known extension is replaced, anything else appended.
+
+    The Format combo is authoritative -- the exporter picks the codec from
+    the path's extension, and the dialog used to only *append* the combo's
+    extension when the path had none, so choosing .webm or .gif with the
+    default ``...mp4`` path still produced an MP4.
+    """
+    if container_of(path) is not None:
+        return os.path.splitext(path)[0] + ext
+    return path + ext
+
+
+def codecs_for_container(ext: str):
+    """Video codec choices (VIDEO_CODEC_CHOICES keys) valid for a container, "auto" first."""
+    if ext == GIF_EXTENSION:
+        return ["auto"]
+    return ["auto"] + [key for key, exts in CODEC_CONTAINERS.items() if ext in exts]
+
+
+def _settings_store() -> Optional[QSettings]:
+    """The app's QSettings, or None when no organization is set (tests): nothing is persisted then."""
+    if not QCoreApplication.organizationName():
+        return None
+    return QSettings()
+
+
 class ExportWorker(QObject):
     progress = Signal(float, str)
     finished = Signal(str)
@@ -62,7 +121,9 @@ class ExportWorker(QObject):
 
     def __init__(self, project: Project, settings: ExportSettings):
         super().__init__()
-        self.exporter = Exporter(project)
+        # The exporter renders its own deep copy of the project: the dialog is
+        # non-modal, so the user may keep editing while this runs.
+        self.exporter = Exporter(copy.deepcopy(project))
         self.settings = settings
 
     def run(self) -> None:
@@ -81,25 +142,56 @@ class ExportWorker(QObject):
 
 
 class ExportDialog(QDialog):
-    """Modal dialog to configure export settings and watch render progress."""
+    """Dialog to configure export settings and watch render progress.
 
-    def __init__(self, project: Project, parent: Optional[QWidget] = None):
+    Non-modal (the editor stays usable during a render, which works on a
+    project snapshot), deleted when closed, and Esc/Cancel during a render
+    cancels it instead of hiding it.
+    """
+
+    def __init__(
+        self,
+        project: Project,
+        parent: Optional[QWidget] = None,
+        in_out_range: Optional[Tuple[float, float]] = None,
+    ):
         super().__init__(parent)
         self.project = project
+        self._in_out_range = in_out_range
         self.setWindowTitle("Export Video")
         self.setMinimumWidth(440)
         self._thread: Optional[QThread] = None
         self._worker: Optional[ExportWorker] = None
+        self.warnings = []
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         self._build_ui()
+        self._restore_last_settings()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.setToolTip("Apply a saved group of export settings")
+        self._reload_presets()
+        self.preset_combo.activated.connect(self._on_preset_chosen)
+        self.save_preset_btn = QPushButton("Save...")
+        self.save_preset_btn.setToolTip("Save the current settings as a preset")
+        self.save_preset_btn.clicked.connect(self._on_save_preset)
+        self.delete_preset_btn = QPushButton("Delete")
+        self.delete_preset_btn.setToolTip("Delete the selected user preset")
+        self.delete_preset_btn.clicked.connect(self._on_delete_preset)
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.save_preset_btn)
+        preset_row.addWidget(self.delete_preset_btn)
+        form.addRow("Preset", preset_row)
+
         path_row = QHBoxLayout()
         default_name = os.path.join(os.path.expanduser("~"), "Videos", f"{self.project.name}.mp4")
         self.path_edit = QLineEdit(default_name)
+        self.path_edit.editingFinished.connect(self._on_path_edited)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse)
         path_row.addWidget(self.path_edit, 1)
@@ -110,6 +202,14 @@ class ExportDialog(QDialog):
         self.container_combo.addItems(CONTAINER_OPTIONS)
         self.container_combo.currentTextChanged.connect(self._on_container_changed)
         form.addRow("Format", self.container_combo)
+
+        self.codec_combo = QComboBox()
+        self.codec_combo.setToolTip(
+            "HEVC and AV1 make smaller files at the same quality; ProRes and DNxHR are large, "
+            "edit-friendly intermediates."
+        )
+        self.codec_combo.currentIndexChanged.connect(self._on_codec_changed)
+        form.addRow("Video Codec", self.codec_combo)
 
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems(list(RESOLUTION_PRESETS.keys()))
@@ -135,6 +235,7 @@ class ExportDialog(QDialog):
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(FPS_OPTIONS)
         self.fps_combo.setCurrentText("30")
+        self.fps_combo.setToolTip("23.976 / 29.97 / 59.94 are the exact NTSC rates (24000/1001...) of most camera footage")
         form.addRow("Frame Rate", self.fps_combo)
 
         self.quality_combo = QComboBox()
@@ -176,6 +277,29 @@ class ExportDialog(QDialog):
         two_pass_row.addWidget(self.two_pass_checkbox)
         two_pass_row.addWidget(self.target_size_spin)
         form.addRow("", two_pass_row)
+
+        self.gpu_target_checkbox = QCheckBox("Target size on the GPU (one pass, approximate size)")
+        self.gpu_target_checkbox.setToolTip(
+            "One NVENC pass with a capped bitrate: much faster, lands close to the target. "
+            "Off: CPU two-pass, which hits the size exactly."
+        )
+        self.gpu_target_checkbox.setEnabled(False)
+        form.addRow("", self.gpu_target_checkbox)
+
+        self.audio_bitrate_combo = QComboBox()
+        for kbps in AUDIO_BITRATE_OPTIONS_KBPS:
+            self.audio_bitrate_combo.addItem(f"{kbps} kbps", kbps)
+        self.audio_bitrate_combo.setCurrentIndex(self.audio_bitrate_combo.findData(AUDIO_BITRATE_KBPS))
+        form.addRow("Audio Bitrate", self.audio_bitrate_combo)
+
+        self.loudness_combo = QComboBox()
+        for label, target in LOUDNESS_TARGETS.items():
+            self.loudness_combo.addItem(label, target)
+        self.loudness_combo.setToolTip(
+            "Normalize the mix to a platform's loudness (two-pass EBU R128 loudnorm, true peak -1 dBTP). "
+            "Peaks are always limited to -1 dBFS."
+        )
+        form.addRow("Loudness", self.loudness_combo)
 
         self.gif_note_label = QLabel("Animated GIF: no audio track; quality comes from palette dithering, not the setting above.")
         self.gif_note_label.setWordWrap(True)
@@ -223,6 +347,15 @@ class ExportDialog(QDialog):
         # keeps this correct if those defaults ever change).
         self._refresh_gpu_checkbox_enabled()
 
+        self._refresh_codec_combo()
+
+        # In/Out points set on the timeline (I/O keys) pre-fill Trim Range.
+        if self._in_out_range is not None:
+            start, end = self._in_out_range
+            self.trim_checkbox.setChecked(True)
+            self.trim_start_spin.setValue(start)
+            self.trim_end_spin.setValue(end)
+
         layout.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -245,6 +378,46 @@ class ExportDialog(QDialog):
         buttons.addWidget(self.export_btn)
         layout.addLayout(buttons)
 
+    # ------------------------------------------------------------------
+    # Codec choice
+    # ------------------------------------------------------------------
+    def current_codec(self) -> str:
+        return self.codec_combo.currentData() or "auto"
+
+    def _refresh_codec_combo(self) -> None:
+        current = self.current_codec() if self.codec_combo.count() else "auto"
+        self.codec_combo.blockSignals(True)
+        self.codec_combo.clear()
+        for key in codecs_for_container(self.container_combo.currentText()):
+            self.codec_combo.addItem(VIDEO_CODEC_CHOICES[key], key)
+        index = self.codec_combo.findData(current)
+        self.codec_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.codec_combo.blockSignals(False)
+        self._on_codec_changed()
+
+    def _effective_encoder(self) -> str:
+        from core.exporter import resolve_codecs
+
+        try:
+            return resolve_codecs(self.container_combo.currentText(), self.current_codec())[0]
+        except ValueError:
+            return ""
+
+    def _on_codec_changed(self, *_args) -> None:
+        if not hasattr(self, "two_pass_checkbox"):
+            return
+        is_gif = self.container_combo.currentText() == GIF_EXTENSION
+        two_pass_ok = not is_gif and self._effective_encoder() in TWO_PASS_ENCODERS
+        if not two_pass_ok and self.two_pass_checkbox.isChecked():
+            self.two_pass_checkbox.setChecked(False)
+        self.two_pass_checkbox.setEnabled(two_pass_ok)
+        self.two_pass_checkbox.setToolTip(
+            "" if two_pass_ok else "Target file size needs H.264, VP9 or AV1."
+        )
+        intermediate = self.current_codec() in ("prores", "dnxhr")
+        self.quality_combo.setEnabled(not is_gif and not intermediate and not self.two_pass_checkbox.isChecked())
+        self._refresh_gpu_checkbox_enabled()
+
     def _on_two_pass_toggled(self, checked: bool) -> None:
         self.target_size_spin.setEnabled(checked)
         self.quality_combo.setEnabled(not checked)
@@ -256,15 +429,22 @@ class ExportDialog(QDialog):
         self._refresh_gpu_checkbox_enabled()
 
     def _refresh_gpu_checkbox_enabled(self) -> None:
-        is_gpu_capable_format = self.container_combo.currentText() not in (GIF_EXTENSION, ".webm")
-        enabled = self._gpu_detected and is_gpu_capable_format and not self.two_pass_checkbox.isChecked()
+        from core.exporter import NVENC_CODEC_MAP
+
+        is_gpu_capable_format = self._effective_encoder() in NVENC_CODEC_MAP
+        two_pass = self.two_pass_checkbox.isChecked()
+        enabled = self._gpu_detected and is_gpu_capable_format and not two_pass
         self.gpu_checkbox.setEnabled(enabled)
+        if hasattr(self, "gpu_target_checkbox"):
+            self.gpu_target_checkbox.setEnabled(self._gpu_detected and is_gpu_capable_format and two_pass)
         if not self._gpu_detected:
             return
         if not is_gpu_capable_format:
-            self.gpu_checkbox.setToolTip("GPU encoding isn't available for this output format -- using the CPU encoder.")
-        elif self.two_pass_checkbox.isChecked():
-            self.gpu_checkbox.setToolTip("Two-pass, target file size exports always use the CPU encoder.")
+            self.gpu_checkbox.setToolTip("GPU encoding isn't available for this format/codec -- using the CPU encoder.")
+        elif two_pass:
+            self.gpu_checkbox.setToolTip(
+                "Target-size exports use CPU two-pass unless 'Target size on the GPU' below is ticked."
+            )
         else:
             self.gpu_checkbox.setToolTip(
                 "Encodes with your NVIDIA GPU (NVENC) instead of the CPU for MP4/MOV/MKV/AVI/FLV output -- "
@@ -280,8 +460,21 @@ class ExportDialog(QDialog):
             self.two_pass_checkbox.setChecked(False)
         self.quality_combo.setEnabled(not is_gif)
         self.two_pass_checkbox.setEnabled(not is_gif)
+        self.audio_bitrate_combo.setEnabled(not is_gif)
+        self.loudness_combo.setEnabled(not is_gif)
         self.gif_note_label.setVisible(is_gif)
+        self._refresh_codec_combo()
         self._refresh_gpu_checkbox_enabled()
+        # The combo is authoritative: keep the output path's extension in step.
+        path = self.path_edit.text().strip()
+        if path and container_of(path) != text:
+            self.path_edit.setText(apply_container_extension(path, text))
+
+    def _on_path_edited(self) -> None:
+        """Typing a different known extension selects that format."""
+        ext = container_of(self.path_edit.text().strip())
+        if ext is not None and ext != self.container_combo.currentText():
+            self.container_combo.setCurrentText(ext)
 
     def _on_resolution_changed(self, text: str) -> None:
         preset = RESOLUTION_PRESETS.get(text)
@@ -330,9 +523,142 @@ class ExportDialog(QDialog):
         ext = self.container_combo.currentText()
         path, _ = QFileDialog.getSaveFileName(self, "Export Video", self.path_edit.text(), f"Video (*{ext})")
         if path:
-            if not path.lower().endswith(ext):
-                path += ext
-            self.path_edit.setText(path)
+            self.path_edit.setText(apply_container_extension(path, ext) if container_of(path) != ext else path)
+
+    # ------------------------------------------------------------------
+    # Presets and remembered settings
+    # ------------------------------------------------------------------
+    def current_settings_dict(self) -> Dict[str, Any]:
+        """The dialog's reusable settings (not the file name or trim range), as a preset dict."""
+        return {
+            "container": self.container_combo.currentText(),
+            "video_codec": self.current_codec(),
+            "width": self.width_spin.value(),
+            "height": self.height_spin.value(),
+            "fps": FPS_VALUES.get(self.fps_combo.currentText(), 30.0),
+            "quality": self.quality_combo.currentText(),
+            "use_gpu": self.gpu_checkbox.isChecked(),
+            "two_pass": self.two_pass_checkbox.isChecked(),
+            "target_size_mb": self.target_size_spin.value(),
+            "gpu_target_size": self.gpu_target_checkbox.isChecked(),
+            "audio_bitrate": self.audio_bitrate_combo.currentData(),
+            "loudness": self.loudness_combo.currentData(),
+            "output_dir": os.path.dirname(self.path_edit.text().strip()),
+        }
+
+    def apply_settings(self, data: Dict[str, Any]) -> None:
+        """Apply a preset/remembered dict; missing keys leave their control unchanged."""
+        if data.get("container") in CONTAINER_OPTIONS:
+            self.container_combo.setCurrentText(data["container"])
+        if "video_codec" in data:
+            index = self.codec_combo.findData(data["video_codec"])
+            if index >= 0:
+                self.codec_combo.setCurrentIndex(index)
+        if data.get("width") and data.get("height"):
+            self.set_resolution(int(data["width"]), int(data["height"]))
+        if data.get("fps"):
+            label = min(FPS_CHOICES, key=lambda c: abs(c[1] - float(data["fps"])))[0]
+            self.fps_combo.setCurrentText(label)
+        if data.get("quality") in QUALITY_PRESETS:
+            self.quality_combo.setCurrentText(data["quality"])
+        if "audio_bitrate" in data:
+            index = self.audio_bitrate_combo.findData(data["audio_bitrate"])
+            if index >= 0:
+                self.audio_bitrate_combo.setCurrentIndex(index)
+        if "loudness" in data:
+            index = self.loudness_combo.findData(data["loudness"])
+            if index >= 0:
+                self.loudness_combo.setCurrentIndex(index)
+        if "use_gpu" in data and self.gpu_checkbox.isEnabled():
+            self.gpu_checkbox.setChecked(bool(data["use_gpu"]))
+        if "two_pass" in data and self.two_pass_checkbox.isEnabled():
+            self.two_pass_checkbox.setChecked(bool(data["two_pass"]))
+        if data.get("target_size_mb"):
+            self.target_size_spin.setValue(float(data["target_size_mb"]))
+        if "gpu_target_size" in data:
+            self.gpu_target_checkbox.setChecked(bool(data["gpu_target_size"]))
+        if data.get("output_dir") and os.path.isdir(data["output_dir"]):
+            name = os.path.splitext(os.path.basename(self.path_edit.text().strip()))[0] or self.project.name
+            self.path_edit.setText(os.path.join(data["output_dir"], name + self.container_combo.currentText()))
+        if data.get("platform") in PLATFORM_DURATION_CAPS:
+            self.platform_combo.setCurrentText(data["platform"])
+
+    def set_resolution(self, width: int, height: int) -> None:
+        for label, preset in RESOLUTION_PRESETS.items():
+            if preset == (width, height):
+                self.resolution_combo.setCurrentText(label)
+                return
+        self.resolution_combo.setCurrentText("Custom")
+        self.width_spin.setValue(width)
+        self.height_spin.setValue(height)
+
+    def _restore_last_settings(self) -> None:
+        """Last export's settings, then the dominant source's size and frame rate (if any).
+
+        The project's own footage decides resolution/fps (exporting 29.97
+        camera footage at 30 made a frame judder every 33 s); everything
+        else (format, codec, quality, loudness, folder) is remembered.
+        """
+        store = _settings_store()
+        if store is not None:
+            try:
+                remembered = json.loads(store.value(LAST_SETTINGS_KEY, "") or "{}")
+            except (TypeError, ValueError):
+                remembered = {}
+            if isinstance(remembered, dict):
+                self.apply_settings(remembered)
+        defaults = source_defaults(self.project)
+        if defaults is not None:
+            width, height, fps_label = defaults
+            self.set_resolution(width, height)
+            if fps_label:
+                self.fps_combo.setCurrentText(fps_label)
+
+    def _remember_settings(self) -> None:
+        store = _settings_store()
+        if store is not None:
+            store.setValue(LAST_SETTINGS_KEY, json.dumps(self.current_settings_dict()))
+
+    def _reload_presets(self) -> None:
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Choose a preset...", None)
+        for name in BUILTIN_PRESETS:
+            self.preset_combo.addItem(name, ("builtin", name))
+        for name in sorted(load_user_presets()):
+            self.preset_combo.addItem(f"{name} (saved)", ("user", name))
+        self.preset_combo.blockSignals(False)
+
+    def preset_data(self, key) -> Optional[Dict[str, Any]]:
+        if not key:
+            return None
+        kind, name = key
+        return BUILTIN_PRESETS.get(name) if kind == "builtin" else load_user_presets().get(name)
+
+    def _on_preset_chosen(self, index: int) -> None:
+        data = self.preset_data(self.preset_combo.itemData(index))
+        if data is not None:
+            self.apply_settings(data)
+
+    def _on_save_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Export Preset", "Preset name:")
+        if not ok or not name.strip():
+            return
+        save_user_preset(name.strip(), self.current_settings_dict())
+        self._reload_presets()
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData(("user", name.strip())))
+
+    def _on_delete_preset(self) -> None:
+        key = self.preset_combo.currentData()
+        if not key or key[0] != "user":
+            QMessageBox.information(self, "Export Presets", "Built-in presets can't be deleted.")
+            return
+        delete_user_preset(key[1])
+        self._reload_presets()
+
+    # ------------------------------------------------------------------
+    def is_running(self) -> bool:
+        return self._worker is not None and self._thread is not None and self._thread.isRunning()
 
     def _on_export(self) -> None:
         output_path = self.path_edit.text().strip()
@@ -340,8 +666,9 @@ class ExportDialog(QDialog):
             QMessageBox.warning(self, "Export Video", "Please choose an output file.")
             return
         ext = self.container_combo.currentText()
-        if not output_path.lower().endswith(tuple(CONTAINER_OPTIONS)):
-            output_path += ext
+        if container_of(output_path) != ext:
+            output_path = apply_container_extension(output_path, ext)
+            self.path_edit.setText(output_path)
 
         if os.path.exists(output_path):
             result = QMessageBox.question(
@@ -364,7 +691,7 @@ class ExportDialog(QDialog):
             output_path=output_path,
             width=self.width_spin.value(),
             height=self.height_spin.value(),
-            fps=float(self.fps_combo.currentText()),
+            fps=FPS_VALUES.get(self.fps_combo.currentText(), 30.0),
             quality_preset=self.quality_combo.currentText(),
             two_pass=self.two_pass_checkbox.isChecked(),
             target_size_mb=self.target_size_spin.value() if self.two_pass_checkbox.isChecked() else None,
@@ -372,7 +699,12 @@ class ExportDialog(QDialog):
             trim_start=self.trim_start_spin.value() if trim_enabled else 0.0,
             trim_end=self.trim_end_spin.value() if trim_enabled else None,
             use_gpu=self.gpu_checkbox.isChecked(),
+            audio_bitrate_kbps=int(self.audio_bitrate_combo.currentData()),
+            loudness_target=self.loudness_combo.currentData(),
+            video_codec=self.current_codec(),
+            gpu_target_size=self.gpu_target_checkbox.isChecked() and self.gpu_target_checkbox.isEnabled(),
         )
+        self._remember_settings()
 
         self.export_btn.setEnabled(False)
         self.status_label.setText("Starting export...")
@@ -397,7 +729,11 @@ class ExportDialog(QDialog):
     def _on_finished(self, path: str) -> None:
         self.status_label.setText(f"Export complete: {path}")
         self.export_btn.setEnabled(True)
-        QMessageBox.information(self, "Export Video", f"Video exported successfully to:\n{path}")
+        self.warnings = list(self._worker.exporter.warnings) if self._worker is not None else []
+        message = f"Video exported successfully to:\n{path}"
+        if self.warnings:
+            message += "\n\nWarnings:\n" + "\n".join(self.warnings)
+        QMessageBox.information(self, "Export Video", message)
         self.accept()
 
     def _on_failed(self, message: str) -> None:
@@ -408,25 +744,38 @@ class ExportDialog(QDialog):
         QMessageBox.critical(self, "Export Video", message)
 
     def _on_cancel(self) -> None:
-        if self._worker is not None and self._thread is not None and self._thread.isRunning():
+        if self.is_running():
             self._worker.cancel()
             self.status_label.setText("Cancelling...")
         else:
             self.reject()
 
+    def cancel_and_wait(self, timeout_ms: int = 5000) -> bool:
+        """Cancel a running export and wait for it; True when nothing is running any more."""
+        if not self.is_running():
+            return True
+        self._worker.cancel()  # terminates the ffmpeg process immediately (core/exporter.py)
+        self.status_label.setText("Cancelling export...")
+        if self._thread.wait(timeout_ms):
+            return True
+        # FFmpeg still hasn't exited: don't destroy a QThread/QObject that's
+        # still running underneath it; ask the user to wait instead.
+        QMessageBox.warning(
+            self, "Export Video", "The export is still shutting down. Please wait a moment and try again."
+        )
+        return False
+
+    def reject(self) -> None:
+        """Esc / Cancel / window close: cancel a running export first.
+
+        QDialog.reject() used to just hide the dialog -- Esc left the render
+        running invisibly with no way to cancel it.
+        """
+        if self.cancel_and_wait():
+            super().reject()
+
     def closeEvent(self, event) -> None:
-        if self._worker is not None and self._thread is not None and self._thread.isRunning():
-            self._worker.cancel()  # now terminates the ffmpeg process immediately (core/exporter.py)
-            self.status_label.setText("Cancelling export...")
-            if not self._thread.wait(5000):
-                # FFmpeg still hasn't exited — don't destroy a QThread/QObject
-                # that's still running underneath it; ask the user to wait
-                # rather than risk a crash on teardown.
-                QMessageBox.warning(
-                    self,
-                    "Export Video",
-                    "The export is still shutting down. Please wait a moment and try closing again.",
-                )
-                event.ignore()
-                return
+        if not self.cancel_and_wait():
+            event.ignore()
+            return
         super().closeEvent(event)
