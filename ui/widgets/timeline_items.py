@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QObject
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import Clip, MediaType
+from core.timeline_nav import clip_keyframe_points, format_timecode
 from ui import theme
 
 TRACK_HEIGHT = 64
@@ -57,9 +59,28 @@ EFFECT_INDICATORS: Tuple[Tuple[str, str, str], ...] = (
     ("has_chroma_key", "K", theme.COLOR_SUCCESS),
     ("has_denoise", "N", theme.COLOR_ACCENT),
     ("has_transition", "T", theme.CLIP_COLOR_TEXT),
+    ("has_effects", "FX", "#8b6cd9"),
+    ("has_volume_automation", "V", "#d9822b"),
 )
-EFFECT_BADGE_SIZE = 10
+# Full names for the badge tooltips (badges used to be colour + one letter only).
+EFFECT_NAMES = {
+    "C": "Color Correction", "K": "Chroma Key", "N": "Noise Reduction", "T": "Transition",
+    "FX": "Effects", "V": "Volume Automation",
+}
+EFFECT_BADGE_SIZE = 14
 EFFECT_BADGE_GAP = 2
+EFFECT_BADGE_FONT_PT = 8
+CLIP_LABEL_FONT_PT = 9
+MEDIA_KIND_NAMES = {MediaType.VIDEO: "Video", MediaType.AUDIO: "Audio", MediaType.IMAGE: "Image", MediaType.TEXT: "Text"}
+
+
+def row_at_scene_y(scene_y: float) -> int:
+    """Track row under a scene y coordinate (e.g. the mouse position of a drop).
+
+    ``floor``, not ``round``: rows are ``TRACK_HEIGHT + TRACK_GAP`` px apart,
+    and rounding sent a drop on the lower half of a track to the next one.
+    """
+    return max(0, int(math.floor((scene_y - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP))))
 
 
 def _active_effect_badges(clip: Clip) -> List[Tuple[str, str]]:
@@ -67,18 +88,43 @@ def _active_effect_badges(clip: Clip) -> List[Tuple[str, str]]:
     return [(letter, color) for attr, letter, color in EFFECT_INDICATORS if getattr(clip, attr)]
 
 
+def clip_description(clip: Clip, track_name: str = "", fps: float = 30.0, offline: bool = False) -> str:
+    """Spoken-style description of a clip, used as its tooltip (the timeline's accessible text).
+
+    e.g. "Video clip Arbol.mp4, 00:00:12:00 to 00:00:20:00, track Video 1. Effects: Color Correction."
+    """
+    text = (
+        f"{MEDIA_KIND_NAMES.get(clip.media_type, 'Clip')} clip {clip.name}, "
+        f"{format_timecode(clip.timeline_start, fps)} to {format_timecode(clip.timeline_end, fps)}"
+    )
+    if track_name:
+        text += f", track {track_name}"
+    text += "."
+    badges = [EFFECT_NAMES[letter] for letter, _color in _active_effect_badges(clip)]
+    if badges:
+        text += " Effects: " + ", ".join(badges) + "."
+    if clip.link_group:
+        text += " Linked to another clip (they move together)."
+    if offline:
+        text += " OFFLINE: the source file is missing (File > Relink Media)."
+    return text
+
+
 class TimelineSignals(QObject):
     """Central signal hub since QGraphicsItem is not a QObject."""
 
     clip_selected = Signal(str)
+    clip_toggle_selected = Signal(str)  # Ctrl+click: add to / remove from the selection
+    clip_context_menu = Signal(str, object)  # clip id, global QPoint
+    clip_razor = Signal(str, float)  # clip id, timeline seconds to split at (Razor tool)
     clip_moved = Signal(str, float, int)  # clip_id, new_start, new_track_row
     clip_trimmed = Signal(str, float, float, float)  # clip_id, in, out, start
     clip_double_clicked = Signal(str)
-    playhead_dragged = Signal(float)
     track_mute_toggled = Signal(int)
     track_lock_toggled = Signal(int)
     track_hidden_toggled = Signal(int)
     track_duck_config_requested = Signal(int)  # row -> right-clicked "Duck Audio Under..."
+    track_selected = Signal(int)  # row -> header clicked (Delete Track acts on it)
     snap_guide_show = Signal(float)  # timeline seconds where the guide should be drawn
     snap_guide_hide = Signal()
     marker_clicked = Signal(str)  # marker_id -> seek the playhead there
@@ -98,9 +144,17 @@ class ClipItem(QGraphicsObject):
         thumbnail: Optional[QPixmap] = None,
         waveform: Optional[WaveformData] = None,
         snap_targets_provider: Optional[Callable[[str], List[float]]] = None,
+        track_name: str = "",
+        fps: float = 30.0,
+        offline: bool = False,
     ):
         super().__init__()
         self.clip_id = clip.id
+        self.track_name = track_name
+        self.fps = fps
+        self.offline = offline
+        # Razor tool: a click splits the clip there instead of selecting/dragging.
+        self.razor_mode = False
         self.row = row
         self.pixels_per_second = pixels_per_second
         self.signals = signals
@@ -117,6 +171,12 @@ class ClipItem(QGraphicsObject):
         self._source_duration = clip.source_duration
         self._locked = False
         self._effect_badges = _active_effect_badges(clip)
+        # A private copy of the model clip, so trim drags compute the
+        # trimmed duration exactly as the model will (speed ramps included)
+        # instead of assuming one constant speed.
+        self._model = clip.with_source_range(clip.source_in, clip.source_out)
+        self._keyframe_times = [t - clip.timeline_start for t in clip_keyframe_points(clip)]
+        self.setToolTip(clip_description(clip, track_name, fps, offline))
 
         self.setFlags(
             QGraphicsItem.ItemIsMovable
@@ -144,9 +204,21 @@ class ClipItem(QGraphicsObject):
         self._source_out = clip.source_out
         self._source_duration = clip.source_duration
         self._effect_badges = _active_effect_badges(clip)
+        self._model = clip.with_source_range(clip.source_in, clip.source_out)
+        self._keyframe_times = [t - clip.timeline_start for t in clip_keyframe_points(clip)]
+        self.setToolTip(clip_description(clip, self.track_name, self.fps, self.offline))
         self._sync_position()
         self.prepareGeometryChange()
         self.update()
+
+    def keyframe_times(self) -> List[float]:
+        """Clip-local times of the keyframe ticks drawn on this clip."""
+        return list(self._keyframe_times)
+
+    def set_row(self, row: int) -> None:
+        if row != self.row:
+            self.row = row
+            self._sync_position()
 
     def active_effect_labels(self) -> List[str]:
         """The letters of every effect-indicator badge currently shown (left to right)."""
@@ -208,33 +280,60 @@ class ClipItem(QGraphicsObject):
         show_badges = bool(self._effect_badges) and rect.width() >= 34
         if show_badges:
             n = len(self._effect_badges)
-            badge_reserve = n * EFFECT_BADGE_SIZE + (n - 1) * EFFECT_BADGE_GAP + 4
+            wide = sum(1 for letter, _c in self._effect_badges if len(letter) > 1)
+            badge_reserve = n * EFFECT_BADGE_SIZE + wide * 8 + (n - 1) * EFFECT_BADGE_GAP + 4
 
-        painter.setPen(QColor("#ffffff"))
+        if self.offline:
+            # Offline media: red diagonal hatching over the whole clip.
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(theme.COLOR_DANGER), Qt.BDiagPattern))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
+            painter.restore()
+
         font = QFont()
-        font.setPointSize(9)
+        font.setPointSize(CLIP_LABEL_FONT_PT)
         font.setBold(True)
         painter.setFont(font)
         text_x = 52 if (self.thumbnail is not None and rect.width() > 30) else 8
         text_rect = QRectF(text_x, 2, max(0.0, rect.width() - text_x - 4 - badge_reserve), 16)
-        elided = painter.fontMetrics().elidedText(self._name, Qt.ElideRight, int(text_rect.width()))
+        label = f"{self._name} (offline)" if self.offline else self._name
+        elided = painter.fontMetrics().elidedText(label, Qt.ElideRight, int(text_rect.width()))
+        if elided and text_rect.width() > 4:
+            # Dark translucent strip behind the name (see theme.CLIP_LABEL_STRIP_ALPHA).
+            strip_width = min(text_rect.width(), painter.fontMetrics().horizontalAdvance(elided) + 8)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, theme.CLIP_LABEL_STRIP_ALPHA))
+            painter.drawRoundedRect(QRectF(text_x - 4, 2, strip_width, 16), 3, 3)
+        painter.setPen(QColor("#ffffff"))
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
 
         if show_badges:
             badge_font = QFont()
-            badge_font.setPointSize(6)
+            badge_font.setPointSize(EFFECT_BADGE_FONT_PT)
             badge_font.setBold(True)
             painter.setFont(badge_font)
             x = rect.width() - badge_reserve + 2
             y = 2.0
             for letter, color in self._effect_badges:
-                badge_rect = QRectF(x, y, EFFECT_BADGE_SIZE, EFFECT_BADGE_SIZE)
+                width = EFFECT_BADGE_SIZE + (8 if len(letter) > 1 else 0)
+                badge_rect = QRectF(x, y, width, EFFECT_BADGE_SIZE)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor(color))
                 painter.drawRoundedRect(badge_rect, 2, 2)
-                painter.setPen(QColor("#ffffff"))
+                painter.setPen(QColor(theme.readable_text_color(color)))
                 painter.drawText(badge_rect, Qt.AlignCenter, letter)
-                x += EFFECT_BADGE_SIZE + EFFECT_BADGE_GAP
+                x += width + EFFECT_BADGE_GAP
+
+        # Keyframe ticks: a small diamond per keyframe along the bottom edge.
+        if self._keyframe_times and self.pixels_per_second > 0:
+            painter.setPen(QPen(QColor("#111111"), 1))
+            painter.setBrush(QColor("#ffd54a"))
+            y = rect.height() - 6
+            for t in self._keyframe_times:
+                x = t * self.pixels_per_second
+                if 0 <= x <= rect.width():
+                    painter.drawPolygon(QPolygonF([QPointF(x, y - 4), QPointF(x + 4, y), QPointF(x, y + 4), QPointF(x - 4, y)]))
 
         # Fade / trim handles indicator (subtle triangles at the corners).
         if rect.width() > 20:
@@ -345,6 +444,19 @@ class ClipItem(QGraphicsObject):
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if event.button() == Qt.RightButton:
+            # Right-click opens the clip menu (it used to start a drag).
+            event.accept()
+            return
+        if self.razor_mode and not self._locked:
+            seconds = self._start + max(0.0, event.pos().x()) / self.pixels_per_second
+            self.signals.clip_razor.emit(self.clip_id, seconds)
+            event.accept()
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            self.signals.clip_toggle_selected.emit(self.clip_id)
+            event.accept()
+            return
         self.signals.clip_selected.emit(self.clip_id)
         if self._locked:
             event.accept()
@@ -373,57 +485,59 @@ class ClipItem(QGraphicsObject):
 
         delta_px = event.scenePos().x() - self._press_scene_x
         delta_timeline_s = delta_px / self.pixels_per_second
-        delta_source_s = delta_timeline_s * self._speed
-        min_source_len = 0.1 * self._speed
 
         if self._drag_mode == "trim_left":
-            max_delta = self._press_source_out - self._press_source_in - min_source_len
-            lower_bound = -self._press_source_in  # can't trim before source start
-            lower_bound = max(lower_bound, -self._press_start)  # can't move timeline start below 0
-            clamped = max(lower_bound, min(delta_source_s, max_delta))
-            self._source_in = self._press_source_in + clamped
-            self._start = self._press_start + clamped / self._speed
-            self._duration = (self._press_source_out - self._source_in) / self._speed
-
+            self._apply_trim_left(delta_timeline_s)
             snap_t = self._nearest_target(self._start, self._snap_targets())
             if snap_t is not None:
                 self.signals.snap_guide_show.emit(snap_t)
-                snapped_clamped = max(lower_bound, min((snap_t - self._press_start) * self._speed, max_delta))
-                self._source_in = self._press_source_in + snapped_clamped
-                self._start = self._press_start + snapped_clamped / self._speed
-                self._duration = (self._press_source_out - self._source_in) / self._speed
+                self._apply_trim_left(snap_t - self._press_start)
             else:
                 self.signals.snap_guide_hide.emit()
-
             self._sync_position()
             self.prepareGeometryChange()
             self.update()
         elif self._drag_mode == "trim_right":
-            min_delta = -(self._press_source_out - self._press_source_in - min_source_len)
-            max_delta = None
-            if self._source_duration is not None:
-                max_delta = self._source_duration - self._press_source_out
-            clamped = max(min_delta, delta_source_s)
-            if max_delta is not None:
-                clamped = min(clamped, max_delta)
-            self._source_out = self._press_source_out + clamped
-            self._duration = (self._source_out - self._source_in) / self._speed
-
-            end_s = self._start + self._duration
-            snap_t = self._nearest_target(end_s, self._snap_targets())
+            self._apply_trim_right(delta_timeline_s)
+            snap_t = self._nearest_target(self._start + self._duration, self._snap_targets())
             if snap_t is not None:
                 self.signals.snap_guide_show.emit(snap_t)
-                snapped_clamped = (snap_t - self._start) * self._speed - (self._press_source_out - self._press_source_in)
-                snapped_clamped = max(min_delta, snapped_clamped)
-                if max_delta is not None:
-                    snapped_clamped = min(snapped_clamped, max_delta)
-                self._source_out = self._press_source_out + snapped_clamped
-                self._duration = (self._source_out - self._source_in) / self._speed
+                self._apply_trim_right(snap_t - self._start - self._press_duration)
             else:
                 self.signals.snap_guide_hide.emit()
-
             self.prepareGeometryChange()
             self.update()
+
+    def _min_source_length(self) -> float:
+        return 0.1 * self._model.speed_at(0.0)
+
+    def _apply_trim_left(self, delta_timeline_s: float) -> None:
+        """Move the left edge by ``delta_timeline_s`` (clamped), updating in/start/duration.
+
+        Source and timeline offsets go through the model clip's own
+        time mapping (:meth:`Clip.source_offset_at`), and the resulting
+        length is the trimmed clip's real ``Clip.duration`` -- the old
+        ``/ self._speed`` math was wrong for speed-ramped clips.
+        """
+        model = self._model
+        delta_timeline_s = max(delta_timeline_s, -self._press_start)  # timeline start can't go below 0
+        src_delta = model.source_offset_at(delta_timeline_s)
+        src_delta = max(src_delta, -self._press_source_in)  # can't trim before the source's start
+        src_delta = min(src_delta, self._press_source_out - self._press_source_in - self._min_source_length())
+        self._source_in = self._press_source_in + src_delta
+        self._start = max(0.0, self._press_start + model.timeline_offset_at(src_delta))
+        self._duration = model.with_source_range(self._source_in, self._press_source_out).duration
+
+    def _apply_trim_right(self, delta_timeline_s: float) -> None:
+        """Move the right edge by ``delta_timeline_s`` (clamped); see :meth:`_apply_trim_left`."""
+        model = self._model
+        new_len = self._press_duration + delta_timeline_s
+        source_out = self._press_source_in + model.source_offset_at(max(0.0, new_len))
+        source_out = max(source_out, self._press_source_in + self._min_source_length())
+        if self._source_duration is not None:
+            source_out = min(source_out, self._source_duration)
+        self._source_out = source_out
+        self._duration = model.with_source_range(self._press_source_in, source_out).duration
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         self.signals.snap_guide_hide.emit()
@@ -446,19 +560,34 @@ class ClipItem(QGraphicsObject):
         self.signals.clip_double_clicked.emit(self.clip_id)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        self.signals.clip_context_menu.emit(self.clip_id, event.screenPos())
+        event.accept()
+
 
 class ToggleButtonItem(QGraphicsObject):
     """A tiny clickable square icon-button used in track headers."""
 
     clicked = Signal()
 
-    def __init__(self, label: str, size: int = 18, parent: Optional[QGraphicsItem] = None):
+    def __init__(self, label: str, size: int = 18, parent: Optional[QGraphicsItem] = None, description: str = ""):
         super().__init__(parent)
         self.label = label
         self.size = size
+        self.description = description
         self.active = False
         self.setAcceptHoverEvents(True)
         self._hover = False
+        self._refresh_tooltip()
+
+    def set_active(self, active: bool) -> None:
+        self.active = bool(active)
+        self._refresh_tooltip()
+        self.update()
+
+    def _refresh_tooltip(self) -> None:
+        if self.description:
+            self.setToolTip(f"{self.description} ({'on' if self.active else 'off'})")
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self.size, self.size)
@@ -473,7 +602,7 @@ class ToggleButtonItem(QGraphicsObject):
         painter.drawRoundedRect(self.boundingRect(), 3, 3)
         painter.setPen(QColor("white") if self.active else QColor(theme.COLOR_TEXT_DIM))
         font = QFont()
-        font.setPointSize(7)
+        font.setPointSize(8)
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(self.boundingRect(), Qt.AlignCenter, self.label)
@@ -518,20 +647,22 @@ class TrackHeaderItem(QGraphicsObject):
         self.name = name
         self.track_kind = track_kind
         self.signals = signals
+        self.selected = False
         self.setZValue(60)  # above clips, ruler and the playhead
 
         y = RULER_HEIGHT + row * (TRACK_HEIGHT + TRACK_GAP)
         self.setPos(0, y)
 
-        self.mute_btn = ToggleButtonItem("M", parent=self)
-        self.lock_btn = ToggleButtonItem("L", parent=self)
-        self.hide_btn = ToggleButtonItem("H", parent=self)
-        self.duck_btn = ToggleButtonItem("D", parent=self)
+        # Letters stay compact; every toggle has a tooltip naming it and its state
+        # ("H" was easily read as headphones or help).
+        self.mute_btn = ToggleButtonItem("M", parent=self, description="Mute track audio")
+        self.lock_btn = ToggleButtonItem("L", parent=self, description="Lock track against edits")
+        self.hide_btn = ToggleButtonItem("H", parent=self, description="Hide track picture (audio still plays)")
+        self.duck_btn = ToggleButtonItem("D", parent=self, description="Duck audio under another track (click to set)")
         self.mute_btn.setPos(HEADER_WIDTH - 92, TRACK_HEIGHT - 24)
         self.lock_btn.setPos(HEADER_WIDTH - 70, TRACK_HEIGHT - 24)
         self.hide_btn.setPos(HEADER_WIDTH - 48, TRACK_HEIGHT - 24)
         self.duck_btn.setPos(HEADER_WIDTH - 26, TRACK_HEIGHT - 24)
-        self.duck_btn.setToolTip("Duck Audio Under...")
 
         self.mute_btn.clicked.connect(lambda: self.signals.track_mute_toggled.emit(self.row))
         self.lock_btn.clicked.connect(lambda: self.signals.track_lock_toggled.emit(self.row))
@@ -553,6 +684,13 @@ class TrackHeaderItem(QGraphicsObject):
         painter.setPen(QColor(theme.COLOR_BORDER))
         painter.drawLine(0, TRACK_HEIGHT, HEADER_WIDTH, TRACK_HEIGHT)
 
+        if self.selected:
+            pen = QPen(QColor(theme.COLOR_ACCENT))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self.boundingRect().adjusted(1, 1, -1, -1))
+
         painter.setPen(QColor(theme.COLOR_TEXT))
         font = QFont()
         font.setPointSize(9)
@@ -560,9 +698,20 @@ class TrackHeaderItem(QGraphicsObject):
         painter.setFont(font)
         painter.drawText(QRectF(12, 6, HEADER_WIDTH - 24, 18), Qt.AlignLeft | Qt.AlignVCenter, self.name)
 
+    def set_selected(self, selected: bool) -> None:
+        self.selected = selected
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        # The M/L/H/D buttons are child items and take their own clicks;
+        # anywhere else on the header selects the track.
+        if event.button() == Qt.LeftButton:
+            self.signals.track_selected.emit(self.row)
+        event.accept()
+
     def contextMenuEvent(self, event) -> None:
         menu = QMenu()
-        duck_action = menu.addAction("Duck Audio Under...")
+        duck_action = menu.addAction("Duck Audio Under / Ducking Settings...")
         chosen = menu.exec(event.screenPos())
         if chosen == duck_action:
             self.signals.track_duck_config_requested.emit(self.row)
@@ -690,11 +839,22 @@ class MarkerItem(QGraphicsObject):
 class RulerItem(QGraphicsObject):
     """Time ruler drawn across the top of the timeline scene."""
 
-    def __init__(self, pixels_per_second: float, total_seconds: float):
+    def __init__(self, pixels_per_second: float, total_seconds: float, fps: float = 30.0):
         super().__init__()
         self.pixels_per_second = pixels_per_second
         self.total_seconds = max(total_seconds, 30.0)
+        self.fps = fps if fps > 0 else 30.0
+        # In/Out points (seconds or None), shaded on the ruler.
+        self.in_point: Optional[float] = None
+        self.out_point: Optional[float] = None
         self.setZValue(40)
+        # Makes option.exposedRect the actually-exposed area, so paint()
+        # can skip the ticks outside it.
+        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption, True)
+
+    def set_in_out(self, in_point: Optional[float], out_point: Optional[float]) -> None:
+        self.in_point, self.out_point = in_point, out_point
+        self.update()
 
     def set_scale(self, pixels_per_second: float, total_seconds: float) -> None:
         self.prepareGeometryChange()
@@ -709,24 +869,43 @@ class RulerItem(QGraphicsObject):
         painter.setPen(QColor(theme.COLOR_BORDER))
         painter.drawLine(0, RULER_HEIGHT - 1, int(self.boundingRect().width()), RULER_HEIGHT - 1)
 
+        if self.in_point is not None or self.out_point is not None:
+            start = (self.in_point or 0.0) * self.pixels_per_second
+            end = (self.out_point if self.out_point is not None else self.total_seconds) * self.pixels_per_second
+            if end > start:
+                shade = QColor(theme.COLOR_ACCENT)
+                shade.setAlpha(70)
+                painter.fillRect(QRectF(start, 0, end - start, RULER_HEIGHT - 1), shade)
+
         interval = self._pick_interval()
         painter.setPen(QColor(theme.COLOR_TEXT_DIM))
         font = QFont()
         font.setPointSize(8)
         painter.setFont(font)
 
-        t = 0.0
-        while t <= self.total_seconds + interval:
+        # Only the ticks in the exposed area (not the whole timeline width).
+        exposed = option.exposedRect if option is not None else self.boundingRect()
+        first = max(0, int(exposed.left() / (interval * self.pixels_per_second)) - 1)
+        last = int(exposed.right() / (interval * self.pixels_per_second)) + 1
+        for k in range(first, last + 1):
+            t = k * interval
+            if t > self.total_seconds + interval:
+                break
             x = t * self.pixels_per_second
             painter.drawLine(int(x), RULER_HEIGHT - 8, int(x), RULER_HEIGHT - 1)
-            minutes = int(t // 60)
-            seconds = int(t % 60)
-            painter.drawText(int(x) + 3, RULER_HEIGHT - 10, f"{minutes:02d}:{seconds:02d}")
-            t += interval
+            painter.drawText(int(x) + 3, RULER_HEIGHT - 10, self._label(t, interval))
+
+    def _label(self, t: float, interval: float) -> str:
+        if interval < 1.0:
+            # Sub-second ticks: MM:SS:FF, so frame positions are readable at high zoom.
+            return format_timecode(t, self.fps)[3:]
+        return f"{int(t // 60):02d}:{int(t % 60):02d}"
 
     def _pick_interval(self) -> float:
-        # Choose a tick interval so ticks land roughly every 60-100px.
-        for candidate in (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600):
+        # Choose a tick interval so ticks land roughly every 60-100px;
+        # below a second, whole numbers of frames.
+        frame = 1.0 / self.fps
+        for candidate in (5 * frame, 10 * frame, 15 * frame, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600):
             if candidate * self.pixels_per_second >= 70:
                 return candidate
         return 600

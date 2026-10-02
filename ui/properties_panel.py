@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -30,7 +35,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
-from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand
+from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand, property_change_overlaps
+from core.effects import REGISTRY, EffectInstance
 from core.history import History
 from core.project import Project
 
@@ -117,6 +123,11 @@ class PropertiesPanel(QWidget):
     """Displays and edits the properties of the currently selected clip."""
 
     project_modified = Signal()
+    # A property of this clip changed (so the timeline can refresh its item:
+    # width after a speed change, effect badges, ...).
+    clip_changed = Signal(str)
+    # One-line user feedback, e.g. why an edit was refused (-> status bar).
+    status_message = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -124,7 +135,8 @@ class PropertiesPanel(QWidget):
         self.history: Optional[History] = None
         self.clip_id: Optional[str] = None
         self._loading = False
-        self._pre_drag_value = None
+        # Timeline playhead, for the "key at playhead" buttons (F12).
+        self.playhead_time = 0.0
 
         self._build_ui()
         self.show_empty_state()
@@ -179,7 +191,18 @@ class PropertiesPanel(QWidget):
 
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 200)
-        clip_form.addRow("Volume", self.volume_slider)
+        clip_form.addRow("Volume", self._with_key_button(self.volume_slider, "volume"))
+
+        volume_keys_row = QHBoxLayout()
+        self.volume_keys_label = QLabel("No volume keyframes")
+        self.volume_keys_label.setWordWrap(True)
+        self.volume_keys_label.setStyleSheet("color: #9aa1ad;")
+        clear_volume_keys_btn = QPushButton("Clear")
+        clear_volume_keys_btn.setToolTip("Remove every volume keyframe (back to the Volume slider)")
+        clear_volume_keys_btn.clicked.connect(lambda: self._clear_keyframes("volume_keyframes", "Clear Volume Keyframes"))
+        volume_keys_row.addWidget(self.volume_keys_label, 1)
+        volume_keys_row.addWidget(clear_volume_keys_btn)
+        clip_form.addRow("Volume Keys", volume_keys_row)
 
         self.mute_checkbox = QCheckBox("Mute audio")
         clip_form.addRow("", self.mute_checkbox)
@@ -198,11 +221,11 @@ class PropertiesPanel(QWidget):
         self.speed_spin.setRange(0.25, 4.0)
         self.speed_spin.setSingleStep(0.05)
         self.speed_spin.setSuffix(" x")
-        clip_form.addRow("Speed", self.speed_spin)
+        clip_form.addRow("Speed", self._with_key_button(self.speed_spin, "speed"))
 
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(0, 100)
-        clip_form.addRow("Opacity", self.opacity_slider)
+        clip_form.addRow("Opacity", self._with_key_button(self.opacity_slider, "opacity"))
 
         self.fade_in_spin = QDoubleSpinBox()
         self.fade_in_spin.setRange(0.0, 30.0)
@@ -240,7 +263,13 @@ class PropertiesPanel(QWidget):
 
         reset_transform_btn = QPushButton("Reset Transform")
         reset_transform_btn.clicked.connect(self._reset_transform)
-        transform_form.addRow("", reset_transform_btn)
+        key_position_btn = QPushButton("\u25c6 Key Position at Playhead")
+        key_position_btn.setToolTip("Add/update a position keyframe at the playhead from the X/Y sliders")
+        key_position_btn.clicked.connect(lambda: self.key_at_playhead("position"))
+        transform_row = QHBoxLayout()
+        transform_row.addWidget(reset_transform_btn)
+        transform_row.addWidget(key_position_btn)
+        transform_form.addRow("", transform_row)
 
         layout.addWidget(self.transform_group)
 
@@ -388,6 +417,39 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(self.chroma_group)
 
+        # ---- Effects group (video/image only): the generic effect stack (B7) ----
+        self.effects_group = CollapsibleGroupBox("Effects (LUT, Key, Sharpen, Blur...)", start_expanded=False)
+        effects_layout = QVBoxLayout(self.effects_group)
+        add_row = QHBoxLayout()
+        self.effect_kind_combo = QComboBox()
+        for kind, spec in REGISTRY.items():
+            self.effect_kind_combo.addItem(spec.label, kind)
+            self.effect_kind_combo.setItemData(self.effect_kind_combo.count() - 1, spec.description, Qt.ToolTipRole)
+        add_effect_btn = QPushButton("+ Add")
+        add_effect_btn.clicked.connect(self._add_effect)
+        add_row.addWidget(self.effect_kind_combo, 1)
+        add_row.addWidget(add_effect_btn)
+        effects_layout.addLayout(add_row)
+        self.effects_list = QListWidget()
+        self.effects_list.setMaximumHeight(96)
+        self.effects_list.currentRowChanged.connect(self._on_effect_row_changed)
+        effects_layout.addWidget(self.effects_list)
+        effect_buttons = QHBoxLayout()
+        self.effect_enabled_checkbox = QCheckBox("Enabled")
+        self.effect_enabled_checkbox.toggled.connect(self._on_effect_enabled_toggled)
+        for text, slot in (("Up", lambda: self._move_effect(-1)), ("Down", lambda: self._move_effect(1)),
+                           ("Remove", self._remove_effect)):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            effect_buttons.addWidget(button)
+        effect_buttons.addWidget(self.effect_enabled_checkbox)
+        effects_layout.addLayout(effect_buttons)
+        self.effect_params_widget = QWidget()
+        self.effect_params_form = QFormLayout(self.effect_params_widget)
+        self.effect_params_form.setContentsMargins(0, 0, 0, 0)
+        effects_layout.addWidget(self.effect_params_widget)
+        layout.addWidget(self.effects_group)
+
         # ---- Text group ----
         self.text_group = QGroupBox("Text")
         text_form = QFormLayout(self.text_group)
@@ -396,12 +458,46 @@ class PropertiesPanel(QWidget):
         self.text_content.setFixedHeight(60)
         text_form.addRow("Content", self.text_content)
 
+        self.font_combo = QFontComboBox()
+        self.font_combo.setToolTip("Font family used in the export (resolved to the installed font file)")
+        text_form.addRow("Font", self.font_combo)
+
         self.font_size_spin = QSpinBox()
         self.font_size_spin.setRange(8, 300)
+        self.font_size_spin.setToolTip("Pixels at 1080p; scaled with the export resolution")
         text_form.addRow("Font Size", self.font_size_spin)
 
         self.color_btn = QPushButton("Text Color")
         text_form.addRow("Color", self.color_btn)
+
+        outline_row = QHBoxLayout()
+        self.outline_width_spin = QSpinBox()
+        self.outline_width_spin.setRange(0, 40)
+        self.outline_color_btn = QPushButton("Outline Color")
+        outline_row.addWidget(self.outline_width_spin)
+        outline_row.addWidget(self.outline_color_btn)
+        text_form.addRow("Outline", outline_row)
+
+        shadow_row = QHBoxLayout()
+        self.shadow_checkbox = QCheckBox("Shadow")
+        self.shadow_offset_spin = QSpinBox()
+        self.shadow_offset_spin.setRange(0, 60)
+        self.shadow_color_btn = QPushButton("Shadow Color")
+        shadow_row.addWidget(self.shadow_checkbox)
+        shadow_row.addWidget(self.shadow_offset_spin)
+        shadow_row.addWidget(self.shadow_color_btn)
+        text_form.addRow("", shadow_row)
+
+        box_row = QHBoxLayout()
+        self.box_checkbox = QCheckBox("Background box")
+        self.box_opacity_spin = QSpinBox()
+        self.box_opacity_spin.setRange(0, 100)
+        self.box_opacity_spin.setSuffix(" %")
+        self.box_color_btn = QPushButton("Box Color")
+        box_row.addWidget(self.box_checkbox)
+        box_row.addWidget(self.box_opacity_spin)
+        box_row.addWidget(self.box_color_btn)
+        text_form.addRow("", box_row)
 
         self.bold_checkbox = QCheckBox("Bold")
         self.italic_checkbox = QCheckBox("Italic")
@@ -418,6 +514,7 @@ class PropertiesPanel(QWidget):
 
         self.alignment_combo = QComboBox()
         self.alignment_combo.addItems(["left", "center", "right"])
+        self.alignment_combo.setToolTip("How the lines of a multi-line text line up with each other")
         text_form.addRow("Alignment", self.alignment_combo)
 
         layout.addWidget(self.text_group)
@@ -431,104 +528,80 @@ class PropertiesPanel(QWidget):
         for group in (
             self.clip_group, self.transform_group, self.reframe_group,
             self.keyframes_group, self.transition_group, self.color_group,
-            self.chroma_group,
+            self.chroma_group, self.effects_group,
         ):
             group._apply_expanded_state(group.isChecked())
 
-        self._connect_signals()
         self._selected_color = QColor("#FFFFFF")
+        self._outline_color = QColor("#000000")
+        self._shadow_color = QColor("#000000")
+        self._box_color = QColor("#000000")
         self._chroma_color = QColor("#00FF00")
+        self._connect_signals()
 
     def _connect_signals(self) -> None:
-        self.volume_slider.sliderPressed.connect(lambda: self._remember("volume", self.volume_slider.value() / 100.0))
-        self.volume_slider.valueChanged.connect(lambda v: self._apply_live("volume", v / 100.0))
-        self.volume_slider.sliderReleased.connect(lambda: self._commit("volume", self.volume_slider.value() / 100.0, "Edit Volume"))
-
-        self.opacity_slider.sliderPressed.connect(lambda: self._remember("opacity", self.opacity_slider.value() / 100.0))
-        self.opacity_slider.valueChanged.connect(lambda v: self._apply_live("opacity", v / 100.0))
-        self.opacity_slider.sliderReleased.connect(lambda: self._commit("opacity", self.opacity_slider.value() / 100.0, "Edit Opacity"))
+        # Every live control executes a *mergeable* command on each
+        # valueChanged (see _edit_live), whatever produced it: mouse drag,
+        # groove click, wheel, arrow/PageUp keys. Previously only a real
+        # drag (sliderPressed/sliderReleased) was recorded, so keyboard and
+        # wheel edits changed the clip without an undo step.
+        live_sliders = (
+            (self.volume_slider, "volume", 100.0, "Edit Volume"),
+            (self.opacity_slider, "opacity", 100.0, "Edit Opacity"),
+            (self.denoise_strength_slider, "denoise_strength", 1.0, "Edit Denoise Strength"),
+            (self.transform_x_slider, "transform_x", 100.0, "Edit Transform Position"),
+            (self.transform_y_slider, "transform_y", 100.0, "Edit Transform Position"),
+            (self.transform_scale_slider, "transform_scale", 100.0, "Edit Transform Scale"),
+            (self.transform_rotation_slider, "transform_rotation", 1.0, "Edit Transform Rotation"),
+            (self.crop_focus_x_slider, "crop_focus_x", 100.0, "Edit Crop Focus"),
+            (self.crop_focus_y_slider, "crop_focus_y", 100.0, "Edit Crop Focus"),
+            (self.brightness_slider, "brightness", 100.0, "Edit Brightness"),
+            (self.contrast_slider, "contrast", 100.0, "Edit Contrast"),
+            (self.saturation_slider, "saturation", 100.0, "Edit Saturation"),
+            (self.gamma_slider, "gamma", 100.0, "Edit Gamma"),
+            (self.chroma_similarity_slider, "chroma_key_similarity", 100.0, "Edit Chroma Key Similarity"),
+            (self.chroma_blend_slider, "chroma_key_blend", 100.0, "Edit Chroma Key Softness"),
+        )
+        for slider, attribute, scale, label in live_sliders:
+            slider.valueChanged.connect(
+                lambda v, a=attribute, sc=scale, lb=label: self._edit_live(a, v / sc, lb)
+            )
+            # A released drag is one finished gesture: the next edit of the
+            # same property is a new undo step even within the merge window.
+            slider.sliderReleased.connect(self._end_gesture)
 
         self.mute_checkbox.toggled.connect(lambda checked: self._commit_now("muted", checked, "Toggle Mute"))
-
         self.denoise_checkbox.toggled.connect(lambda checked: self._commit_now("denoise_enabled", checked, "Toggle Noise Reduction"))
-        self.denoise_strength_slider.sliderPressed.connect(lambda: self._remember("denoise_strength", float(self.denoise_strength_slider.value())))
-        self.denoise_strength_slider.valueChanged.connect(lambda v: self._apply_live("denoise_strength", float(v)))
-        self.denoise_strength_slider.sliderReleased.connect(lambda: self._commit("denoise_strength", float(self.denoise_strength_slider.value()), "Edit Denoise Strength"))
 
-        self.speed_spin.editingFinished.connect(lambda: self._commit_now("speed", self.speed_spin.value(), "Edit Speed"))
+        self.speed_spin.editingFinished.connect(self._commit_speed)
         self.fade_in_spin.editingFinished.connect(lambda: self._commit_now("fade_in", self.fade_in_spin.value(), "Edit Fade In"))
         self.fade_out_spin.editingFinished.connect(lambda: self._commit_now("fade_out", self.fade_out_spin.value(), "Edit Fade Out"))
 
-        self.transform_x_slider.sliderPressed.connect(lambda: self._remember("transform_x", self.transform_x_slider.value() / 100.0))
-        self.transform_x_slider.valueChanged.connect(lambda v: self._apply_live("transform_x", v / 100.0))
-        self.transform_x_slider.sliderReleased.connect(lambda: self._commit("transform_x", self.transform_x_slider.value() / 100.0, "Edit Transform Position"))
-
-        self.transform_y_slider.sliderPressed.connect(lambda: self._remember("transform_y", self.transform_y_slider.value() / 100.0))
-        self.transform_y_slider.valueChanged.connect(lambda v: self._apply_live("transform_y", v / 100.0))
-        self.transform_y_slider.sliderReleased.connect(lambda: self._commit("transform_y", self.transform_y_slider.value() / 100.0, "Edit Transform Position"))
-
-        self.transform_scale_slider.sliderPressed.connect(lambda: self._remember("transform_scale", self.transform_scale_slider.value() / 100.0))
-        self.transform_scale_slider.valueChanged.connect(lambda v: self._apply_live("transform_scale", v / 100.0))
-        self.transform_scale_slider.sliderReleased.connect(lambda: self._commit("transform_scale", self.transform_scale_slider.value() / 100.0, "Edit Transform Scale"))
-
-        self.transform_rotation_slider.sliderPressed.connect(lambda: self._remember("transform_rotation", float(self.transform_rotation_slider.value())))
-        self.transform_rotation_slider.valueChanged.connect(lambda v: self._apply_live("transform_rotation", float(v)))
-        self.transform_rotation_slider.sliderReleased.connect(lambda: self._commit("transform_rotation", float(self.transform_rotation_slider.value()), "Edit Transform Rotation"))
-
         self.fill_frame_checkbox.toggled.connect(self._toggle_fill_frame)
-
-        self.crop_focus_x_slider.sliderPressed.connect(lambda: self._remember("crop_focus_x", self.crop_focus_x_slider.value() / 100.0))
-        self.crop_focus_x_slider.valueChanged.connect(lambda v: self._apply_live("crop_focus_x", v / 100.0))
-        self.crop_focus_x_slider.sliderReleased.connect(lambda: self._commit("crop_focus_x", self.crop_focus_x_slider.value() / 100.0, "Edit Crop Focus"))
-
-        self.crop_focus_y_slider.sliderPressed.connect(lambda: self._remember("crop_focus_y", self.crop_focus_y_slider.value() / 100.0))
-        self.crop_focus_y_slider.valueChanged.connect(lambda v: self._apply_live("crop_focus_y", v / 100.0))
-        self.crop_focus_y_slider.sliderReleased.connect(lambda: self._commit("crop_focus_y", self.crop_focus_y_slider.value() / 100.0, "Edit Crop Focus"))
 
         self.transition_combo.currentIndexChanged.connect(self._on_transition_changed)
         self.transition_duration_spin.editingFinished.connect(
             lambda: self._commit_now("transition_duration", self.transition_duration_spin.value(), "Edit Transition Duration")
         )
 
-        self.brightness_slider.sliderPressed.connect(lambda: self._remember("brightness", self.brightness_slider.value() / 100.0))
-        self.brightness_slider.valueChanged.connect(lambda v: self._apply_live("brightness", v / 100.0))
-        self.brightness_slider.sliderReleased.connect(lambda: self._commit("brightness", self.brightness_slider.value() / 100.0, "Edit Brightness"))
-
-        self.contrast_slider.sliderPressed.connect(lambda: self._remember("contrast", self.contrast_slider.value() / 100.0))
-        self.contrast_slider.valueChanged.connect(lambda v: self._apply_live("contrast", v / 100.0))
-        self.contrast_slider.sliderReleased.connect(lambda: self._commit("contrast", self.contrast_slider.value() / 100.0, "Edit Contrast"))
-
-        self.saturation_slider.sliderPressed.connect(lambda: self._remember("saturation", self.saturation_slider.value() / 100.0))
-        self.saturation_slider.valueChanged.connect(lambda v: self._apply_live("saturation", v / 100.0))
-        self.saturation_slider.sliderReleased.connect(lambda: self._commit("saturation", self.saturation_slider.value() / 100.0, "Edit Saturation"))
-
-        self.gamma_slider.sliderPressed.connect(lambda: self._remember("gamma", self.gamma_slider.value() / 100.0))
-        self.gamma_slider.valueChanged.connect(lambda v: self._apply_live("gamma", v / 100.0))
-        self.gamma_slider.sliderReleased.connect(lambda: self._commit("gamma", self.gamma_slider.value() / 100.0, "Edit Gamma"))
-
         self.chroma_enabled_checkbox.toggled.connect(lambda checked: self._commit_now("chroma_key_enabled", checked, "Toggle Chroma Key"))
         self.chroma_color_btn.clicked.connect(self._pick_chroma_color)
 
-        self.chroma_similarity_slider.sliderPressed.connect(
-            lambda: self._remember("chroma_key_similarity", self.chroma_similarity_slider.value() / 100.0)
-        )
-        self.chroma_similarity_slider.valueChanged.connect(lambda v: self._apply_live("chroma_key_similarity", v / 100.0))
-        self.chroma_similarity_slider.sliderReleased.connect(
-            lambda: self._commit("chroma_key_similarity", self.chroma_similarity_slider.value() / 100.0, "Edit Chroma Key Similarity")
-        )
-
-        self.chroma_blend_slider.sliderPressed.connect(lambda: self._remember("chroma_key_blend", self.chroma_blend_slider.value() / 100.0))
-        self.chroma_blend_slider.valueChanged.connect(lambda v: self._apply_live("chroma_key_blend", v / 100.0))
-        self.chroma_blend_slider.sliderReleased.connect(
-            lambda: self._commit("chroma_key_blend", self.chroma_blend_slider.value() / 100.0, "Edit Chroma Key Softness")
-        )
-
         self.color_btn.clicked.connect(self._pick_color)
+        self.outline_color_btn.clicked.connect(lambda: self._pick_text_color("_outline_color", "Outline Color"))
+        self.shadow_color_btn.clicked.connect(lambda: self._pick_text_color("_shadow_color", "Shadow Color"))
+        self.box_color_btn.clicked.connect(lambda: self._pick_text_color("_box_color", "Box Color"))
         for widget, signal_name in (
             (self.text_content, "editingFinished"),
             (self.font_size_spin, "editingFinished"),
+            (self.outline_width_spin, "editingFinished"),
+            (self.shadow_offset_spin, "editingFinished"),
+            (self.box_opacity_spin, "editingFinished"),
+            (self.font_combo, "currentFontChanged"),
             (self.bold_checkbox, "toggled"),
             (self.italic_checkbox, "toggled"),
+            (self.shadow_checkbox, "toggled"),
+            (self.box_checkbox, "toggled"),
             (self.pos_x_slider, "sliderReleased"),
             (self.pos_y_slider, "sliderReleased"),
             (self.alignment_combo, "currentTextChanged"),
@@ -551,6 +624,7 @@ class PropertiesPanel(QWidget):
         self.transition_group.setVisible(False)
         self.color_group.setVisible(False)
         self.chroma_group.setVisible(False)
+        self.effects_group.setVisible(False)
         self.text_group.setVisible(False)
 
     def set_selected_clip(self, clip_id: Optional[str]) -> None:
@@ -563,6 +637,7 @@ class PropertiesPanel(QWidget):
             return
 
         self.clip_id = clip_id
+        self._end_gesture()  # an edit of another clip never merges with this one
         self._loading = True
 
         self.empty_label.setVisible(False)
@@ -579,6 +654,7 @@ class PropertiesPanel(QWidget):
         self.transition_group.setVisible(is_visual)
         self.color_group.setVisible(is_visual)
         self.chroma_group.setVisible(is_visual)
+        self.effects_group.setVisible(is_visual)
 
         self.volume_slider.setValue(int(clip.volume * 100))
         self.mute_checkbox.setChecked(clip.muted)
@@ -588,6 +664,7 @@ class PropertiesPanel(QWidget):
         self.opacity_slider.setValue(int(clip.opacity * 100))
         self.fade_in_spin.setValue(clip.fade_in)
         self.fade_out_spin.setValue(clip.fade_out)
+        self._refresh_volume_keys_label(clip)
 
         if is_visual:
             self.transform_x_slider.setValue(int(clip.transform_x * 100))
@@ -620,6 +697,7 @@ class PropertiesPanel(QWidget):
             self._chroma_color = QColor(clip.chroma_key_color)
             self.chroma_similarity_slider.setValue(int(clip.chroma_key_similarity * 100))
             self.chroma_blend_slider.setValue(int(clip.chroma_key_blend * 100))
+            self._refresh_effects_list(clip)
 
         if is_text and clip.text_style is not None:
             style = clip.text_style
@@ -627,6 +705,15 @@ class PropertiesPanel(QWidget):
             self.text_content.setPlainText(style.content)
             self.text_content.blockSignals(False)
             self.font_size_spin.setValue(style.font_size)
+            self.font_combo.setCurrentFont(QFont(style.font_family))
+            self.outline_width_spin.setValue(style.outline_width)
+            self._outline_color = QColor(style.outline_color)
+            self.shadow_checkbox.setChecked(style.shadow_enabled)
+            self.shadow_offset_spin.setValue(style.shadow_offset)
+            self._shadow_color = QColor(style.shadow_color)
+            self.box_checkbox.setChecked(style.box_enabled)
+            self.box_opacity_spin.setValue(int(round(style.box_opacity * 100)))
+            self._box_color = QColor(style.box_color)
             self.bold_checkbox.setChecked(style.bold)
             self.italic_checkbox.setChecked(style.italic)
             self.pos_x_slider.setValue(int(style.position_x * 100))
@@ -644,35 +731,53 @@ class PropertiesPanel(QWidget):
             return None
         return self.project.find_clip(self.clip_id)
 
-    def _remember(self, attribute: str, _value) -> None:
-        clip = self._current_clip()
-        self._pre_drag_value = getattr(clip, attribute, None) if clip else None
+    def _end_gesture(self) -> None:
+        if self.history is not None:
+            self.history.end_merge()
 
-    def _apply_live(self, attribute: str, value) -> None:
-        if self._loading:
-            return
-        clip = self._current_clip()
-        if clip is not None:
-            setattr(clip, attribute, value)
-            self.project_modified.emit()
+    def _refuse_if_overlapping(self, attribute: str, value) -> bool:
+        """True (and a status message) if the edit would run the clip into its neighbour."""
+        if self.project is None or self.clip_id is None:
+            return False
+        if property_change_overlaps(self.project, self.clip_id, attribute, value):
+            self.status_message.emit(
+                "Not applied: the clip would become longer and overlap the next clip on its track. "
+                "Make room first."
+            )
+            return True
+        return False
 
-    def _commit(self, attribute: str, value, label: str) -> None:
+    def _execute(self, attribute: str, value, label: str, mergeable: bool) -> bool:
         if self._loading or self.history is None or self.project is None or self.clip_id is None:
-            return
+            return False
         clip = self._current_clip()
-        if clip is None:
-            return
-        # Value already applied live; push a command that records the
-        # before/after so undo restores the pre-drag value correctly.
-        setattr(clip, attribute, self._pre_drag_value if self._pre_drag_value is not None else value)
-        self.history.execute(UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label))
+        if clip is None or getattr(clip, attribute, None) == value:
+            return False
+        if self._refuse_if_overlapping(attribute, value):
+            return False
+        self.history.execute(
+            UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label, mergeable=mergeable)
+        )
+        self.clip_changed.emit(self.clip_id)
         self.project_modified.emit()
+        return True
 
-    def _commit_now(self, attribute: str, value, label: str) -> None:
-        if self._loading or self.history is None or self.project is None or self.clip_id is None:
-            return
-        self.history.execute(UpdateClipPropertyCommand(self.project, self.clip_id, attribute, value, label))
-        self.project_modified.emit()
+    def _edit_live(self, attribute: str, value, label: str) -> None:
+        """A continuous control moved: one mergeable, undoable command per change."""
+        self._execute(attribute, value, label, mergeable=True)
+
+    def _commit_now(self, attribute: str, value, label: str) -> bool:
+        """A discrete edit (checkbox, combo, spin box, button): its own undo step."""
+        self._end_gesture()
+        return self._execute(attribute, value, label, mergeable=False)
+
+    def _commit_speed(self) -> None:
+        if not self._commit_now("speed", self.speed_spin.value(), "Edit Speed"):
+            clip = self._current_clip()
+            if clip is not None and abs(clip.speed - self.speed_spin.value()) > 1e-9:
+                self._loading = True
+                self.speed_spin.setValue(clip.speed)  # refused: show the real value again
+                self._loading = False
 
     def _toggle_fill_frame(self, checked: bool) -> None:
         mode = ReframeMode.FILL if checked else ReframeMode.FIT
@@ -694,6 +799,214 @@ class PropertiesPanel(QWidget):
         self.transform_scale_slider.setValue(100)
         self.transform_rotation_slider.setValue(0)
         self._loading = False
+
+    # ------------------------------------------------------------------
+    # Key at playhead (F12)
+    # ------------------------------------------------------------------
+    def set_playhead_time(self, t: float) -> None:
+        self.playhead_time = max(0.0, t)
+
+    def _with_key_button(self, control: QWidget, kind: str) -> QWidget:
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(control, 1)
+        button = QPushButton("\u25c6")
+        button.setFixedWidth(28)
+        button.setToolTip(f"Add/update a {kind} keyframe at the playhead from the current value")
+        button.setAccessibleName(f"Key {kind} at playhead")
+        button.clicked.connect(lambda: self.key_at_playhead(kind))
+        row.addWidget(button)
+        setattr(self, f"key_{kind}_btn", button)
+        return holder
+
+    def key_at_playhead(self, kind: str) -> bool:
+        """Add or replace a ``kind`` keyframe at the playhead, from the control's current value.
+
+        Times are clip-relative timeline seconds, except speed, whose
+        keyframes are source seconds -- converted through the clip's speed
+        segments so the user never does that arithmetic.
+        """
+        clip = self._current_clip()
+        if clip is None:
+            return False
+        local = self.playhead_time - clip.timeline_start
+        if not (-1e-6 <= local <= clip.duration + 1e-6):
+            self.status_message.emit("Move the playhead over the selected clip to add a keyframe there.")
+            return False
+        local = min(max(0.0, local), clip.duration)
+        if kind == "opacity":
+            attribute, entry = "opacity_keyframes", (local, self.opacity_slider.value() / 100.0)
+        elif kind == "position":
+            attribute, entry = "position_keyframes", (
+                local, self.transform_x_slider.value() / 100.0, self.transform_y_slider.value() / 100.0)
+        elif kind == "volume":
+            attribute, entry = "volume_keyframes", (local, self.volume_slider.value() / 100.0)
+        elif kind == "speed":
+            attribute, entry = "speed_keyframes", (clip.source_offset_at(local), self.speed_spin.value())
+        else:
+            return False
+        keyframes = [tuple(k) for k in getattr(clip, attribute) if abs(k[0] - entry[0]) > 1e-3]
+        keyframes.append(entry)
+        keyframes.sort()
+        if not self._commit_now(attribute, keyframes, f"Key {kind.title()} at Playhead"):
+            return False
+        if len(keyframes) == 1:
+            self.status_message.emit(f"{kind.title()} keyframe added. Add a second one to start animating.")
+        self._refresh_keyframe_views(clip)
+        return True
+
+    def _clear_keyframes(self, attribute: str, label: str) -> None:
+        clip = self._current_clip()
+        if clip is not None and getattr(clip, attribute):
+            self._commit_now(attribute, [], label)
+            self._refresh_keyframe_views(clip)
+
+    def _refresh_keyframe_views(self, clip: Clip) -> None:
+        self._refresh_opacity_keyframe_table(clip.opacity_keyframes)
+        self._refresh_position_keyframe_table(clip.position_keyframes)
+        self._refresh_speed_keyframe_table(clip.speed_keyframes)
+        self._refresh_volume_keys_label(clip)
+
+    def _refresh_volume_keys_label(self, clip: Clip) -> None:
+        keys = sorted(clip.volume_keyframes)
+        if not keys:
+            self.volume_keys_label.setText("No volume keyframes (use \u25c6 next to Volume)")
+        else:
+            text = ", ".join(f"{t:.2f}s {v * 100:.0f}%" for t, v in keys[:6]) + (" ..." if len(keys) > 6 else "")
+            note = "" if len(keys) >= 2 else " (add one more to animate)"
+            self.volume_keys_label.setText(text + note)
+
+    # ------------------------------------------------------------------
+    # Effect stack (B7): a form generated from each effect's parameter schema
+    # ------------------------------------------------------------------
+    def _effects_copy(self):
+        clip = self._current_clip()
+        return copy.deepcopy(clip.effects) if clip is not None else None
+
+    def _commit_effects(self, effects, label: str, select_row: Optional[int] = None) -> None:
+        if self._commit_now("effects", effects, label):
+            clip = self._current_clip()
+            self._refresh_effects_list(clip, select_row)
+
+    def _refresh_effects_list(self, clip: Optional[Clip], select_row: Optional[int] = None) -> None:
+        previous = self.effects_list.currentRow() if select_row is None else select_row
+        self.effects_list.blockSignals(True)
+        self.effects_list.clear()
+        for effect in clip.effects if clip is not None else []:
+            spec = effect.spec
+            label = spec.label if spec else f"{effect.kind} (unknown, kept as is)"
+            if not effect.enabled:
+                label += " (off)"
+            elif spec and not effect.is_renderable():
+                label += " (needs a file)"
+            self.effects_list.addItem(QListWidgetItem(label))
+        self.effects_list.blockSignals(False)
+        count = self.effects_list.count()
+        row = min(max(previous, 0), count - 1) if count else -1
+        self.effects_list.setCurrentRow(row)
+        self._on_effect_row_changed(row)
+
+    def _add_effect(self) -> None:
+        effects = self._effects_copy()
+        if effects is None:
+            return
+        effects.append(EffectInstance.create(self.effect_kind_combo.currentData()))
+        self._commit_effects(effects, "Add Effect", len(effects) - 1)
+
+    def _remove_effect(self) -> None:
+        effects, row = self._effects_copy(), self.effects_list.currentRow()
+        if effects is None or not (0 <= row < len(effects)):
+            return
+        del effects[row]
+        self._commit_effects(effects, "Remove Effect", max(0, row - 1))
+
+    def _move_effect(self, step: int) -> None:
+        effects, row = self._effects_copy(), self.effects_list.currentRow()
+        if effects is None or not (0 <= row < len(effects)) or not (0 <= row + step < len(effects)):
+            return
+        effects[row], effects[row + step] = effects[row + step], effects[row]
+        self._commit_effects(effects, "Reorder Effects", row + step)
+
+    def _on_effect_enabled_toggled(self, checked: bool) -> None:
+        effects, row = self._effects_copy(), self.effects_list.currentRow()
+        if self._loading or effects is None or not (0 <= row < len(effects)) or effects[row].enabled == checked:
+            return
+        effects[row].enabled = checked
+        self._commit_effects(effects, "Toggle Effect", row)
+
+    def set_effect_param(self, row: int, name: str, value) -> bool:
+        effects = self._effects_copy()
+        if effects is None or not (0 <= row < len(effects)) or effects[row].params.get(name) == value:
+            return False
+        effects[row].params[name] = value
+        self._commit_effects(effects, "Edit Effect", row)
+        return True
+
+    def _on_effect_row_changed(self, row: int) -> None:
+        while self.effect_params_form.rowCount():
+            self.effect_params_form.removeRow(0)
+        clip = self._current_clip()
+        effect = clip.effects[row] if clip is not None and 0 <= row < len(clip.effects) else None
+        self.effect_enabled_checkbox.blockSignals(True)
+        self.effect_enabled_checkbox.setChecked(bool(effect and effect.enabled))
+        self.effect_enabled_checkbox.setEnabled(effect is not None)
+        self.effect_enabled_checkbox.blockSignals(False)
+        if effect is None or effect.spec is None:
+            return
+        values = effect.resolved_params()
+        for spec in effect.spec.params:
+            self.effect_params_form.addRow(spec.label, self._param_editor(row, spec, values[spec.name]))
+
+    def _param_editor(self, row: int, spec, value) -> QWidget:
+        name = spec.name
+        if spec.kind in ("float", "int"):
+            box = QDoubleSpinBox() if spec.kind == "float" else QSpinBox()
+            box.setRange(spec.minimum, spec.maximum)
+            box.setSingleStep(spec.step)
+            if spec.kind == "float":
+                box.setDecimals(2)
+            box.setValue(value)
+            box.editingFinished.connect(lambda b=box: self.set_effect_param(row, name, b.value()))
+            return box
+        if spec.kind == "bool":
+            box = QCheckBox()
+            box.setChecked(bool(value))
+            box.toggled.connect(lambda checked: self.set_effect_param(row, name, checked))
+            return box
+        if spec.kind == "choice":
+            box = QComboBox()
+            box.addItems(list(spec.choices))
+            box.setCurrentText(value)
+            box.currentTextChanged.connect(lambda text: self.set_effect_param(row, name, text))
+            return box
+        if spec.kind == "color":
+            button = QPushButton(value)
+            button.setStyleSheet(f"background-color: {value};")
+
+            def pick():
+                color = QColorDialog.getColor(QColor(value), self, spec.label)
+                if color.isValid():
+                    self.set_effect_param(row, name, color.name().upper())
+            button.clicked.connect(pick)
+            return button
+        # file
+        holder = QWidget()
+        line = QHBoxLayout(holder)
+        line.setContentsMargins(0, 0, 0, 0)
+        edit = QLineEdit(value)
+        edit.setPlaceholderText("Choose a .cube file")
+        edit.editingFinished.connect(lambda: self.set_effect_param(row, name, edit.text().strip()))
+        browse = QPushButton("Browse...")
+
+        def choose():
+            path, _ = QFileDialog.getOpenFileName(self, spec.label, edit.text(), "3D LUT (*.cube *.3dl);;All Files (*)")
+            if path:
+                self.set_effect_param(row, name, path)
+        browse.clicked.connect(choose)
+        line.addWidget(edit, 1)
+        line.addWidget(browse)
+        return holder
 
     # ------------------------------------------------------------------
     # Keyframes
@@ -786,8 +1099,8 @@ class PropertiesPanel(QWidget):
         keyframes = [kf for kf in clip.speed_keyframes if abs(kf[0] - t) > 1e-6]
         keyframes.append((t, speed))
         keyframes.sort()
-        self._commit_now("speed_keyframes", keyframes, "Add Speed Keyframe")
-        self._refresh_speed_keyframe_table(keyframes)
+        if self._commit_now("speed_keyframes", keyframes, "Add Speed Keyframe"):
+            self._refresh_speed_keyframe_table(keyframes)
 
     def _remove_selected_speed_keyframe(self) -> None:
         clip = self._current_clip()
@@ -799,8 +1112,8 @@ class PropertiesPanel(QWidget):
         keyframes = sorted(clip.speed_keyframes)
         if row < len(keyframes):
             del keyframes[row]
-        self._commit_now("speed_keyframes", keyframes, "Remove Speed Keyframe")
-        self._refresh_speed_keyframe_table(keyframes)
+        if self._commit_now("speed_keyframes", keyframes, "Remove Speed Keyframe"):
+            self._refresh_speed_keyframe_table(keyframes)
 
     def _on_transition_changed(self, index: int) -> None:
         if self._loading or index < 0:
@@ -821,6 +1134,12 @@ class PropertiesPanel(QWidget):
             self._selected_color = color
             self._apply_text_style()
 
+    def _pick_text_color(self, attribute: str, title: str) -> None:
+        color = QColorDialog.getColor(getattr(self, attribute), self, title)
+        if color.isValid():
+            setattr(self, attribute, color)
+            self._apply_text_style()
+
     def _apply_text_style(self, *_args) -> None:
         if self._loading or self.history is None or self.project is None or self.clip_id is None:
             return
@@ -829,17 +1148,28 @@ class PropertiesPanel(QWidget):
             return
         new_style = TextStyle(
             content=self.text_content.toPlainText(),
-            font_family=clip.text_style.font_family if clip.text_style else "Arial",
+            font_family=self.font_combo.currentFont().family() or "Arial",
             font_size=self.font_size_spin.value(),
             color=self._selected_color.name(),
-            outline_color=clip.text_style.outline_color if clip.text_style else "#000000",
-            outline_width=clip.text_style.outline_width if clip.text_style else 2,
+            outline_color=self._outline_color.name(),
+            outline_width=self.outline_width_spin.value(),
             bold=self.bold_checkbox.isChecked(),
             italic=self.italic_checkbox.isChecked(),
             position_x=self.pos_x_slider.value() / 100.0,
             position_y=self.pos_y_slider.value() / 100.0,
             alignment=self.alignment_combo.currentText(),
+            shadow_enabled=self.shadow_checkbox.isChecked(),
+            shadow_color=self._shadow_color.name(),
+            shadow_offset=self.shadow_offset_spin.value(),
+            box_enabled=self.box_checkbox.isChecked(),
+            box_color=self._box_color.name(),
+            box_opacity=self.box_opacity_spin.value() / 100.0,
+            box_padding=clip.text_style.box_padding if clip.text_style else 12,
         )
+        if clip.text_style is not None and new_style == clip.text_style:
+            return  # e.g. focus left the text box without a change
+        self._end_gesture()
         self.history.execute(UpdateTextClipCommand(self.project, self.clip_id, new_style))
         self.name_label.setText(f"{new_style.content[:24] or 'Text'}  ·  Text Clip")
+        self.clip_changed.emit(self.clip_id)
         self.project_modified.emit()

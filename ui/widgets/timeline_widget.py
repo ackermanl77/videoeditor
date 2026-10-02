@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import json
+import os
+import time
+from typing import Dict, List, Optional, Set
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QMimeData, QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
     QGraphicsLineItem,
     QGraphicsScene,
     QGraphicsView,
@@ -16,6 +24,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QLayoutItem,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -35,12 +44,36 @@ from core.commands import (
     SplitClipCommand,
     TrimClipCommand,
     UpdateTrackPropertyCommand,
+    build_add_clip_command,
     build_ripple_delete_command,
     build_ripple_trim_command,
 )
-from core.history import History
+from core.edit_ops import (
+    build_delete_clips_command,
+    build_detach_audio_command,
+    build_duplicate_command,
+    build_insert_command,
+    build_move_clips_command,
+    build_overwrite_command,
+    build_paste_attributes_command,
+    build_paste_command,
+    build_roll_command,
+    build_slide_command,
+    build_slip_command,
+    copy_clips,
+    linked_clip_ids,
+)
+from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.project import Project
+from core.timeline_nav import (
+    adjacent_point,
+    clip_keyframe_points,
+    edit_points,
+    marker_points,
+    snap_to_frame,
+    step_frames,
+)
 from core.track import Track, TrackType
 from ui import theme
 from ui.media_bin import MEDIA_MIME_TYPE
@@ -56,11 +89,76 @@ from ui.widgets.timeline_items import (
     RulerItem,
     TimelineSignals,
     TrackHeaderItem,
+    row_at_scene_y,
 )
 
 DEFAULT_PIXELS_PER_SECOND = 40.0
 MIN_PPS = 5.0
 MAX_PPS = 400.0
+# Minimum spacing between preview seeks while drag-scrubbing the ruler
+# (~30 Hz); the playhead line itself follows the mouse on every move.
+SCRUB_SEEK_INTERVAL_S = 1.0 / 30.0
+
+
+CLIPBOARD_MIME = "application/x-video-editor-clips"
+
+
+class DuckingDialog(QDialog):
+    """Ducking settings for one track: which track it ducks under, and the compressor's response.
+
+    Threshold, ratio, attack and release used to be fixed Track defaults
+    with no UI at all.
+    """
+
+    def __init__(self, track: Track, other_tracks: List[Track], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Audio Ducking: {track.name}")
+        form = QFormLayout(self)
+        self.trigger_combo = QComboBox()
+        self.trigger_combo.addItem("None (no ducking)", None)
+        for other in other_tracks:
+            self.trigger_combo.addItem(other.name, other.id)
+        index = self.trigger_combo.findData(track.duck_trigger_track_id)
+        self.trigger_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addRow("Duck under", self.trigger_combo)
+
+        def spin(value, low, high, step, suffix, decimals=2, tip=""):
+            box = QDoubleSpinBox()
+            box.setRange(low, high)
+            box.setDecimals(decimals)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            box.setValue(value)
+            box.setToolTip(tip)
+            return box
+
+        self.threshold_spin = spin(track.duck_threshold, 0.001, 1.0, 0.01, "", 3,
+                                   "Trigger level (linear 0..1) above which the music is lowered")
+        self.ratio_spin = spin(track.duck_ratio, 1.0, 20.0, 0.5, " : 1", 1, "How strongly the music is lowered")
+        self.attack_spin = spin(track.duck_attack, 0.01, 2000.0, 5.0, " ms", 1, "How fast ducking starts")
+        self.release_spin = spin(track.duck_release, 0.01, 9000.0, 25.0, " ms", 1, "How fast the music comes back")
+        form.addRow("Threshold", self.threshold_spin)
+        form.addRow("Ratio", self.ratio_spin)
+        form.addRow("Attack", self.attack_spin)
+        form.addRow("Release", self.release_spin)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "duck_trigger_track_id": self.trigger_combo.currentData(),
+            "duck_threshold": self.threshold_spin.value(),
+            "duck_ratio": self.ratio_spin.value(),
+            "duck_attack": self.attack_spin.value(),
+            "duck_release": self.release_spin.value(),
+        }
+
+
+def zoom_scroll_value(anchor_time: float, new_pps: float, anchor_viewport_x: float) -> int:
+    """Horizontal scroll value keeping ``anchor_time`` under viewport x ``anchor_viewport_x`` after a zoom."""
+    return int(round(HEADER_WIDTH + anchor_time * new_pps - anchor_viewport_x))
 
 
 class FlowLayout(QLayout):
@@ -144,7 +242,7 @@ class TimelineView(QGraphicsView):
     """QGraphicsView with Ctrl+wheel zoom and click-to-seek behaviour."""
 
     seek_requested = Signal(float)
-    zoom_requested = Signal(float)  # multiplicative factor
+    zoom_requested = Signal(float, float)  # multiplicative factor, anchor viewport x (-1 = playhead)
 
     def __init__(self, scene: QGraphicsScene, timeline_widget: "TimelineWidget"):
         super().__init__(scene)
@@ -152,9 +250,13 @@ class TimelineView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setDragMode(QGraphicsView.NoDrag)
+        # Dragging on empty space draws a rubber band that selects clips (F6).
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setRubberBandSelectionMode(Qt.IntersectsItemShape)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
+        self._scrubbing = False
+        self._last_scrub_emit = 0.0
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -168,18 +270,43 @@ class TimelineView(QGraphicsView):
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-            self.zoom_requested.emit(factor)
+            self.zoom_requested.emit(factor, float(event.position().x()))  # anchored on the mouse
             event.accept()
         else:
             super().wheelEvent(event)
 
+    def _seconds_at(self, view_pos) -> float:
+        pos = self.mapToScene(view_pos)
+        return max(0.0, (pos.x() - HEADER_WIDTH) / self._timeline_widget.pixels_per_second)
+
     def mousePressEvent(self, event) -> None:
         pos = self.mapToScene(event.pos())
         if event.button() == Qt.LeftButton and pos.y() < RULER_HEIGHT and pos.x() >= HEADER_WIDTH:
-            seconds = max(0.0, (pos.x() - HEADER_WIDTH) / self._timeline_widget.pixels_per_second)
-            self.seek_requested.emit(seconds)
+            # Press on the ruler (or the playhead's handle, which sits in
+            # it) seeks, and dragging from there scrubs.
+            self._scrubbing = True
+            self._last_scrub_emit = time.monotonic()
+            self.seek_requested.emit(self._seconds_at(event.pos()))
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._scrubbing:
+            t = self._seconds_at(event.pos())
+            self._timeline_widget.move_playhead_marker(t)
+            now = time.monotonic()
+            if now - self._last_scrub_emit >= SCRUB_SEEK_INTERVAL_S:
+                self._last_scrub_emit = now
+                self.seek_requested.emit(t)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._scrubbing:
+            self._scrubbing = False
+            self.seek_requested.emit(self._seconds_at(event.pos()))  # always land exactly where released
+            return
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasFormat(MEDIA_MIME_TYPE):
@@ -198,7 +325,7 @@ class TimelineView(QGraphicsView):
             asset_id = bytes(event.mimeData().data(MEDIA_MIME_TYPE)).decode("utf-8")
             scene_pos = self.mapToScene(event.position().toPoint() if hasattr(event, "position") else event.pos())
             seconds = max(0.0, (scene_pos.x() - HEADER_WIDTH) / self._timeline_widget.pixels_per_second)
-            row = max(0, round((scene_pos.y() - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP)))
+            row = row_at_scene_y(scene_pos.y())
             self._timeline_widget.handle_media_drop(asset_id, seconds, row)
             event.acceptProposedAction()
         else:
@@ -208,9 +335,11 @@ class TimelineView(QGraphicsView):
 class TimelineWidget(QWidget):
     """Top-level timeline panel: toolbar + track headers + graphics view."""
 
-    selection_changed = Signal(object)  # Optional[str] clip_id
+    selection_changed = Signal(object)  # Optional[str] clip_id (the primary selection)
     project_modified = Signal()
     playhead_changed = Signal(float)
+    status_message = Signal(str)
+    reveal_asset_requested = Signal(str)  # asset id (clip menu > Reveal in Media Bin)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -218,9 +347,25 @@ class TimelineWidget(QWidget):
         self.history: Optional[History] = None
         self.pixels_per_second = DEFAULT_PIXELS_PER_SECOND
         self.playhead_time = 0.0
-        self.selected_clip_id: Optional[str] = None
+        self.selected_clip_id: Optional[str] = None  # primary selection (shown in Properties)
+        # Every selected clip: Ctrl+click and rubber band add to it (F6).
+        self.selected_clip_ids: Set[str] = set()
+        self._syncing_selection = False
+        self.razor_mode = False
+        self._clipboard_payload: Optional[dict] = None
+        self._layout_key = None
+        # Injected so tests can replace the modal ducking dialog.
+        self.ducking_dialog_factory = DuckingDialog
+        # Set by clicking a track header; Delete Track acts on it (falling
+        # back to the selected clip's track). Cleared by selecting a clip.
+        self.selected_track_id: Optional[str] = None
+        # In/Out points (seconds or None): shaded on the ruler, and offered
+        # as the Export dialog's Trim Range. View state, not project data.
+        self.in_point: Optional[float] = None
+        self.out_point: Optional[float] = None
 
         self._row_tracks: List[Track] = []
+        self._marker_items: List[MarkerItem] = []
         self._clip_items: Dict[str, ClipItem] = {}
         self._header_items: List[TrackHeaderItem] = []
         self._thumbnail_cache: Dict[str, QPixmap] = {}
@@ -335,8 +480,12 @@ class TimelineWidget(QWidget):
 
         self.view.seek_requested.connect(self.set_playhead)
         self.view.zoom_requested.connect(self._on_zoom_factor)
+        self.scene.selectionChanged.connect(self._on_scene_selection_changed)
 
         self.signals.clip_selected.connect(self._on_clip_selected)
+        self.signals.clip_toggle_selected.connect(self._on_clip_toggle_selected)
+        self.signals.clip_context_menu.connect(self._on_clip_context_menu)
+        self.signals.clip_razor.connect(self._on_clip_razor)
         self.signals.clip_moved.connect(self._on_clip_moved)
         self.signals.clip_trimmed.connect(self._on_clip_trimmed)
         self.signals.clip_double_clicked.connect(self._on_clip_selected)
@@ -344,6 +493,7 @@ class TimelineWidget(QWidget):
         self.signals.track_lock_toggled.connect(self._on_track_lock_toggled)
         self.signals.track_hidden_toggled.connect(self._on_track_hidden_toggled)
         self.signals.track_duck_config_requested.connect(self._on_track_duck_config_requested)
+        self.signals.track_selected.connect(self._on_track_selected)
         self.signals.snap_guide_show.connect(self._on_snap_guide_show)
         self.signals.snap_guide_hide.connect(self._on_snap_guide_hide)
         self.signals.marker_clicked.connect(self._on_marker_clicked)
@@ -355,7 +505,11 @@ class TimelineWidget(QWidget):
         self.project = project
         self.history = history
         self.selected_clip_id = None
+        self.selected_clip_ids = set()
+        self.selected_track_id = None
+        self.in_point = self.out_point = None
         self.playhead_time = 0.0
+        self._layout_key = None
         self.rebuild()
 
     def _emit_modified(self) -> None:
@@ -364,21 +518,84 @@ class TimelineWidget(QWidget):
     # ------------------------------------------------------------------
     # Scene construction
     # ------------------------------------------------------------------
+    def _compute_layout_key(self):
+        """Everything besides clips that the scene's items depend on (rows, headers, markers)."""
+        video_tracks = [t for t in self.project.tracks if t.track_type == TrackType.VIDEO]
+        audio_tracks = [t for t in self.project.tracks if t.track_type == TrackType.AUDIO]
+        rows = list(reversed(video_tracks)) + audio_tracks
+        return (
+            tuple((t.id, t.name, t.muted, t.locked, t.hidden, bool(t.duck_trigger_track_id)) for t in rows),
+            tuple((m.id, m.time, m.name, m.color) for m in self.project.markers),
+            self.selected_track_id,
+            self.project.settings.fps,
+        )
+
     def rebuild(self) -> None:
+        """Bring the scene up to date with the project.
+
+        When only clips changed (the common case after an edit), existing
+        clip items are updated in place by id and only added/removed clips
+        create or delete items (PG3). Any change to tracks, headers or
+        markers falls back to recreating the scene.
+        """
         if self.project is None:
             return
+        if self.selected_track_id is not None and self.project.find_track(self.selected_track_id) is None:
+            self.selected_track_id = None
+        key = self._compute_layout_key()
+        if key == self._layout_key and self._row_tracks:
+            self._sync_clip_items()
+            return
+        self._layout_key = key
+        self._full_rebuild()
+
+    def _sync_clip_items(self) -> None:
+        offline_cache: Dict[str, bool] = {}
+        seen = set()
+        for row, track in enumerate(self._row_tracks):
+            for clip in track.sorted_clips():
+                seen.add(clip.id)
+                item = self._clip_items.get(clip.id)
+                if item is None:
+                    self._add_clip_item(clip, row, track, offline_cache)
+                    continue
+                item.offline = self._is_offline(clip, offline_cache)
+                item.track_name = track.name
+                item.set_row(row)
+                item.set_source_clip(clip)
+                item.set_locked(track.locked)
+        for clip_id in [cid for cid in self._clip_items if cid not in seen]:
+            item = self._clip_items.pop(clip_id)
+            self.scene.removeItem(item)
+        self.selected_clip_ids &= seen
+        if self.selected_clip_id not in seen:
+            self.selected_clip_id = None
+        self.ruler_item.set_scale(self.pixels_per_second, max(self.project.total_duration, 60.0))
+        self.ruler_item.update()
+        self.scene.setSceneRect(0, 0, self._scene_width(), self._scene_height())
+        self._highlight_selection()
+        self._update_empty_hint()
+
+    def _full_rebuild(self) -> None:
+        self._syncing_selection = True
         self.scene.clear()
+        self._syncing_selection = False
         self._clip_items.clear()
         self._header_items.clear()
+        self._marker_items = []
+        if self.selected_track_id is not None and self.project.find_track(self.selected_track_id) is None:
+            self.selected_track_id = None
 
         video_tracks = [t for t in self.project.tracks if t.track_type == TrackType.VIDEO]
         audio_tracks = [t for t in self.project.tracks if t.track_type == TrackType.AUDIO]
         # Higher-index video tracks are drawn on top in compositing, so show
         # them higher in the panel too (matches conventional NLE layout).
         self._row_tracks = list(reversed(video_tracks)) + audio_tracks
+        offline_cache: Dict[str, bool] = {}
 
         total_seconds = max(self.project.total_duration, 60.0)
-        self.ruler_item = RulerItem(self.pixels_per_second, total_seconds)
+        self.ruler_item = RulerItem(self.pixels_per_second, total_seconds, self.project.settings.fps)
+        self.ruler_item.set_in_out(self.in_point, self.out_point)
         self.ruler_item.setPos(HEADER_WIDTH, 0)
         self.scene.addItem(self.ruler_item)
 
@@ -392,19 +609,19 @@ class TimelineWidget(QWidget):
 
         for row, track in enumerate(self._row_tracks):
             header = TrackHeaderItem(track.id, row, track.name, track.track_type.value, self.signals)
-            header.mute_btn.active = track.muted
-            header.lock_btn.active = track.locked
-            header.hide_btn.active = track.hidden
-            header.duck_btn.active = bool(track.duck_trigger_track_id)
+            header.mute_btn.set_active(track.muted)
+            header.lock_btn.set_active(track.locked)
+            header.hide_btn.set_active(track.hidden)
+            header.duck_btn.set_active(bool(track.duck_trigger_track_id))
+            header.selected = track.id == self.selected_track_id
             self.scene.addItem(header)
             self._header_items.append(header)
 
             for clip in track.sorted_clips():
-                self._add_clip_item(clip, row)
+                self._add_clip_item(clip, row, track, offline_cache)
 
-        scene_height = RULER_HEIGHT + len(self._row_tracks) * (TRACK_HEIGHT + TRACK_GAP) + 40
-        scene_width = max(total_seconds * self.pixels_per_second + 400 + HEADER_WIDTH, 1200 + HEADER_WIDTH)
-        self.scene.setSceneRect(0, 0, scene_width, scene_height)
+        scene_height = self._scene_height()
+        self.scene.setSceneRect(0, 0, self._scene_width(), scene_height)
 
         self.playhead_item = PlayheadItem(scene_height)
         self.playhead_item.setX(HEADER_WIDTH + self.playhead_time * self.pixels_per_second)
@@ -417,10 +634,36 @@ class TimelineWidget(QWidget):
             marker_item = MarkerItem(marker.id, marker.time, marker.name, marker.color, scene_height, self.signals)
             marker_item.setX(HEADER_WIDTH + marker.time * self.pixels_per_second)
             self.scene.addItem(marker_item)
+            self._marker_items.append(marker_item)
 
         self._highlight_selection()
         self._pin_header_items()
         self._update_empty_hint()
+
+    def _scene_height(self) -> float:
+        return RULER_HEIGHT + len(self._row_tracks) * (TRACK_HEIGHT + TRACK_GAP) + 40
+
+    def _scene_width(self) -> float:
+        total_seconds = max(self.project.total_duration if self.project else 0.0, 60.0)
+        return max(total_seconds * self.pixels_per_second + 400 + HEADER_WIDTH, 1200 + HEADER_WIDTH)
+
+    def refresh_clip(self, clip_id: str) -> None:
+        """Bring one clip's item up to date after a property edit (width, badges, name).
+
+        The Properties panel's commits used to leave the timeline stale
+        (e.g. a Speed change kept the old width) until an unrelated edit
+        rebuilt the scene.
+        """
+        if self.project is None:
+            return
+        clip = self.project.find_clip(clip_id)
+        item = self._clip_items.get(clip_id)
+        if clip is None or item is None:
+            self.rebuild()
+            return
+        item.set_source_clip(clip)
+        self.ruler_item.set_scale(self.pixels_per_second, max(self.project.total_duration, 60.0))
+        self.scene.setSceneRect(0, 0, self._scene_width(), self._scene_height())
 
     def _update_empty_hint(self) -> None:
         has_any_clip = self.project is not None and any(track.clips for track in self.project.tracks)
@@ -478,7 +721,16 @@ class TimelineWidget(QWidget):
     def _on_ripple_toggled(self, checked: bool) -> None:
         self.ripple_enabled = checked
 
-    def _add_clip_item(self, clip: Clip, row: int) -> None:
+    @staticmethod
+    def _is_offline(clip: Clip, cache: Dict[str, bool]) -> bool:
+        if clip.media_type == MediaType.TEXT or not clip.source_path:
+            return False
+        if clip.source_path not in cache:
+            cache[clip.source_path] = not os.path.isfile(clip.source_path)
+        return cache[clip.source_path]
+
+    def _add_clip_item(self, clip: Clip, row: int, track: Optional[Track] = None,
+                       offline_cache: Optional[Dict[str, bool]] = None) -> None:
         thumb = self._get_thumbnail(clip)
         waveform = self._get_waveform(clip)
         item = ClipItem(
@@ -489,16 +741,29 @@ class TimelineWidget(QWidget):
             thumb,
             waveform=waveform,
             snap_targets_provider=self._snap_targets,
+            track_name=track.name if track is not None else "",
+            fps=self._fps(),
+            offline=self._is_offline(clip, offline_cache if offline_cache is not None else {}),
         )
+        item.razor_mode = self.razor_mode
+        if track is not None and track.locked:
+            item.set_locked(True)
         self.scene.addItem(item)
         self._clip_items[clip.id] = item
 
     def _get_thumbnail(self, clip: Clip) -> Optional[QPixmap]:
-        if clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
+        """The clip's thumbnail, scaled once to the clip height and cached (it was rescaled on every paint)."""
+        if clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE) or self.get_thumbnail_for_clip is None:
             return None
-        if self.get_thumbnail_for_clip is not None:
-            return self.get_thumbnail_for_clip(clip)
-        return None
+        pixmap = self.get_thumbnail_for_clip(clip)
+        if pixmap is None or pixmap.isNull():
+            return pixmap
+        key = f"{clip.source_path}|{pixmap.cacheKey()}"
+        cached = self._thumbnail_cache.get(key)
+        if cached is None:
+            cached = pixmap.scaledToHeight(TRACK_HEIGHT - 4, Qt.SmoothTransformation)
+            self._thumbnail_cache[key] = cached
+        return cached
 
     def _get_waveform(self, clip: Clip):
         if clip.media_type not in (MediaType.AUDIO, MediaType.VIDEO):
@@ -542,14 +807,21 @@ class TimelineWidget(QWidget):
     # ------------------------------------------------------------------
     # Zoom / playhead
     # ------------------------------------------------------------------
-    def _on_zoom_slider(self, value: int) -> None:
-        t = value / 100.0
-        self.pixels_per_second = MIN_PPS * (MAX_PPS / MIN_PPS) ** t
-        self.rebuild()
+    @staticmethod
+    def _pps_for_slider(value: int) -> float:
+        return MIN_PPS * (MAX_PPS / MIN_PPS) ** (value / 100.0)
 
-    def _on_zoom_factor(self, factor: float) -> None:
-        self.pixels_per_second = max(MIN_PPS, min(MAX_PPS, self.pixels_per_second * factor))
-        self.rebuild()
+    @staticmethod
+    def _slider_for_pps(pps: float) -> int:
+        import math
+
+        return int(round(100.0 * math.log(pps / MIN_PPS) / math.log(MAX_PPS / MIN_PPS)))
+
+    def _on_zoom_slider(self, value: int) -> None:
+        self.set_zoom(self._pps_for_slider(value))
+
+    def _on_zoom_factor(self, factor: float, anchor_viewport_x: float = -1.0) -> None:
+        self.set_zoom(self.pixels_per_second * factor, anchor_viewport_x)
 
     def zoom_in(self) -> None:
         self._on_zoom_factor(1.25)
@@ -557,22 +829,198 @@ class TimelineWidget(QWidget):
     def zoom_out(self) -> None:
         self._on_zoom_factor(0.8)
 
+    def zoom_to_fit(self) -> None:
+        if self.project is None:
+            return
+        available = max(100, self.view.viewport().width() - HEADER_WIDTH - 20)
+        self.set_zoom(available / max(self.project.total_duration, 1.0))
+        self.view.horizontalScrollBar().setValue(0)
+
+    def set_zoom(self, pixels_per_second: float, anchor_viewport_x: float = -1.0) -> None:
+        """Change the zoom in place, keeping the anchor where it is on screen.
+
+        The anchor is the viewport x under the mouse (wheel zoom) or, with
+        ``anchor_viewport_x < 0``, the playhead. Items are re-scaled rather
+        than the whole scene rebuilt on every slider tick/wheel step, and
+        the scroll position is recomputed so the view no longer jumps.
+        """
+        new_pps = max(MIN_PPS, min(MAX_PPS, pixels_per_second))
+        scrollbar = self.view.horizontalScrollBar()
+        old_pps = self.pixels_per_second
+        if anchor_viewport_x < 0:
+            anchor_time = self.playhead_time
+            anchor_viewport_x = HEADER_WIDTH + anchor_time * old_pps - scrollbar.value()
+            if not (HEADER_WIDTH <= anchor_viewport_x <= self.view.viewport().width()):
+                anchor_viewport_x = max(HEADER_WIDTH, self.view.viewport().width() / 2)
+                anchor_time = max(0.0, (scrollbar.value() + anchor_viewport_x - HEADER_WIDTH) / old_pps)
+        else:
+            anchor_time = max(0.0, (scrollbar.value() + anchor_viewport_x - HEADER_WIDTH) / old_pps)
+
+        self.pixels_per_second = new_pps
+        for item in self._clip_items.values():
+            item.prepareGeometryChange()
+            item.pixels_per_second = new_pps
+            item._sync_position()
+            item.update()
+        total_seconds = max(self.project.total_duration if self.project else 0.0, 60.0)
+        self.ruler_item.set_scale(new_pps, total_seconds)
+        self.ruler_item.update()
+        self.playhead_item.setX(HEADER_WIDTH + self.playhead_time * new_pps)
+        for marker_item in self._marker_items:
+            marker_item.setX(HEADER_WIDTH + marker_item.time * new_pps)
+        self.snap_guide_item.setVisible(False)
+        self.scene.setSceneRect(0, 0, self._scene_width(), self._scene_height())
+        scrollbar.setValue(zoom_scroll_value(anchor_time, new_pps, anchor_viewport_x))
+        self._pin_header_items()
+
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(self._slider_for_pps(new_pps))
+        self.zoom_slider.blockSignals(False)
+
     def set_playhead(self, seconds: float) -> None:
         self.playhead_time = max(0.0, seconds)
         self.playhead_item.setX(HEADER_WIDTH + self.playhead_time * self.pixels_per_second)
         self.playhead_changed.emit(self.playhead_time)
 
+    def move_playhead_marker(self, seconds: float) -> None:
+        """Move only the playhead line (drag-scrub feedback between throttled seeks)."""
+        self.playhead_item.setX(HEADER_WIDTH + max(0.0, seconds) * self.pixels_per_second)
+
+    # ------------------------------------------------------------------
+    # Keyboard transport / navigation (frame-accurate, project fps)
+    # ------------------------------------------------------------------
+    def _fps(self) -> float:
+        return self.project.settings.fps if self.project is not None else 30.0
+
+    def step_frames(self, frames: int) -> None:
+        self.set_playhead(step_frames(self.playhead_time, self._fps(), frames))
+
+    def step_seconds(self, seconds: float) -> None:
+        self.set_playhead(snap_to_frame(self.playhead_time + seconds, self._fps()))
+
+    def go_to_start(self) -> None:
+        self.set_playhead(0.0)
+
+    def go_to_end(self) -> None:
+        if self.project is not None:
+            self.set_playhead(self.project.total_duration)
+
+    def go_to_edit_point(self, direction: int) -> None:
+        if self.project is None:
+            return
+        target = adjacent_point(edit_points(self.project), self.playhead_time, direction)
+        if target is not None:
+            self.set_playhead(target)
+
+    def go_to_marker(self, direction: int) -> None:
+        if self.project is None:
+            return
+        target = adjacent_point(marker_points(self.project), self.playhead_time, direction)
+        if target is not None:
+            self.set_playhead(target)
+
+    def set_in_point(self) -> None:
+        self.in_point = self.playhead_time
+        if self.out_point is not None and self.out_point <= self.in_point:
+            self.out_point = None
+        self.ruler_item.set_in_out(self.in_point, self.out_point)
+
+    def set_out_point(self) -> None:
+        self.out_point = self.playhead_time
+        if self.in_point is not None and self.in_point >= self.out_point:
+            self.in_point = None
+        self.ruler_item.set_in_out(self.in_point, self.out_point)
+
+    def clear_in_out(self) -> None:
+        self.in_point = self.out_point = None
+        self.ruler_item.set_in_out(None, None)
+
+    def in_out_range(self):
+        """``(start, end)`` for the Export dialog's Trim Range, or None when neither point is set."""
+        if self.in_point is None and self.out_point is None:
+            return None
+        start = self.in_point or 0.0
+        end = self.out_point if self.out_point is not None else (self.project.total_duration if self.project else 0.0)
+        return (start, end) if end > start else None
+
     # ------------------------------------------------------------------
     # Selection
     # ------------------------------------------------------------------
     def _on_clip_selected(self, clip_id: str) -> None:
+        """Plain click: select only this clip -- unless it is already part of a
+        multi-selection, which then stays selected so the group can be dragged."""
+        if clip_id not in self.selected_clip_ids or len(self.selected_clip_ids) <= 1:
+            self.selected_clip_ids = {clip_id}
         self.selected_clip_id = clip_id
+        self._select_track_header(None)
         self._highlight_selection()
         self.selection_changed.emit(clip_id)
 
+    def _on_clip_toggle_selected(self, clip_id: str) -> None:
+        """Ctrl+click: add the clip to, or remove it from, the selection."""
+        if clip_id in self.selected_clip_ids:
+            self.selected_clip_ids.discard(clip_id)
+            if self.selected_clip_id == clip_id:
+                self.selected_clip_id = next(iter(self.selected_clip_ids), None)
+        else:
+            self.selected_clip_ids.add(clip_id)
+            self.selected_clip_id = clip_id
+        self._highlight_selection()
+        self.selection_changed.emit(self.selected_clip_id)
+
+    def select_clips(self, clip_ids) -> None:
+        """Programmatic selection (also used by Select All and after paste)."""
+        ids = [cid for cid in clip_ids if cid in self._clip_items]
+        self.selected_clip_ids = set(ids)
+        self.selected_clip_id = ids[-1] if ids else None
+        self._highlight_selection()
+        self.selection_changed.emit(self.selected_clip_id)
+
+    def select_all(self) -> None:
+        self.select_clips(list(self._clip_items))
+
+    def _on_scene_selection_changed(self) -> None:
+        """Rubber-band selection (and Qt's own click handling) -> our selection set."""
+        if self._syncing_selection:
+            return
+        try:
+            ids = {item.clip_id for item in self.scene.selectedItems() if isinstance(item, ClipItem)}
+        except RuntimeError:
+            return
+        if ids == self.selected_clip_ids:
+            return
+        self.selected_clip_ids = ids
+        if self.selected_clip_id not in ids:
+            self.selected_clip_id = next(iter(sorted(ids)), None) if ids else None
+            self.selection_changed.emit(self.selected_clip_id)
+
+    def selected_ids(self) -> List[str]:
+        """The selection, primary clip included even if the set is empty (older call sites)."""
+        ids = set(self.selected_clip_ids)
+        if self.selected_clip_id:
+            ids.add(self.selected_clip_id)
+        return sorted(ids, key=lambda cid: self.project.find_clip(cid).timeline_start
+                      if self.project is not None and self.project.find_clip(cid) else 0.0)
+
+    def _on_track_selected(self, row: int) -> None:
+        if 0 <= row < len(self._row_tracks):
+            self._select_track_header(self._row_tracks[row].id)
+
+    def _select_track_header(self, track_id: Optional[str]) -> None:
+        self.selected_track_id = track_id
+        for header in self._header_items:
+            header.set_selected(header.track_id == track_id)
+
     def _highlight_selection(self) -> None:
-        for cid, item in self._clip_items.items():
-            item.setSelected(cid == self.selected_clip_id)
+        selected = set(self.selected_clip_ids)
+        if self.selected_clip_id:
+            selected.add(self.selected_clip_id)
+        self._syncing_selection = True
+        try:
+            for cid, item in self._clip_items.items():
+                item.setSelected(cid in selected)
+        finally:
+            self._syncing_selection = False
 
     # ------------------------------------------------------------------
     # Editing operations
@@ -591,9 +1039,9 @@ class TimelineWidget(QWidget):
         track = self.project.find_track(track_id) if track_id else None
         if track is None:
             candidates = [t for t in self.project.tracks if t.track_type == kind]
-            track = candidates[0] if candidates else self.project.add_track(kind)
+            track = candidates[0] if candidates else None
 
-        start = at_time if at_time is not None else track.duration
+        start = at_time if at_time is not None else (track.duration if track is not None else 0.0)
         length = asset.duration if asset.duration > 0 else 5.0
 
         clip = Clip(
@@ -602,10 +1050,15 @@ class TimelineWidget(QWidget):
             source_in=0.0,
             source_out=length,
             timeline_start=start,
-            track_index=self.project.tracks.index(track),
             source_duration=asset.duration if asset.duration > 0 else None,
+            asset_id=asset.id,
         )
-        self.history.execute(AddClipCommand(self.project, track.id, clip))
+        # Lands on the requested track if the spot is free, else another
+        # track of the same kind where it is, else a new track -- all one
+        # undo step (see core.commands.build_add_clip_command).
+        self.history.execute(
+            build_add_clip_command(self.project, clip, kind, track.id if track is not None else None, self._row_tracks)
+        )
         self.rebuild()
         self._emit_modified()
 
@@ -622,17 +1075,14 @@ class TimelineWidget(QWidget):
     def add_text_clip(self, at_time: Optional[float] = None) -> Optional[str]:
         if self.project is None or self.history is None:
             return None
-        video_tracks = [t for t in self.project.tracks if t.track_type == TrackType.VIDEO]
-        track = video_tracks[-1] if video_tracks else self.project.add_track(TrackType.VIDEO)
         start = at_time if at_time is not None else self.playhead_time
-        clip = Clip(
-            media_type=MediaType.TEXT,
-            source_in=0.0,
-            source_out=4.0,
-            timeline_start=start,
-            track_index=self.project.tracks.index(track),
-        )
-        self.history.execute(AddClipCommand(self.project, track.id, clip))
+        clip = Clip(media_type=MediaType.TEXT, source_in=0.0, source_out=4.0, timeline_start=start)
+        # Top-most video track first (text is drawn over everything anyway);
+        # never on top of an existing clip.
+        video_tracks = [t for t in self.project.tracks if t.track_type == TrackType.VIDEO]
+        order = list(reversed(video_tracks))
+        preferred = order[0].id if order else None
+        self.history.execute(build_add_clip_command(self.project, clip, TrackType.VIDEO, preferred, order))
         self.selected_clip_id = clip.id
         self.rebuild()
         self._emit_modified()
@@ -682,13 +1132,22 @@ class TimelineWidget(QWidget):
         self._emit_modified()
 
     def delete_selected_track(self) -> None:
-        if self.project is None or self.history is None or self.selected_clip_id is None:
+        """Delete the track whose header was clicked, else the selected clip's track.
+
+        Used to require a selected clip, so an empty track could never be deleted.
+        """
+        if self.project is None or self.history is None:
             return
-        track = self.project.find_clip_track(self.selected_clip_id)
+        track = self.project.find_track(self.selected_track_id) if self.selected_track_id else None
+        if track is None and self.selected_clip_id is not None:
+            track = self.project.find_clip_track(self.selected_clip_id)
         if track is None:
             return
         self.history.execute(RemoveTrackCommand(self.project, track.id))
-        self.selected_clip_id = None
+        if self.selected_clip_id is not None and self.project.find_clip(self.selected_clip_id) is None:
+            self.selected_clip_id = None
+            self.selection_changed.emit(None)
+        self.selected_track_id = None
         self.rebuild()
         self._emit_modified()
 
@@ -700,17 +1159,258 @@ class TimelineWidget(QWidget):
         self._emit_modified()
 
     def delete_selected(self) -> None:
-        if self.project is None or self.history is None or self.selected_clip_id is None:
+        if self.project is None or self.history is None:
             return
-        if self.ripple_enabled:
-            command = build_ripple_delete_command(self.project, self.selected_clip_id)
+        ids = self.selected_ids()
+        if not ids:
+            return
+        if len(ids) == 1:
+            if self.ripple_enabled:
+                command = build_ripple_delete_command(self.project, ids[0])
+            else:
+                command = RemoveClipCommand(self.project, ids[0])
         else:
-            command = RemoveClipCommand(self.project, self.selected_clip_id)
+            command = build_delete_clips_command(self.project, ids, ripple=self.ripple_enabled)
         self.history.execute(command)
         self.selected_clip_id = None
+        self.selected_clip_ids = set()
         self.rebuild()
         self._emit_modified()
         self.selection_changed.emit(None)
+
+    # ------------------------------------------------------------------
+    # Clipboard (F6)
+    # ------------------------------------------------------------------
+    def copy_selected(self) -> bool:
+        if self.project is None:
+            return False
+        payload = copy_clips(self.project, self.selected_ids())
+        if payload is None:
+            return False
+        self._clipboard_payload = payload
+        try:
+            mime = QMimeData()
+            mime.setData(CLIPBOARD_MIME, json.dumps(payload).encode("utf-8"))
+            QGuiApplication.clipboard().setMimeData(mime)
+        except Exception:  # noqa: BLE001 - the in-app copy above still works
+            pass
+        self.status_message.emit(f"Copied {len(payload['clips'])} clip(s).")
+        return True
+
+    def cut_selected(self) -> None:
+        if self.copy_selected():
+            self.delete_selected()
+
+    def _clipboard(self) -> Optional[dict]:
+        try:
+            mime = QGuiApplication.clipboard().mimeData()
+            if mime is not None and mime.hasFormat(CLIPBOARD_MIME):
+                return json.loads(bytes(mime.data(CLIPBOARD_MIME)).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+        return self._clipboard_payload
+
+    def _execute_and_select(self, command, select_new: bool = True) -> bool:
+        if command is None or self.project is None or self.history is None:
+            return False
+        before = {c.id for t in self.project.tracks for c in t.clips}
+        self.history.execute(command)
+        self.rebuild()
+        self._emit_modified()
+        if select_new:
+            new = [c.id for t in self.project.tracks for c in t.clips if c.id not in before]
+            if new:
+                self.select_clips(new)
+        return True
+
+    def paste_at_playhead(self) -> bool:
+        if self.project is None:
+            return False
+        ok = self._execute_and_select(build_paste_command(self.project, self._clipboard(), self.playhead_time))
+        if not ok:
+            self.status_message.emit("Nothing to paste.")
+        return ok
+
+    def duplicate_selected(self) -> bool:
+        if self.project is None:
+            return False
+        return self._execute_and_select(build_duplicate_command(self.project, self.selected_ids()))
+
+    def paste_attributes(self) -> bool:
+        if self.project is None:
+            return False
+        command = build_paste_attributes_command(self.project, self._clipboard(), self.selected_ids())
+        ok = self._execute_and_select(command, select_new=False)
+        if ok:
+            for cid in self.selected_ids():
+                self.refresh_clip(cid)
+        return ok
+
+    # ------------------------------------------------------------------
+    # NLE edits (F7)
+    # ------------------------------------------------------------------
+    def set_razor_mode(self, enabled: bool) -> None:
+        """Razor tool (C): clicking a clip splits it at the click instead of selecting it."""
+        self.razor_mode = bool(enabled)
+        for item in self._clip_items.values():
+            item.razor_mode = self.razor_mode
+        self.view.viewport().setCursor(Qt.CrossCursor if self.razor_mode else Qt.ArrowCursor)
+        self.status_message.emit("Razor tool on: click a clip to cut it." if enabled else "Razor tool off.")
+
+    def _on_clip_razor(self, clip_id: str, seconds: float) -> None:
+        if self.project is None or self.history is None:
+            return
+        self.history.execute(SplitClipCommand(self.project, clip_id, seconds))
+        self.rebuild()
+        self._emit_modified()
+
+    def _clip_for_asset(self, asset: MediaAsset, start: float) -> Clip:
+        media_type = MediaType.IMAGE if asset.is_image else (MediaType.VIDEO if asset.has_video else MediaType.AUDIO)
+        length = asset.duration if asset.duration > 0 else 5.0
+        return Clip(media_type=media_type, source_path=asset.path, source_out=length, timeline_start=start,
+                    source_duration=asset.duration if asset.duration > 0 else None, asset_id=asset.id)
+
+    def insert_asset_at_playhead(self, asset: MediaAsset, overwrite: bool = False) -> bool:
+        """Insert (ripple every unlocked track) or overwrite media at the playhead on the selected/first track."""
+        if self.project is None:
+            return False
+        clip = self._clip_for_asset(asset, self.playhead_time)
+        kind = TrackType.AUDIO if clip.media_type == MediaType.AUDIO else TrackType.VIDEO
+        track = self.project.find_track(self.selected_track_id) if self.selected_track_id else None
+        if track is None or track.track_type != kind:
+            track = self._track_for_row(0, kind) if self._row_tracks else None
+        if overwrite:
+            command = build_overwrite_command(self.project, clip, track.id) if track is not None else None
+        else:
+            command = build_insert_command(self.project, clip, track.id if track is not None else None)
+        ok = self._execute_and_select(command)
+        if not ok:
+            self.status_message.emit("Couldn't place the media there (locked track?).")
+        return ok
+
+    def detach_audio_selected(self, has_audio=None) -> bool:
+        if self.project is None or self.selected_clip_id is None:
+            return False
+        clip = self.project.find_clip(self.selected_clip_id)
+        asset = self.project.asset_for_clip(clip) if clip is not None else None
+        audible = has_audio if has_audio is not None else (asset.has_audio if asset is not None else True)
+        ok = self._execute_and_select(build_detach_audio_command(self.project, self.selected_clip_id, audible), False)
+        self.status_message.emit("Audio detached to an audio track (linked)." if ok else "This clip has no audio to detach.")
+        return ok
+
+    def roll_selected_to_playhead(self) -> bool:
+        if self.project is None or self.selected_clip_id is None:
+            return False
+        ok = self._execute_and_select(build_roll_command(self.project, self.selected_clip_id, self.playhead_time), False)
+        if not ok:
+            self.status_message.emit("Roll needs a clip touching the selected clip's right edge, and enough media.")
+        return ok
+
+    def slip_selected(self, source_delta: Optional[float] = None) -> bool:
+        if self.project is None or self.selected_clip_id is None:
+            return False
+        if source_delta is None:
+            source_delta, ok = QInputDialog.getDouble(self, "Slip Clip", "Shift the source by (seconds):", 0.0, -3600, 3600, 2)
+            if not ok:
+                return False
+        return self._execute_and_select(build_slip_command(self.project, self.selected_clip_id, source_delta), False)
+
+    def slide_selected(self, delta: Optional[float] = None) -> bool:
+        if self.project is None or self.selected_clip_id is None:
+            return False
+        if delta is None:
+            delta, ok = QInputDialog.getDouble(self, "Slide Clip", "Move the clip by (seconds):", 0.0, -3600, 3600, 2)
+            if not ok:
+                return False
+        ok = self._execute_and_select(build_slide_command(self.project, self.selected_clip_id, delta), False)
+        if not ok:
+            self.status_message.emit("Can't slide there: the neighbouring clips don't have enough media, or it would overlap.")
+        return ok
+
+    def nudge_selected(self, frames: int) -> bool:
+        """Move the selected clips by whole frames (Alt+Left / Alt+Right)."""
+        if self.project is None or self.history is None:
+            return False
+        ids = self.selected_ids()
+        command = build_move_clips_command(self.project, ids, frames / self._fps())
+        return self._execute_and_select(command, False)
+
+    def select_adjacent_clip(self, direction: int) -> None:
+        """Tab / Shift+Tab: select the next/previous clip in time on the selected clip's track (or any track)."""
+        if self.project is None:
+            return
+        track = self.project.find_clip_track(self.selected_clip_id) if self.selected_clip_id else None
+        clips = track.sorted_clips() if track is not None else sorted(
+            (c for t in self.project.tracks for c in t.clips), key=lambda c: c.timeline_start)
+        if not clips:
+            return
+        ids = [c.id for c in clips]
+        if self.selected_clip_id in ids:
+            index = (ids.index(self.selected_clip_id) + (1 if direction > 0 else -1)) % len(ids)
+        else:
+            index = 0 if direction > 0 else len(ids) - 1
+        self._on_clip_selected(ids[index])
+
+    def go_to_keyframe(self, direction: int) -> None:
+        """Previous/next keyframe of the selected clip (F12)."""
+        if self.project is None or self.selected_clip_id is None:
+            return
+        clip = self.project.find_clip(self.selected_clip_id)
+        if clip is None:
+            return
+        target = adjacent_point(clip_keyframe_points(clip), self.playhead_time, direction)
+        if target is not None:
+            self.set_playhead(target)
+
+    # ------------------------------------------------------------------
+    # Clip context menu (F6)
+    # ------------------------------------------------------------------
+    def build_clip_menu(self, clip_id: str) -> QMenu:
+        if clip_id not in self.selected_ids():
+            self._on_clip_selected(clip_id)
+        menu = QMenu(self)
+        entries = (
+            ("Split at Playhead", self.split_selected),
+            ("Delete", self.delete_selected),
+            ("Ripple Delete", self._ripple_delete_selected),
+            (None, None),
+            ("Copy", self.copy_selected),
+            ("Cut", self.cut_selected),
+            ("Paste at Playhead", self.paste_at_playhead),
+            ("Duplicate", self.duplicate_selected),
+            ("Paste Attributes", self.paste_attributes),
+            (None, None),
+            ("Detach Audio", self.detach_audio_selected),
+            ("Roll Edit to Playhead", self.roll_selected_to_playhead),
+            ("Slip...", self.slip_selected),
+            ("Slide...", self.slide_selected),
+            (None, None),
+            ("Reveal in Media Bin", lambda: self._reveal_asset(clip_id)),
+            ("Properties", lambda: self.selection_changed.emit(clip_id)),
+        )
+        for text, slot in entries:
+            if text is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(text).triggered.connect(lambda _checked=False, s=slot: s())
+        return menu
+
+    def _on_clip_context_menu(self, clip_id: str, screen_pos) -> None:
+        self.build_clip_menu(clip_id).exec(screen_pos)
+
+    def _ripple_delete_selected(self) -> None:
+        previous = self.ripple_enabled
+        self.ripple_enabled = True
+        try:
+            self.delete_selected()
+        finally:
+            self.ripple_enabled = previous
+
+    def _reveal_asset(self, clip_id: str) -> None:
+        clip = self.project.find_clip(clip_id) if self.project is not None else None
+        asset = self.project.asset_for_clip(clip) if clip is not None else None
+        if asset is not None:
+            self.reveal_asset_requested.emit(asset.id)
 
     def _on_clip_moved(self, clip_id: str, new_start: float, new_row: int) -> None:
         if self.project is None or self.history is None:
@@ -718,6 +1418,22 @@ class TimelineWidget(QWidget):
             return
         clip = self.project.find_clip(clip_id)
         if clip is None:
+            self.rebuild()
+            return
+        group = set(linked_clip_ids(self.project, clip_id))
+        if clip_id in self.selected_clip_ids and len(self.selected_clip_ids) > 1:
+            group |= self.selected_clip_ids
+            for cid in list(self.selected_clip_ids):
+                group |= set(linked_clip_ids(self.project, cid))
+        if len(group) > 1:
+            # Group/linked move: every clip shifts by the same time on its own track.
+            command = build_move_clips_command(self.project, group, max(0.0, new_start) - clip.timeline_start)
+            if command is not None:
+                self.history.execute(command)
+                self._emit_modified()
+            else:
+                self.status_message.emit("Can't move the selection there: it would overlap another clip.")
+            self._layout_key = None  # Qt moved the other selected items visually; redraw them all
             self.rebuild()
             return
         kind = TrackType.AUDIO if clip.media_type == MediaType.AUDIO else TrackType.VIDEO
@@ -744,13 +1460,9 @@ class TimelineWidget(QWidget):
         if track is None or clip is None:
             self.rebuild()
             return
-        probe = Clip(
-            media_type=clip.media_type,
-            timeline_start=timeline_start,
-            source_in=source_in,
-            source_out=source_out,
-            speed=clip.speed,
-        )
+        # A copy of the real clip (speed ramp included), not a constant-speed stand-in.
+        probe = clip.with_source_range(source_in, source_out)
+        probe.timeline_start = timeline_start
         if self.ripple_enabled:
             # Clips at/after the clip's OLD end shift in lockstep with this
             # trim (see build_ripple_trim_command), so they can never newly
@@ -817,31 +1529,16 @@ class TimelineWidget(QWidget):
             return
         track = self._row_tracks[row]
         other_tracks = [t for t in self.project.tracks if t.id != track.id]
-        options = ["None (no ducking)"] + [t.name for t in other_tracks]
-        current_index = 0
-        if track.duck_trigger_track_id:
-            for i, t in enumerate(other_tracks):
-                if t.id == track.duck_trigger_track_id:
-                    current_index = i + 1
-                    break
-        choice, ok = QInputDialog.getItem(
-            self,
-            "Duck Audio Under",
-            f'"{track.name}" ducks (lowers volume) under which track\'s audio?',
-            options,
-            current_index,
-            editable=False,
-        )
-        if not ok:
+        dialog = self.ducking_dialog_factory(track, other_tracks, self)
+        if dialog.exec() != QDialog.Accepted:
             return
-        if choice == options[0]:
-            new_trigger_id = None
-        else:
-            new_trigger_id = other_tracks[options.index(choice) - 1].id
-        if self.history is not None and new_trigger_id != track.duck_trigger_track_id:
-            self.history.execute(
-                UpdateTrackPropertyCommand(self.project, track.id, "duck_trigger_track_id", new_trigger_id, "Set Audio Ducking")
-            )
+        changes = [
+            UpdateTrackPropertyCommand(self.project, track.id, name, value, "Set Audio Ducking")
+            for name, value in dialog.values().items()
+            if getattr(track, name) != value
+        ]
+        if self.history is not None and changes:
+            self.history.execute(changes[0] if len(changes) == 1 else CompositeCommand(changes, "Set Audio Ducking"))
         # Rebuild so the header's duck-toggle indicator (active/inactive)
         # reflects the new value immediately, the same way mute/lock/hide's
         # own handlers rebuild right after mutating their track field.

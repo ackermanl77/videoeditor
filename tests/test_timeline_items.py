@@ -161,20 +161,45 @@ class DuckToggleIntegrationTests(unittest.TestCase):
 
         self.assertTrue(widget._header_items[row].duck_btn.active)
 
+    @staticmethod
+    def _fake_dialog(trigger_id, accepted=True, **params):
+        """Stand-in for the modal DuckingDialog: answers with the real dialog's values plus overrides."""
+        from PySide6.QtWidgets import QDialog
+
+        from ui.widgets.timeline_widget import DuckingDialog
+
+        calls = []
+
+        def factory(track, others, parent):
+            real = DuckingDialog(track, others, parent)
+            calls.append(real)
+            index = real.trigger_combo.findData(trigger_id)
+            real.trigger_combo.setCurrentIndex(index)
+            for name, value in params.items():
+                getattr(real, f"{name}_spin").setValue(value)
+            real.exec = lambda: QDialog.Accepted if accepted else QDialog.Rejected
+            return real
+
+        return factory, calls
+
     def test_clicking_duck_button_reuses_the_context_menus_picker(self):
         widget, project, video_track, audio_track = self._widget_with_project()
         row = widget._row_tracks.index(audio_track)
         header = widget._header_items[row]
         self.assertFalse(header.duck_btn.active)
 
-        with patch(
-            "ui.widgets.timeline_widget.QInputDialog.getItem",
-            return_value=(video_track.name, True),
-        ) as mock_get_item:
-            header.duck_btn.clicked.emit()
+        widget.ducking_dialog_factory, calls = self._fake_dialog(video_track.id, ratio=4.0, release=500.0)
+        header.duck_btn.clicked.emit()
 
-        mock_get_item.assert_called_once()
+        self.assertEqual(len(calls), 1)
         self.assertEqual(audio_track.duck_trigger_track_id, video_track.id)
+        # B5: the compressor settings are editable too, in the same undo step.
+        self.assertEqual((audio_track.duck_ratio, audio_track.duck_release), (4.0, 500.0))
+        widget.history.undo()
+        self.assertIsNone(audio_track.duck_trigger_track_id)
+        self.assertEqual(audio_track.duck_ratio, 8.0)
+        widget.history.redo()
+        widget.rebuild()
         # rebuild() (run by the same handler the context menu uses) replaces
         # header items, so re-fetch this row's header for the fresh state.
         self.assertTrue(widget._header_items[row].duck_btn.active)
@@ -187,14 +212,18 @@ class DuckToggleIntegrationTests(unittest.TestCase):
         header = widget._header_items[row]
         self.assertTrue(header.duck_btn.active)
 
-        with patch(
-            "ui.widgets.timeline_widget.QInputDialog.getItem",
-            return_value=("None (no ducking)", True),
-        ):
-            header.duck_btn.clicked.emit()
+        widget.ducking_dialog_factory, _calls = self._fake_dialog(None)
+        header.duck_btn.clicked.emit()
 
         self.assertIsNone(audio_track.duck_trigger_track_id)
         self.assertFalse(widget._header_items[row].duck_btn.active)
+
+    def test_cancelled_dialog_changes_nothing(self):
+        widget, project, video_track, audio_track = self._widget_with_project()
+        widget.ducking_dialog_factory, _calls = self._fake_dialog(video_track.id, accepted=False)
+        widget._on_track_duck_config_requested(widget._row_tracks.index(audio_track))
+        self.assertIsNone(audio_track.duck_trigger_track_id)
+        self.assertFalse(widget.history.can_undo)
 
 
 if __name__ == "__main__":

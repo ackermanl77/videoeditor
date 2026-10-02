@@ -22,6 +22,44 @@ CLIP_COLOR_AUDIO = "#3f9e6d"
 CLIP_COLOR_IMAGE = "#a0729b"
 CLIP_COLOR_TEXT = "#c9a24b"
 
+# Clip names are drawn on this translucent dark strip (alpha 0..255) so white
+# text stays readable on every clip colour: plain white on the text-clip gold
+# measured 2.4:1, below the WCAG AA minimum of 4.5:1.
+CLIP_LABEL_STRIP_ALPHA = 150
+WCAG_AA_CONTRAST = 4.5
+
+
+def _channel(c: float) -> float:
+    c /= 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _rgb(color: str):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def relative_luminance(color) -> float:
+    r, g, b = _rgb(color) if isinstance(color, str) else color
+    return 0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b)
+
+
+def contrast_ratio(fg, bg) -> float:
+    """WCAG 2 contrast ratio between two colours (``#rrggbb`` or RGB tuples)."""
+    lighter, darker = sorted((relative_luminance(fg), relative_luminance(bg)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def blend_over(color: str, overlay=(0, 0, 0), alpha: int = CLIP_LABEL_STRIP_ALPHA):
+    """RGB of ``overlay`` at ``alpha`` (0..255) painted over ``color``."""
+    a = alpha / 255.0
+    return tuple(round(c * (1 - a) + o * a) for c, o in zip(_rgb(color), overlay))
+
+
+def readable_text_color(background: str) -> str:
+    """White or near-black, whichever contrasts more with ``background`` (badges)."""
+    return "#ffffff" if contrast_ratio("#ffffff", background) >= contrast_ratio("#111111", background) else "#111111"
+
 DARK_STYLESHEET = f"""
 * {{
     font-family: "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif;
