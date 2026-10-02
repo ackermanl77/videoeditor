@@ -62,6 +62,13 @@ def _show_splash(app: QApplication) -> QSplashScreen | None:
 
 
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        # Checks the bundled FFmpeg, required filters and a real one-second
+        # export, then exits -- no QApplication, no window (core/selftest.py).
+        from core.selftest import run_self_test
+
+        return run_self_test()
+
     _set_windows_app_id()
 
     QApplication.setApplicationName("Open Video Editor")

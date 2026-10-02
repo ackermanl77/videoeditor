@@ -48,22 +48,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check the tag matches core.__version__
+        if: github.ref_type == 'tag'
+        run: python scripts/version_info.py --check-tag "${{ github.ref_name }}"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       # Bundles the "essentials" FFmpeg build, not "full" -- see
-      # docs/workflows/packaging/workflow.md for the size trade-off (full's
-      # ffmpeg.exe/ffprobe.exe are ~222MB each; essentials' are ~98MB each
-      # and cover every codec this app uses). build.spec auto-detects
-      # anything named ffmpeg*/ffprobe* placed in bin/ and bundles it.
-      - name: Download and bundle FFmpeg (essentials build)
-        run: |
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
-          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          $binSrc = Get-ChildItem -Path ffmpeg-extracted -Recurse -Directory -Filter "bin" | Select-Object -First 1
-          Copy-Item (Join-Path $binSrc.FullName "ffmpeg.exe") -Destination "bin\ffmpeg.exe"
-          Copy-Item (Join-Path $binSrc.FullName "ffprobe.exe") -Destination "bin\ffprobe.exe"
+      # docs/workflows/packaging/workflow.md for the size trade-off. The
+      # version, download URL and SHA256 of the archive and of each binary
+      # are pinned in ffmpeg.lock (it used to download gyan.dev's floating
+      # "latest release" zip with no integrity check); the script fails the
+      # build on any mismatch. build.spec bundles whatever ffmpeg*/ffprobe*
+      # it finds in bin/.
+      - name: Download and bundle the pinned FFmpeg (ffmpeg.lock)
+        run: python scripts/fetch_ffmpeg.py
 
       - name: Build the executable
         run: python build.py
@@ -75,6 +75,17 @@ jobs:
             exit 1
           }
           Get-Item "dist\VideoEditor.exe" | Select-Object Name, Length
+
+      # The exe is windowed (no console), so check its exit code; the report
+      # is written to %TEMP%\VideoEditor-selftest.txt (core/selftest.py).
+      - name: Self-test the built exe (bundled FFmpeg, filters, a real export)
+        run: |
+          $p = Start-Process -FilePath "dist\VideoEditor.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Get-Content "$env:TEMP\VideoEditor-selftest.txt" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) {
+            Write-Error "VideoEditor.exe --self-test failed (exit code $($p.ExitCode))"
+            exit 1
+          }
 
       - name: Publish GitHub Release
         env:

@@ -4,10 +4,13 @@
 # This is what shows up under the file's Properties > Details tab on
 # Windows, and is what gives a packaged app a "real program" feel instead
 # of an unnamed generic executable.
+#
+# TEMPLATE: build.spec renders it with scripts/version_info.py, filling
+# {filevers}/{version} from core.__version__ (the single version source).
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers={filevers},
+    prodvers={filevers},
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -23,12 +26,12 @@ VSVersionInfo(
           [
             StringStruct(u"CompanyName", u"Open Video Editor Project"),
             StringStruct(u"FileDescription", u"Open Video Editor"),
-            StringStruct(u"FileVersion", u"1.0.0.0"),
+            StringStruct(u"FileVersion", u"{version}"),
             StringStruct(u"InternalName", u"VideoEditor"),
             StringStruct(u"LegalCopyright", u"MIT License"),
             StringStruct(u"OriginalFilename", u"VideoEditor.exe"),
             StringStruct(u"ProductName", u"Open Video Editor"),
-            StringStruct(u"ProductVersion", u"1.0.0.0"),
+            StringStruct(u"ProductVersion", u"{version}"),
           ],
         )
       ]

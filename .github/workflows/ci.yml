@@ -34,3 +34,32 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+  # Real-FFmpeg integration tests (tests/integration/, plus the handful of
+  # real-execution tests elsewhere) and the offscreen Qt UI tests -- both
+  # skipped in the job above, which installs nothing. Installs the same
+  # pinned, checksum-verified FFmpeg the release bundles (ffmpeg.lock) and
+  # PySide6, on Windows since that is what ships. QT_QPA_PLATFORM=offscreen:
+  # the UI tests only make programmatic widget calls, nothing is shown.
+  integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned FFmpeg into bin/
+        run: python scripts/fetch_ffmpeg.py
+
+      - name: Install PySide6 for the offscreen UI tests
+        run: pip install "PySide6>=6.6,<7.0"
+
+      - name: Run tests (real FFmpeg + offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+
+      - name: Self-test from source
+        run: python main.py --self-test
