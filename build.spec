@@ -60,9 +60,13 @@ a = Analysis(
 # Network, the multimedia/platform/style/imageformat plugins): none of them
 # reach Qt6Quick*, Qt6Qml* or Qt6Pdf*. The qpdf image-format plugin is the
 # only thing that imports Qt6Pdf, so it goes too. opengl32sw.dll (Qt's
-# software-OpenGL fallback, loaded dynamically) is deliberately kept until a
-# built exe has been playback-tested without it.
-_UNUSED_QT_BINARY = re.compile(r"(^|[\\/])(Qt6(Quick|Qml|Pdf)\w*\.dll|qpdf\.dll)$", re.IGNORECASE)
+# software-OpenGL fallback, ~20 MB, loaded dynamically) goes as well: the
+# preview's QVideoWidget renders through D3D11/raster, never OpenGL, and a
+# built exe without it was smoke- and playback-tested (it is never loaded,
+# even with QT_OPENGL=software).
+_UNUSED_QT_BINARY = re.compile(
+    r"(^|[\\/])(Qt6(Quick|Qml|Pdf)\w*\.dll|qpdf\.dll|opengl32sw\.dll)$", re.IGNORECASE
+)
 a.binaries = [entry for entry in a.binaries if not _UNUSED_QT_BINARY.search(entry[0])]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)

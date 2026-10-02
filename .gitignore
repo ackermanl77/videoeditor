@@ -9,3 +9,4 @@ bin/
 .video_editor/
 *.vproj~
 .DS_Store
+.build-venv/
