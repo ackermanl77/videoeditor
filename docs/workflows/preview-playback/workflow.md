@@ -38,3 +38,7 @@ There is no automated test for `PreviewPlayer` (it requires `QMediaPlayer`/a liv
 - **Accurate frame** (checkbox): while paused or scrubbing, `core/frame_render.py` builds the export graph for a one-frame window (`trim_range=(t, t+1/fps)`, `video_only=True`) at preview size and pipes one PNG back; it runs on a worker thread, debounced by 150 ms, and a generation counter drops results superseded by a newer request.
 - **Next-clip preloading**: within 1.5 s of a cut to a different file, a second `QMediaPlayer` opens the next file; at the cut the two players (and their video widgets) swap instead of calling `setSource`.
 - **Proxies**: when an asset has a proxy (`MediaAsset.proxy_path`, see `core/proxy.py`), the preview plays it; export never does.
+
+## Stabilization in Accurate frame (round 3)
+
+- The Accurate-frame renderer builds the export graph with `stabilize_cached_only=True`: a stabilized clip shows stabilized only after an export has cached its motion analysis (`~/.video_editor/stabilize`), so scrubbing never waits for a full analysis pass.

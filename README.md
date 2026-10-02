@@ -37,6 +37,7 @@ deliberately layered and documented so it is easy to read, test and extend.
   clip's duration instead of one constant value
 - **Crossfade transitions** between adjacent clips on the same track
 - **Per-clip color correction**: brightness, contrast, saturation, gamma
+  (an effect in the clip's stack, each value keyframable)
 - **Chroma key** (green-screen) compositing per clip
 - **Text overlays**: content, font size, color, bold/italic, position,
   alignment
@@ -47,20 +48,32 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Export** to MP4 / MOV / MKV / AVI / FLV / WebM / animated GIF with
   resolution, frame-rate and quality presets (or two-pass
   target-file-size encoding), rendered by FFmpeg with a live progress bar
+- **Render queue**: queue several exports (each a snapshot of the project
+  and its settings) and let them render one after another in the
+  background, with per-job progress, time left, cancel, retry and reorder
 - **Keyboard shortcuts** for the operations you use most (Help > Keyboard
   Shortcuts lists them all)
-- **Effect stack**: LUT (.cube), YUV chroma key with despill, sharpen, blur,
-  vignette, video denoise, in any order per clip
+- **Effect stack**: color correction, RGB and YUV chroma keys (with despill),
+  LUT (.cube), sharpen, blur, vignette, video denoise and two-pass
+  **stabilization** (vid.stab), in any order per clip; parameters marked
+  animatable (color correction, vignette) take keyframes
 - **Audio**: equal-power audio crossfades, volume keyframes, ducking with
   adjustable threshold/ratio/attack/release, master limiter, loudness targets
 - **Editing tools**: multi-select (Ctrl+click, rubber band), copy/cut/paste,
-  duplicate, paste attributes, insert/overwrite, roll/slip/slide, razor,
-  detach/linked audio, keyframe-at-playhead buttons
+  duplicate, paste attributes, insert/overwrite, roll/slip/slide and ripple
+  move (also as drags: Ctrl+edge = roll, Alt = slip, Ctrl+Alt = slide,
+  Shift = ripple move), razor, detach/linked audio, keyframe-at-playhead buttons
+- **Screen readers**: the timeline exposes its tracks and clips (names,
+  times, effects, selection) to assistive technology, with keyboard focus
 - **Accurate preview frames**: while paused, show the exact export frame
   rendered by the export engine; next-clip preloading; preview proxies
-- **Colour**: HDR (HLG/PQ) tone-mapped to SDR; every export tagged BT.709
-- **Codecs**: H.264, HEVC, AV1 (CPU or NVENC), ProRes 422 HQ, DNxHR HQ; export
-  presets, remembered settings, exact 23.976/29.97/59.94 rates
+- **Colour**: 8-bit SDR BT.709 by default (HDR tone-mapped to it), 10-bit
+  SDR, or 10-bit **HDR passthrough** (HDR10/PQ or HLG, BT.2020, with the
+  source's mastering metadata on CPU HEVC) for HDR footage; only the modes
+  the chosen codec and this machine's encoders support are offered
+- **Codecs**: H.264, HEVC, AV1 (CPU or NVENC, 10-bit where supported),
+  ProRes 422 HQ, DNxHR HQ/HQX; export presets, remembered settings, exact
+  23.976/29.97/59.94 rates
 - **Robust projects**: versioned file format, relative media paths, Relink
   Media, per-session autosave, `.bak` on save
 
@@ -83,6 +96,10 @@ video_editor/
 │   ├── history.py                   # Undo/redo command stack (Command pattern)
 │   ├── commands.py                   # Concrete undoable editing operations
 │   ├── filter_graph.py                # Builds the FFmpeg filter_complex graph
+│   ├── effects.py                      # Effect registry (schema, animatable params) + instances
+│   ├── output_color.py                 # 8/10-bit SDR and HDR (PQ/HLG) export targets
+│   ├── stabilize.py                    # vid.stab motion-analysis pass + cache
+│   ├── render_queue.py                 # Render queue model (project snapshots)
 │   └── exporter.py                     # Runs FFmpeg, reports progress
 ├── ui/                         # PySide6 UI layer (imports from core, never the reverse)
 │   ├── theme.py                  # Dark Qt stylesheet
@@ -91,9 +108,11 @@ video_editor/
 │   ├── preview_player.py               # Preview panel (QMediaPlayer-based)
 │   ├── properties_panel.py               # Clip inspector panel
 │   ├── export_dialog.py                   # Export settings + progress dialog
+│   ├── render_queue.py                    # Render Queue dock
 │   └── widgets/
 │       ├── timeline_widget.py                # The timeline panel (QGraphicsView)
-│       └── timeline_items.py                   # Clip / ruler / header graphics items
+│       ├── timeline_items.py                   # Clip / ruler / header graphics items
+│       └── timeline_accessibility.py           # Screen-reader interfaces for tracks/clips
 ├── tests/                     # Unit tests for the core engine (no Qt required)
 └── assets/
     └── icons/                  # App icon (PNG + Windows .ico), splash screen,
@@ -153,7 +172,7 @@ To check an installation or a built exe without opening the GUI:
 python main.py --self-test        # or: VideoEditor.exe --self-test
 ```
 
-It prints the version, the FFmpeg it found, NVENC availability and the required filters, renders a one-second test export, and exits 0 on success.
+It prints the version, the FFmpeg it found, NVENC availability and the 22 required filters, renders a one-second test export, and exits 0 on success.
 
 ## Building a standalone executable
 
@@ -231,6 +250,7 @@ publishes it as a prerelease, for a one-off test build.
 | Save Project As        | Ctrl+Shift+S |
 | Import Media             | Ctrl+I |
 | Export Video               | Ctrl+E |
+| Show/hide Render Queue       | Ctrl+Shift+E |
 | Undo / Redo                  | Ctrl+Z / Ctrl+Y |
 | Play / Pause                   | Space |
 | Split clip at playhead            | S |
@@ -241,6 +261,8 @@ publishes it as a prerelease, for a one-off test build.
 | Copy / Cut / Paste / Duplicate           | Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D |
 | Insert / Overwrite media at playhead     | , / . |
 | Razor tool                               | C |
+| Roll / slip / slide / ripple move (drag) | Ctrl+edge / Alt / Ctrl+Alt / Shift |
+| Select next/previous clip, edit its properties | Tab / Shift+Tab, Enter |
 | All shortcuts                            | F1 |
 
 ## How editing works

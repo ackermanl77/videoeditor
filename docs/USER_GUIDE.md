@@ -308,7 +308,11 @@ Notes:
 
 For video/image clips, the **Color Correction** group offers Brightness,
 Contrast, Saturation, and Gamma sliders — standard color grading controls,
-applied at export time.
+applied at export time. The sliders edit a **Color Correction** effect in
+the clip's effect stack (it appears in the Effects list after your first
+change), so it can be reordered with other effects, switched off, and
+**animated**: in the Effects list, each of its values has a **◆** button
+(see [Effects, audio automation and editing tools](#effects-audio-automation-and-editing-tools)).
 
 | Control | Range | Neutral |
 |---|---|---|
@@ -329,7 +333,10 @@ For footage shot against a solid-color background:
 
 The keyed-out background becomes transparent, letting whatever's on the
 track beneath show through — the same way Transform lets you build
-picture-in-picture or split-screen layouts.
+picture-in-picture or split-screen layouts. Like Color Correction, this group
+edits an effect in the clip's stack (**Chroma Key (RGB)**). Projects saved by
+earlier versions are converted automatically when opened and look the same;
+once saved, they need this version (or newer) to open.
 
 ## Text overlays
 
@@ -384,9 +391,30 @@ effect, click **+ Add**, then edit its settings below the list. Effects run
 top to bottom; **Up**/**Down** reorder them and **Enabled** switches one off
 without losing its settings. Available: **LUT (.cube)** for camera-log to
 Rec.709 or creative looks, **Chroma Key (YUV) + Despill** (cleaner edges than
-the older RGB Chroma Key group), **Sharpen**, **Gaussian Blur**, **Vignette**
-and **Video Denoise**. A clip with effects shows an **FX** badge. A LUT file
-that has gone missing stops the export with a clear message.
+the older RGB Chroma Key group), **Sharpen**, **Gaussian Blur**, **Vignette**,
+**Video Denoise**, **Color Correction**, **Chroma Key (RGB)** and
+**Stabilize**. A clip with effects shows an **FX** badge (colour correction
+and the RGB key keep their **C**/**K** badges). A LUT file that has gone
+missing stops the export with a clear message.
+
+**Stabilize** smooths out camera shake (vid.stab). The first export of a
+stabilized clip first analyses its motion ("Analyzing motion for
+stabilization" in the progress line); the result is remembered, so later
+exports and changes to **Smoothing**, **Zoom** or **Borders** don't repeat
+it (changing **Shakiness** or **Accuracy**, or the clip's in/out points, does).
+**Zoom to hide borders** enlarges the picture just enough to hide the edges
+the correction exposes; with it off, **Borders** chooses black edges or the
+previous frame's. The preview's **Accurate frame** shows the stabilized
+picture once an export has analysed the clip.
+
+**Animating effect settings**: settings with a **◆** button next to them
+(Color Correction's four values and Vignette's strength) can change over the
+clip. Set the value, put the playhead on the clip and click **◆** to add a
+keyframe there; move the playhead, change the value and click **◆** again.
+With two or more keyframes the value glides between them; the label next to
+the button counts them and **Clear** removes them. Other settings (keys,
+LUTs, blur, sharpen, denoise, stabilization) can't be animated, because FFmpeg
+applies them with one value for the whole clip.
 
 **Keyframes at the playhead**: the **◆** buttons next to Volume, Speed and
 Opacity, and **◆ Key Position at Playhead** in Transform, add or update a
@@ -430,7 +458,21 @@ Split, Ripple Delete, Detach Audio, Roll, Slip, Slide and Reveal in Media Bin.
 - **Roll Edit to Playhead** (**Ctrl+R**) moves the cut between the selected
   clip and the one after it; **Slip** changes which part of the source a clip
   shows without moving it; **Slide** moves a clip between its neighbours,
-  trimming them to compensate.
+  trimming them to compensate; **Ripple Move** moves a clip together with
+  everything after it on its track.
+- The same edits work by **dragging with a modifier key**:
+
+  | Drag | With | Does |
+  |---|---|---|
+  | A clip's left or right edge | **Ctrl** | **Roll**: the cut between this clip and the one touching that edge moves |
+  | Inside a clip | **Alt** | **Slip**: the clip stays put, its content shifts (drag right to show earlier footage) |
+  | Inside a clip | **Ctrl+Alt** | **Slide**: the clip moves, its neighbours trim to keep the cut closed |
+  | Inside a clip | **Shift** | **Ripple Move**: the clip and every later clip on its track move together (linked audio follows) |
+
+  Each drag is one undo step. If it isn't possible (no touching neighbour,
+  not enough footage, it would overlap), nothing changes and the status bar
+  says why. **Ctrl+click** inside a clip still adds it to or removes it from
+  the selection.
 - **Razor Tool** (**C**): click a clip to cut it there. Press **C** again to
   turn it off.
 
@@ -442,10 +484,12 @@ duration and frame size, and the relink is one undo step. Projects also store
 media paths relative to the project file, so moving a project folder together
 with its media keeps working.
 
-**HDR and colour**: HDR (HLG/PQ) footage is tone-mapped to standard BT.709 on
-export, SD footage is converted to the HD colour matrix, and every export is
-tagged BT.709, so it looks the same in every player. The Media Bin marks
-HDR and 10-bit files.
+**HDR and colour**: by default HDR (HLG/PQ) footage is tone-mapped to
+standard BT.709 on export, SD footage is converted to the HD colour matrix,
+and every export is tagged BT.709, so it looks the same in every player. The
+Media Bin marks HDR and 10-bit files. To keep HDR footage in HDR, or to get a
+10-bit file, use the Export dialog's **Color** setting (see
+[Exporting your video](#exporting-your-video)).
 
 **Preview proxies**: **Media > Generate Proxy for Selected Media** (or
 right-click a Media Bin item) makes a small, fast-seeking copy that the
@@ -530,17 +574,42 @@ timeline to a real video file via FFmpeg.
 3. Pick a resolution (a preset, or Custom), frame rate, and quality.
    23.976, 29.97 and 59.94 are the exact rates most cameras record; use them
    for that footage to avoid judder.
-4. *(Optional)* Check **Two-pass, target file size** and enter a target
+4. *(Optional)* Pick the **Color** format. **8-bit SDR (BT.709)** is the
+   default and plays everywhere. With HEVC, AV1, ProRes or DNxHR you can also
+   choose **10-bit SDR** (smoother gradients, less banding), and when your
+   timeline has HDR footage, **10-bit HDR10 (PQ)** or **10-bit HDR HLG** —
+   whichever your HDR footage uses — to keep it in HDR. In an HDR export,
+   ordinary (SDR) clips and titles are placed at HDR "reference white", so
+   they look normal next to the HDR footage rather than glaringly bright.
+   Only the choices your codec, your computer and your footage support are
+   listed; with an NVIDIA card that can't encode 10-bit, the CPU encoder is
+   used. For HDR10 (PQ), the CPU HEVC encoder (GPU encoding off) also writes
+   the footage's mastering-display and brightness metadata; GPU and AV1
+   exports carry the HDR colour tags only. Check HDR exports on an HDR
+   screen or TV.
+5. *(Optional)* Check **Two-pass, target file size** and enter a target
    size in MB instead of a quality preset — useful when you need to hit a
    specific file-size limit (e.g. for an upload cap). With an NVIDIA GPU,
    **Target size on the GPU** does this in one fast pass that lands close to
    the size; leave it off to hit the size exactly.
-5. *(Optional)* Set up vertical/Shorts export settings — see
+6. *(Optional)* Set up vertical/Shorts export settings — see
    [above](#shorts--vertical-video-export).
-6. Click **Export**. You'll be asked to confirm if the output file already
+7. Click **Export**. You'll be asked to confirm if the output file already
    exists. Progress shows the render speed and time left. The editor stays
    usable while it renders (it exports the project as it was when you clicked
    Export). **Cancel**, **Esc** or closing the dialog stops the render.
+   Or click **Add to Queue** to render it later (below).
+
+**Render queue**: **Add to Queue** puts the export in the **Render Queue**
+panel (**File > Render Queue**, **Ctrl+Shift+E**) instead of rendering it in
+the dialog. Each queued export remembers the project exactly as it was when
+you queued it, so you can queue several versions (say a 4K master, a 1080p
+upload and a vertical cut), keep editing, and let them render one after
+another in the background. The panel shows each job's status, progress and
+time left. Select a job to **Cancel** it (running or waiting), **Remove** it,
+move a waiting job **Up**/**Down**, **Retry** a failed or cancelled one, or
+**Show File** when it's done. Quitting while jobs are waiting asks whether to
+cancel them.
 
 Animated GIF export uses a dedicated high-quality palette technique (not
 FFmpeg's default, which looks visibly banded) and has no audio track,
@@ -557,6 +626,7 @@ disabled and explained when GIF is selected.
 | Save Project As | Ctrl+Shift+S |
 | Import Media | Ctrl+I |
 | Export Video | Ctrl+E |
+| Show / hide the Render Queue | Ctrl+Shift+E |
 | Undo / Redo | Ctrl+Z / Ctrl+Y |
 | Play / Pause | Space |
 | Split clip at playhead | S |
@@ -568,10 +638,12 @@ disabled and explained when GIF is selected.
 | Duplicate / Paste attributes | Ctrl+D / Ctrl+Alt+V |
 | Select all clips | Ctrl+A |
 | Select next / previous clip (timeline) | Tab / Shift+Tab |
+| Edit the selected clip's properties (timeline) | Enter |
 | Nudge selection one frame (timeline) | Alt+Left / Alt+Right |
 | Insert / Overwrite selected media at playhead | , / . |
 | Detach audio | Ctrl+Shift+D |
 | Roll edit to playhead | Ctrl+R |
+| Roll / slip / slide / ripple move by dragging | Ctrl+drag an edge / Alt+drag / Ctrl+Alt+drag / Shift+drag |
 | Razor tool on/off | C |
 | Previous / next keyframe | Shift+K / Ctrl+Shift+K |
 | Keyboard shortcut list | F1 |
@@ -588,6 +660,11 @@ the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
 - **Hover a clip** for a description (type, name, start and end, track,
   effects, linked/offline); hover a track-header button for what it does and
   whether it's on.
+- **Screen readers** (Narrator, NVDA, JAWS) can read the timeline: it is
+  presented as a list of tracks ("Video track Video 1, 3 clips, muted"), each
+  listing its clips by name, start and end time, with effects and offline
+  status as the description. **Tab**/**Shift+Tab** moves to the next/previous
+  clip and announces it; **Enter** jumps to its properties.
 - **Ripple editing only affects the track you're editing** — other tracks
   never shift, so a ripple delete/trim can't accidentally desync audio and
   video that live on different tracks.

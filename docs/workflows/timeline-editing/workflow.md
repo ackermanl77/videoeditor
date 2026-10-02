@@ -70,3 +70,15 @@ All in `core/edit_ops.py` (Qt-free, one undo step each), surfaced by `TimelineWi
 - **Insert / Overwrite** (`,` / `.`) the Media Bin selection at the playhead (insert ripples every unlocked track), **Roll** to playhead, **Slip**, **Slide**, **Razor** (C), **Detach Audio** (a linked audio clip; the video clip is muted).
 - A left trim now re-bases speed/opacity/position/volume keyframes so they stay on the same content (`Clip.with_source_range`).
 - After an edit the scene is updated by clip id (only added/removed clips create or delete items); a change to tracks, headers or markers still rebuilds it.
+
+## Drag modifiers and ripple move (round 3)
+
+- `ui.widgets.timeline_items.drag_mode_for(x, width, modifiers)` maps a press to a drag: edge = trim, **Ctrl+edge** = roll, body = move, **Alt** = slip, **Ctrl+Alt** = slide, **Shift** = ripple move, Ctrl+click in the body = toggle selection (unchanged). `ClipItem.begin_drag/update_drag/finish_drag` draw the gesture (trim-like resize for roll, a sliding item for slide/ripple, the shifted source range for slip) and emit `TimelineSignals.clip_edit_gesture(clip_id, gesture, value)`; `TimelineWidget._on_clip_edit_gesture` builds the same core commands as the menus (`build_roll_at_edge`, `build_slip_command`, `build_slide_command`, `build_ripple_move_command`), executes them as one undo step, or shows why it was refused, then rebuilds.
+- **Ripple move** (`core.edit_ops.build_ripple_move_command`): the clip, every clip starting at or after it on its track and every clip linked to those move by the same delta through `build_move_clips_command` (refused on overlap with a clip that stays, a start before 0, or a locked track). Also Edit > Ripple Move Clip... and the clip menu.
+- Slip direction: dragging right shows earlier footage (the content follows the mouse).
+
+## Keyboard focus and screen readers (round 3)
+
+- `ui/widgets/timeline_accessibility.py` installs a `QAccessible` factory (once, from `TimelineWidget.__init__`): `TimelineView` -> `TimelineViewAccessible` (pane "Timeline", children = track rows), `TrackHeaderItem` -> `TrackAccessible` (list, "Video track Video 1, 3 clips, muted"), `ClipItem` -> `ClipAccessible` (list item named by `clip_accessible_name`, description = `clip_description`, selectable/selected/focusable/focused, screen rect). Interfaces are factory-created for the QGraphicsObjects themselves, so Qt's accessibility cache owns them and drops them with their item.
+- Clips are `ItemIsFocusable`. Tab/Shift+Tab (`select_adjacent_clip`) also calls `focus_clip`: scrolls to the clip, focuses the view and item, and (when an accessibility client is active) sends Focus and Selection events and a `QAccessibleAnnouncementEvent` with the clip's name. **Enter** on the timeline/preview moves focus into the Properties panel (`MainWindow.focus_properties`).
+- Verified through Qt's accessibility interfaces in offscreen tests (`tests/test_p3_ui.py::TimelineAccessibilityTests`); not yet tried with NVDA/Narrator.

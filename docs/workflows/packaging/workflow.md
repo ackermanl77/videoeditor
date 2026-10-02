@@ -35,6 +35,6 @@ Confirming *what actually got bundled* doesn't need a second machine, and catche
 ## Version, self-test and UPX (P2)
 
 - `core/__init__.py: __version__` is the single version source: `build.spec` renders the exe's Windows version resource from it (`scripts/version_info.py`, `version_info.txt` is the template), the About box and `.vproj` files show it, and `release.yml` fails when the pushed tag isn't `v<__version__>`.
-- `VideoEditor.exe --self-test` (or `python main.py --self-test`) runs before any `QApplication`: version, FFmpeg/FFprobe paths and versions, NVENC, 18 required filters, and a real one-second export checked with ffprobe; exit code 0/1, report also in `%TEMP%\VideoEditor-selftest.txt` (the exe has no console). `release.yml` runs it on the built exe before publishing.
+- `VideoEditor.exe --self-test` (or `python main.py --self-test`) runs before any `QApplication`: version, FFmpeg/FFprobe paths and versions, NVENC, 22 required filters (including vid.stab), and a real one-second export checked with ffprobe; exit code 0/1, report also in `%TEMP%\VideoEditor-selftest.txt` (the exe has no console). `release.yml` runs it on the built exe before publishing.
 - `upx=False` is explicit. `docs/USER_GUIDE.md` is bundled for **Help > User Guide**.
 - FFmpeg is still the static "essentials" build; a shared-library FFmpeg (K3) would avoid linking the codecs into both ffmpeg.exe and ffprobe.exe.
