@@ -25,12 +25,13 @@ building it.
 15. [Chroma key (green screen)](#chroma-key-green-screen)
 16. [Text overlays](#text-overlays)
 17. [Shorts / vertical video export](#shorts--vertical-video-export)
-18. [The preview player — what it does and doesn't show](#the-preview-player--what-it-does-and-doesnt-show)
-19. [Project files, autosave, and Recent Projects](#project-files-autosave-and-recent-projects)
-20. [Exporting your video](#exporting-your-video)
-21. [Keyboard shortcuts](#keyboard-shortcuts)
-22. [Tips, limits, and things to know](#tips-limits-and-things-to-know)
-23. [Troubleshooting](#troubleshooting)
+18. [Effects, audio automation and editing tools](#effects-audio-automation-and-editing-tools)
+19. [The preview player — what it does and doesn't show](#the-preview-player--what-it-does-and-doesnt-show)
+20. [Project files, autosave, and Recent Projects](#project-files-autosave-and-recent-projects)
+21. [Exporting your video](#exporting-your-video)
+22. [Keyboard shortcuts](#keyboard-shortcuts)
+23. [Tips, limits, and things to know](#tips-limits-and-things-to-know)
+24. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -371,23 +372,106 @@ Markers/chapters still work correctly even on a trimmed, reframed export.
 > evading a platform's copyright-detection systems — no export setting
 > makes that non-infringing.
 
+## Effects, audio automation and editing tools
+
+**Effects stack** (Properties > **Effects**, video and image clips): pick an
+effect, click **+ Add**, then edit its settings below the list. Effects run
+top to bottom; **Up**/**Down** reorder them and **Enabled** switches one off
+without losing its settings. Available: **LUT (.cube)** for camera-log to
+Rec.709 or creative looks, **Chroma Key (YUV) + Despill** (cleaner edges than
+the older RGB Chroma Key group), **Sharpen**, **Gaussian Blur**, **Vignette**
+and **Video Denoise**. A clip with effects shows an **FX** badge. A LUT file
+that has gone missing stops the export with a clear message.
+
+**Keyframes at the playhead**: the **◆** buttons next to Volume, Speed and
+Opacity, and **◆ Key Position at Playhead** in Transform, add or update a
+keyframe at the playhead from the control's current value. You no longer type
+times by hand, and speed keyframes are converted to source time for you.
+Keyframes show as small yellow diamonds on the clip. **Shift+K** /
+**Ctrl+Shift+K** jump to the previous/next keyframe of the selected clip.
+
+**Volume automation**: two or more volume keyframes draw a volume envelope
+that overrides the Volume slider (a **V** badge marks the clip). **Clear**
+removes them.
+
+**Audio crossfades**: set **Transition Out** on an audio clip that touches the
+next one and the two crossfade with an equal-power curve (no dip in the
+middle). As with video transitions, the second clip starts the transition
+duration early. Video crossfades now use the same equal-power audio curve.
+
+**Ducking settings**: the track header's **D** button (or right-click > Duck
+Audio Under) now also sets threshold, ratio, attack and release.
+
+**Selecting several clips**: **Ctrl+click** adds or removes a clip; drag on
+empty timeline space to draw a selection box; **Ctrl+A** selects everything;
+**Tab**/**Shift+Tab** select the next/previous clip. Dragging one selected
+clip moves the whole selection; **Alt+Left/Right** nudges it by one frame;
+**Delete** removes all of it (with Ripple on, gaps close on each track).
+
+**Clipboard**: **Ctrl+C**, **Ctrl+X**, **Ctrl+V** (pastes at the playhead,
+on a free track), **Ctrl+D** (duplicate right after the selection),
+**Ctrl+Alt+V** (paste attributes: colour, keying, transform, effects and audio
+settings from the copied clip). Right-click a clip for all of these plus
+Split, Ripple Delete, Detach Audio, Roll, Slip, Slide and Reveal in Media Bin.
+
+**Editing tools**:
+
+- **Insert** (**,**) puts the media selected in the Media Bin at the playhead
+  and pushes everything after it on every unlocked track to the right.
+  **Overwrite** (**.**) replaces whatever is under it instead.
+- **Detach Audio** (**Ctrl+Shift+D**) moves a video clip's sound to an audio
+  track as its own clip, linked to the picture: they move together, but you
+  can trim them separately (J/L cuts).
+- **Roll Edit to Playhead** (**Ctrl+R**) moves the cut between the selected
+  clip and the one after it; **Slip** changes which part of the source a clip
+  shows without moving it; **Slide** moves a clip between its neighbours,
+  trimming them to compensate.
+- **Razor Tool** (**C**): click a clip to cut it there. Press **C** again to
+  turn it off.
+
+**Offline media and relinking**: clips whose file is missing get red hatching
+and "(offline)". **File > Relink Media...** lists missing files: **Locate
+File...** for one (other missing files in the same folder are then found
+automatically) or **Search Folder...** for all. Matches are checked by
+duration and frame size, and the relink is one undo step. Projects also store
+media paths relative to the project file, so moving a project folder together
+with its media keeps working.
+
+**HDR and colour**: HDR (HLG/PQ) footage is tone-mapped to standard BT.709 on
+export, SD footage is converted to the HD colour matrix, and every export is
+tagged BT.709, so it looks the same in every player. The Media Bin marks
+HDR and 10-bit files.
+
+**Preview proxies**: **Media > Generate Proxy for Selected Media** (or
+right-click a Media Bin item) makes a small, fast-seeking copy that the
+preview plays instead of the original; export always uses the original.
+**Media > Generate Proxies Automatically** does this for every imported file
+larger than 1080p, 10-bit or HDR. Proxies use the NVIDIA encoder when there is
+one.
+
 ## The preview player — what it does and doesn't show
 
 Press **Space**, or click the play button, to preview your edit. Click the
 ruler or drag the playhead to scrub.
 
-**Important**: the preview intentionally shows a *simplified* version of
-your project, not a frame-accurate render:
+**Important**: playback shows a *simplified* version of your project:
 
-- It shows only **one** clip at a time — the topmost non-hidden video
+- It plays only **one** clip at a time — the topmost non-hidden video
   track's clip if one is playing, otherwise the first audio track's clip.
 - It does **not** show multiple video tracks composited together, text
   drawn over video, crossfade transitions, fades, or opacity.
 
+**Accurate frame**: tick **Accurate frame** under the preview to see the exact
+exported frame (every track, transitions, text, keyframes, effects) whenever
+playback is paused or you scrub. It is rendered by the export engine at
+preview size, so it takes a moment to appear; playback itself stays the fast,
+simplified view.
+
+When a cut between two different files is coming up, the preview opens the
+next file in advance, so cuts no longer pause briefly.
+
 **The exported file is always the real, fully composited result** — every
-track, transition, text overlay, fade, and opacity setting included. The
-preview trades some accuracy for a simple, fast, reliable playback
-experience; a small note in the preview panel reminds you of this.
+track, transition, text overlay, fade, and opacity setting included.
 
 ## Project files, autosave, and Recent Projects
 
@@ -408,28 +492,50 @@ video file.
 - **Autosave**: while you have unsaved changes, the app automatically
   saves a recovery snapshot every 2 minutes (separately from your actual
   project file — autosaving never overwrites what you deliberately
-  saved). If the app closes unexpectedly, you'll be offered to recover
-  that snapshot the next time you open it.
+  saved), keeping the last few snapshots. Each open editor window has its
+  own snapshots, so two editors never overwrite each other's, and you're
+  only offered recovery for an editor that actually closed unexpectedly.
+- **Backups**: each Save keeps the previous version of the file as
+  `<name>.vproj.bak` next to it.
+- **Unsaved-changes star**: the `*` in the title follows Undo, so undoing
+  back to what you saved clears it.
+- **Newer and older files**: a project made by a newer version of the app is
+  refused with a message naming that version, rather than opened with parts
+  silently dropped. Older projects are upgraded on open. Anything the app
+  can't read (an unknown transition, say) is replaced by a safe default and
+  listed once after opening, along with any overlapping clips.
 - Note: only the *paths* to your media files are saved, not the media
-  itself — if you move or delete a source file, clips referencing it will
-  appear blank/silent until it's restored at its original location.
+  itself (both the full path and the path relative to the project file). If
+  a file moves, its clips show as offline until you relink it (**File >
+  Relink Media...**, see [above](#effects-audio-automation-and-editing-tools)).
 
 ## Exporting your video
 
 **File > Export Video...** (**Ctrl+E**) renders your full, composited
 timeline to a real video file via FFmpeg.
 
-1. Choose the output location and container format: MP4, MOV, MKV, AVI,
-   FLV, WebM, or animated GIF.
-2. Pick a resolution (a preset, or Custom), frame rate, and quality.
-3. *(Optional)* Check **Two-pass, target file size** and enter a target
+1. *(Optional)* Pick a **Preset**: YouTube 1080p, YouTube 4K (HEVC),
+   Shorts/Reels/TikTok, Archive (ProRes) or Animated GIF, or one you saved
+   with **Save...**. The dialog also remembers your last export's settings,
+   and starts at the resolution and frame rate of your main footage.
+2. Choose the output location and container format: MP4, MOV, MKV, AVI,
+   FLV, WebM, or animated GIF, then the **Video Codec**: H.264, HEVC and AV1
+   (smaller files at the same quality), or ProRes 422 HQ / DNxHR HQ (large,
+   edit-friendly intermediates, in MOV/MKV).
+3. Pick a resolution (a preset, or Custom), frame rate, and quality.
+   23.976, 29.97 and 59.94 are the exact rates most cameras record; use them
+   for that footage to avoid judder.
+4. *(Optional)* Check **Two-pass, target file size** and enter a target
    size in MB instead of a quality preset — useful when you need to hit a
-   specific file-size limit (e.g. for an upload cap).
-4. *(Optional)* Set up vertical/Shorts export settings — see
+   specific file-size limit (e.g. for an upload cap). With an NVIDIA GPU,
+   **Target size on the GPU** does this in one fast pass that lands close to
+   the size; leave it off to hit the size exactly.
+5. *(Optional)* Set up vertical/Shorts export settings — see
    [above](#shorts--vertical-video-export).
-5. Click **Export**. You'll be asked to confirm if the output file already
-   exists. Progress is shown live, and **Cancel** stops the render
-   immediately if you change your mind.
+6. Click **Export**. You'll be asked to confirm if the output file already
+   exists. Progress shows the render speed and time left. The editor stays
+   usable while it renders (it exports the project as it was when you clicked
+   Export). **Cancel**, **Esc** or closing the dialog stops the render.
 
 Animated GIF export uses a dedicated high-quality palette technique (not
 FFmpeg's default, which looks visibly banded) and has no audio track,
@@ -453,15 +559,30 @@ disabled and explained when GIF is selected.
 | Add text clip | T |
 | Add marker at playhead | M |
 | Zoom timeline in / out | Ctrl+= / Ctrl+- (or Ctrl+scroll) |
+| Copy / Cut / Paste at playhead | Ctrl+C / Ctrl+X / Ctrl+V |
+| Duplicate / Paste attributes | Ctrl+D / Ctrl+Alt+V |
+| Select all clips | Ctrl+A |
+| Select next / previous clip (timeline) | Tab / Shift+Tab |
+| Nudge selection one frame (timeline) | Alt+Left / Alt+Right |
+| Insert / Overwrite selected media at playhead | , / . |
+| Detach audio | Ctrl+Shift+D |
+| Roll edit to playhead | Ctrl+R |
+| Razor tool on/off | C |
+| Previous / next keyframe | Shift+K / Ctrl+Shift+K |
+| Keyboard shortcut list | F1 |
 
-(**Open Recent** and **Clear Recent Projects** are menu-only — no
-keyboard shortcut.)
+**Help > Keyboard Shortcuts** (**F1**) lists every shortcut, generated from
+the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
+**Clear Recent Projects** are menu-only — no keyboard shortcut.)
 
 ## Tips, limits, and things to know
 
-- **The preview is not what you'll get frame-for-frame** — always trust
-  the exported file for transitions, text-over-video, fades, and opacity;
-  see [above](#the-preview-player--what-it-does-and-doesnt-show).
+- **Playback is not what you'll get frame-for-frame** — pause with
+  **Accurate frame** ticked to check transitions, text-over-video, fades and
+  opacity; see [above](#the-preview-player--what-it-does-and-doesnt-show).
+- **Hover a clip** for a description (type, name, start and end, track,
+  effects, linked/offline); hover a track-header button for what it does and
+  whether it's on.
 - **Ripple editing only affects the track you're editing** — other tracks
   never shift, so a ripple delete/trim can't accidentally desync audio and
   video that live on different tracks.

@@ -7,7 +7,7 @@ import os
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer
+from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -16,21 +16,28 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QPushButton,
     QSplitter,
     QStatusBar,
     QToolBar,
     QWidget,
 )
 
+from core import __version__
+from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip
-from core.ffmpeg_utils import nvenc_available
+from core.ffmpeg_utils import binary_version, nvenc_available
 from core.history import History
 from core.media_asset import MediaAsset
-from core.project import Project, write_json_atomic
+from core.project import Project, write_backup_copy
+from core.proxy import generate_proxy, needs_proxy
+from core.timeline_nav import format_timecode
 from core.track import TrackType
 from core.waveform import load_waveform
 from ui.export_dialog import ExportDialog
+from ui.help_dialogs import ShortcutsDialog, UserGuideDialog
 from ui.import_worker import ImportWorker
+from ui.relink_dialog import RelinkDialog
 from ui.media_bin import MediaBinWidget
 from ui.preview_player import PreviewPlayer
 from ui.properties_panel import PropertiesPanel
@@ -62,12 +69,12 @@ def _autosave_dir() -> str:
     return path
 
 
-def _autosave_path() -> str:
-    return os.path.join(_autosave_dir(), "autosave.vproj")
+AUTO_PROXY_SETTING = "media/auto_proxies"
 
 
-def _autosave_meta_path() -> str:
-    return _autosave_path() + ".meta.json"
+def _strict_mode() -> bool:
+    """``VIDEO_EDITOR_STRICT=1``: validate the project after every edit (see core.history.History)."""
+    return os.environ.get("VIDEO_EDITOR_STRICT", "") not in ("", "0")
 
 
 MAX_RECENT_PROJECTS = 10
@@ -100,11 +107,18 @@ def _save_recent_projects(paths: List[str]) -> None:
 
 
 class MainWindow(QMainWindow):
+    # (asset id, proxy path or None) from a proxy-encoding thread.
+    _proxy_finished = Signal(str, object)
+
     def __init__(self):
         super().__init__()
         self.project = Project()
-        self.history = History(on_change=self._on_history_changed)
-        self._dirty = False
+        self.history = self._new_history()
+        # Changes outside History (imported media, proxies, recovered work).
+        self._media_dirty = False
+        self._autosave_session = AutosaveSession(_autosave_dir())
+        self._export_dialogs: List[ExportDialog] = []
+        self._proxy_jobs: set = set()
         self._syncing_playhead = False
         self._thumb_pixmap_cache: Dict[str, QPixmap] = {}
         self._waveform_cache: Dict[str, Optional[WaveformData]] = {}
@@ -113,6 +127,7 @@ class MainWindow(QMainWindow):
         self._import_thread: Optional[QThread] = None
         self._import_worker: Optional[ImportWorker] = None
         self._import_errors: List[str] = []
+        self._proxy_finished.connect(self._on_proxy_finished)
 
         icon_path = os.path.join(self._icons_dir, "app_icon.png")
         if os.path.exists(icon_path):
@@ -186,22 +201,31 @@ class MainWindow(QMainWindow):
         self.import_progress.setFixedWidth(160)
         self.import_progress.setVisible(False)
         self.status_bar.addPermanentWidget(self.import_progress)
-        self.time_status_label = QLabel("00:00:00 / 00:00:00")
+        self.import_cancel_btn = QPushButton("Cancel Import")
+        self.import_cancel_btn.setVisible(False)
+        self.import_cancel_btn.clicked.connect(self.cancel_import)
+        self.status_bar.addPermanentWidget(self.import_cancel_btn)
+        self.time_status_label = QLabel("00:00:00:00 / 00:00:00:00")
         self.status_bar.addPermanentWidget(self.time_status_label)
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
 
+        # Actions that also appear on the toolbar are created once, here, and
+        # the toolbar reuses the same QAction objects (see _build_toolbar):
+        # two actions with one key sequence (Export's Ctrl+E used to be on
+        # both) is an "ambiguous shortcut" in Qt and neither fires.
         file_menu = menu_bar.addMenu("&File")
         self._add_action(file_menu, "New Project", self.new_project, QKeySequence.New)
         self._add_action(file_menu, "Open Project...", self.open_project, QKeySequence.Open)
         self.recent_projects_menu = file_menu.addMenu("Open Recent")
         self._refresh_recent_projects_menu()
-        self._add_action(file_menu, "Save Project", self.save_project, QKeySequence.Save, icon="save")
+        self.save_action = self._add_action(file_menu, "Save Project", self.save_project, QKeySequence.Save, icon="save")
         self._add_action(file_menu, "Save Project As...", self.save_project_as, QKeySequence.SaveAs)
         file_menu.addSeparator()
-        self._add_action(file_menu, "Import Media...", self.import_media_dialog, "Ctrl+I", icon="import")
-        self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
+        self.import_action = self._add_action(file_menu, "Import Media...", self.import_media_dialog, "Ctrl+I", icon="import")
+        self.relink_action = self._add_action(file_menu, "Relink Media...", self.open_relink_dialog)
+        self.export_action = self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close, "Ctrl+Q")
 
@@ -209,9 +233,25 @@ class MainWindow(QMainWindow):
         self.undo_action = self._add_action(edit_menu, "Undo", self.undo, QKeySequence.Undo, icon="undo")
         self.redo_action = self._add_action(edit_menu, "Redo", self.redo, QKeySequence.Redo, icon="redo")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "Split Clip at Playhead", self.timeline.split_selected, "S", icon="split")
-        self._add_action(edit_menu, "Delete Selected Clip", self.timeline.delete_selected, QKeySequence.Delete, icon="delete")
-        self._add_action(edit_menu, "Add Text Clip", self.add_text_clip, "T", icon="text")
+        self._add_action(edit_menu, "Cut", self.timeline.cut_selected, QKeySequence.Cut)
+        self._add_action(edit_menu, "Copy", self.timeline.copy_selected, QKeySequence.Copy)
+        self._add_action(edit_menu, "Paste at Playhead", self.timeline.paste_at_playhead, QKeySequence.Paste)
+        self._add_action(edit_menu, "Paste Attributes", self.timeline.paste_attributes, "Ctrl+Alt+V")
+        self._add_action(edit_menu, "Duplicate", self.timeline.duplicate_selected, "Ctrl+D")
+        self._add_action(edit_menu, "Select All Clips", self.timeline.select_all, QKeySequence.SelectAll)
+        edit_menu.addSeparator()
+        self.split_action = self._add_action(edit_menu, "Split Clip at Playhead", self.timeline.split_selected, "S", icon="split")
+        self.delete_action = self._add_action(edit_menu, "Delete Selected Clips", self.timeline.delete_selected, QKeySequence.Delete, icon="delete")
+        self.text_action = self._add_action(edit_menu, "Add Text Clip", self.add_text_clip, "T", icon="text")
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, "Insert Selected Media at Playhead", lambda: self._place_selected_asset(False), ",")
+        self._add_action(edit_menu, "Overwrite with Selected Media at Playhead", lambda: self._place_selected_asset(True), ".")
+        self._add_action(edit_menu, "Detach Audio", self.timeline.detach_audio_selected, "Ctrl+Shift+D")
+        self._add_action(edit_menu, "Roll Edit to Playhead", self.timeline.roll_selected_to_playhead, "Ctrl+R")
+        self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
+        self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
+        self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
+        self.razor_action.setCheckable(True)
 
         timeline_menu = menu_bar.addMenu("&Timeline")
         self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
@@ -220,9 +260,71 @@ class MainWindow(QMainWindow):
         self._add_action(timeline_menu, "Add Audio Track", lambda: self.timeline.add_track(TrackType.AUDIO))
         self._add_action(timeline_menu, "Zoom In", self.timeline.zoom_in, "Ctrl+=")
         self._add_action(timeline_menu, "Zoom Out", self.timeline.zoom_out, "Ctrl+-")
+        self._add_action(timeline_menu, "Zoom to Fit", self.timeline.zoom_to_fit, "Shift+Z")
+
+        self._build_playback_menu(menu_bar.addMenu("&Playback"))
+
+        media_menu = menu_bar.addMenu("&Media")
+        self._add_action(media_menu, "Generate Proxy for Selected Media", self._proxy_for_selected_asset)
+        self.auto_proxy_action = self._add_action(
+            media_menu, "Generate Proxies Automatically (>1080p, 10-bit, HDR)", self._on_auto_proxy_toggled
+        )
+        self.auto_proxy_action.setCheckable(True)
+        self.auto_proxy_action.setChecked(self._auto_proxies_enabled())
+        self._add_action(media_menu, "Cancel Import", self.cancel_import)
 
         help_menu = menu_bar.addMenu("&Help")
+        self._add_action(help_menu, "Keyboard Shortcuts", self.show_shortcuts, "F1")
+        self._add_action(help_menu, "User Guide", self.show_user_guide)
         self._add_action(help_menu, "About", self.show_about)
+
+    def _build_playback_menu(self, menu) -> None:
+        """Keyboard transport: J/K/L shuttle, frame/second steps, edit/marker navigation, In/Out.
+
+        Letter keys are window-wide (text fields still receive typed
+        letters -- they claim printable keys first). Arrow/Home/End/Up/Down
+        are scoped to the timeline and preview (``WidgetWithChildrenShortcut``)
+        so they don't steal arrow keys from the Properties panel's sliders and
+        spin boxes; their menu entries show the key but don't register it.
+        """
+        self._add_action(menu, "Shuttle Reverse", lambda: self.preview.shuttle(-1), "J")
+        self._add_action(menu, "Stop Shuttle", self.preview.stop_shuttle, "K")
+        self._add_action(menu, "Shuttle Forward", lambda: self.preview.shuttle(1), "L")
+        menu.addSeparator()
+        scoped = (
+            ("Previous Frame", "Left", lambda: self.timeline.step_frames(-1)),
+            ("Next Frame", "Right", lambda: self.timeline.step_frames(1)),
+            ("Back 1 Second", "Shift+Left", lambda: self.timeline.step_seconds(-1.0)),
+            ("Forward 1 Second", "Shift+Right", lambda: self.timeline.step_seconds(1.0)),
+            ("Go to Start", "Home", self.timeline.go_to_start),
+            ("Go to End", "End", self.timeline.go_to_end),
+            ("Previous Edit Point", "Up", lambda: self.timeline.go_to_edit_point(-1)),
+            ("Next Edit Point", "Down", lambda: self.timeline.go_to_edit_point(1)),
+            ("Nudge Selection Left 1 Frame", "Alt+Left", lambda: self.timeline.nudge_selected(-1)),
+            ("Nudge Selection Right 1 Frame", "Alt+Right", lambda: self.timeline.nudge_selected(1)),
+            ("Select Next Clip", "Tab", lambda: self.timeline.select_adjacent_clip(1)),
+            ("Select Previous Clip", "Shift+Tab", lambda: self.timeline.select_adjacent_clip(-1)),
+        )
+        self.transport_actions: List[QAction] = []
+        for text, key, slot in scoped:
+            shortcut_action = QAction(text, self)
+            shortcut_action.setShortcut(QKeySequence(key))
+            shortcut_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            shortcut_action.triggered.connect(slot)
+            self.timeline.addAction(shortcut_action)
+            self.preview.addAction(shortcut_action)
+            self.transport_actions.append(shortcut_action)
+            menu_action = menu.addAction(f"{text}\t{key}")  # display-only key hint
+            menu_action.triggered.connect(slot)
+        menu.addSeparator()
+        self._add_action(menu, "Previous Marker", lambda: self.timeline.go_to_marker(-1), "Shift+M")
+        self._add_action(menu, "Next Marker", lambda: self.timeline.go_to_marker(1), "Ctrl+Shift+M")
+        self._add_action(menu, "Previous Keyframe", lambda: self.timeline.go_to_keyframe(-1), "Shift+K")
+        self._add_action(menu, "Next Keyframe", lambda: self.timeline.go_to_keyframe(1), "Ctrl+Shift+K")
+        menu.addSeparator()
+        self._add_action(menu, "Set In Point", self.timeline.set_in_point, "I")
+        self._add_action(menu, "Set Out Point", self.timeline.set_out_point, "O")
+        self._add_action(menu, "Clear In/Out", self.timeline.clear_in_out, "Alt+X")
 
     def _icon(self, name: str) -> QIcon:
         path = os.path.join(self._icons_dir, "toolbar", f"{name}.png")
@@ -263,31 +365,34 @@ class MainWindow(QMainWindow):
 
         toolbar.addWidget(self._build_brand_widget())
         toolbar.addSeparator()
-        import_action = toolbar.addAction(self._icon("import"), "Import", self.import_media_dialog)
-        import_action.setToolTip("Import media files (Ctrl+I)")
-        toolbar.addSeparator()
-        save_action = toolbar.addAction(self._icon("save"), "Save", self.save_project)
-        save_action.setToolTip("Save the current project (Ctrl+S)")
-        toolbar.addSeparator()
-        self.toolbar_undo = toolbar.addAction(self._icon("undo"), "Undo", self.undo)
-        self.toolbar_undo.setToolTip("Undo the last action (Ctrl+Z)")
-        self.toolbar_redo = toolbar.addAction(self._icon("redo"), "Redo", self.redo)
-        self.toolbar_redo.setToolTip("Redo the last undone action (Ctrl+Y)")
-        toolbar.addSeparator()
-        split_action = toolbar.addAction(self._icon("split"), "Split", self.timeline.split_selected)
-        split_action.setToolTip("Split the selected clip at the playhead (S)")
-        delete_action = toolbar.addAction(self._icon("delete"), "Delete", self.timeline.delete_selected)
-        delete_action.setToolTip("Delete the selected clip (Delete)")
-        text_action = toolbar.addAction(self._icon("text"), "Add Text", self.add_text_clip)
-        text_action.setToolTip("Add a text clip at the playhead (T)")
+        # The same QAction objects as the menus (one shortcut registration
+        # each); iconText is the shorter toolbar label.
+        for action, icon_text, tooltip in (
+            (self.import_action, "Import", "Import media files (Ctrl+I)"),
+            (None, None, None),
+            (self.save_action, "Save", "Save the current project (Ctrl+S)"),
+            (None, None, None),
+            (self.undo_action, "Undo", "Undo the last action (Ctrl+Z)"),
+            (self.redo_action, "Redo", "Redo the last undone action (Ctrl+Y)"),
+            (None, None, None),
+            (self.split_action, "Split", "Split the selected clip at the playhead (S)"),
+            (self.delete_action, "Delete", "Delete the selected clip (Delete)"),
+            (self.text_action, "Add Text", "Add a text clip at the playhead (T)"),
+        ):
+            if action is None:
+                toolbar.addSeparator()
+                continue
+            action.setIconText(icon_text)
+            action.setToolTip(tooltip)
+            toolbar.addAction(action)
         toolbar.addSeparator()
         self.play_action = toolbar.addAction(self._icon("play"), "Play", self.preview.toggle_play)
         self.play_action.setShortcut("Space")
         self.play_action.setToolTip("Play (Space)")
         toolbar.addSeparator()
-        export_action = toolbar.addAction(self._icon("export"), "Export Video", self.open_export_dialog)
-        export_action.setShortcut("Ctrl+E")
-        export_action.setToolTip("Export the finished video (Ctrl+E)")
+        self.export_action.setIconText("Export Video")
+        self.export_action.setToolTip("Export the finished video (Ctrl+E)")
+        toolbar.addAction(self.export_action)
 
     def _on_playing_changed(self, is_playing: bool) -> None:
         self.play_action.setIcon(self._icon("pause" if is_playing else "play"))
@@ -297,6 +402,10 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.media_bin.import_requested.connect(self.import_media_paths)
         self.media_bin.add_to_timeline_requested.connect(self._add_asset_to_timeline_end)
+        self.media_bin.proxy_requested.connect(self.generate_proxy_for)
+        self.media_bin.relink_requested.connect(self.open_relink_dialog)
+        self.timeline.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
+        self.timeline.reveal_asset_requested.connect(self._reveal_asset)
 
         self.timeline.selection_changed.connect(self._on_selection_changed)
         self.timeline.project_modified.connect(self._on_project_modified)
@@ -305,6 +414,8 @@ class MainWindow(QMainWindow):
         self.timeline.get_waveform_for_clip = self._waveform_for_clip
 
         self.properties.project_modified.connect(self._on_project_modified)
+        self.properties.clip_changed.connect(self.timeline.refresh_clip)
+        self.properties.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
 
         self.preview.time_changed.connect(self._on_preview_time_changed)
         self.preview.playing_changed.connect(self._on_playing_changed)
@@ -316,8 +427,24 @@ class MainWindow(QMainWindow):
         self.properties.set_project(self.project, self.history)
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self.history.clear()
-        self._dirty = False
+        self.history.mark_clean()
+        self._media_dirty = False
         self._update_title()
+
+    def _new_history(self) -> History:
+        validator = (lambda: self.project.validate()) if _strict_mode() else None
+        return History(on_change=self._on_history_changed, validator=validator)
+
+    @property
+    def _dirty(self) -> bool:
+        """Unsaved changes: an undo position other than the saved one, or media changes."""
+        return self._media_dirty or not self.history.is_clean
+
+    @_dirty.setter
+    def _dirty(self, value: bool) -> None:
+        self._media_dirty = bool(value)
+        if not value:
+            self.history.mark_clean()
 
     # ------------------------------------------------------------------
     # Media import
@@ -349,6 +476,7 @@ class MainWindow(QMainWindow):
         self.import_progress.setRange(0, len(new_paths))
         self.import_progress.setValue(0)
         self.import_progress.setVisible(True)
+        self.import_cancel_btn.setVisible(True)
         self.status_bar.showMessage(f"Importing {len(new_paths)} file(s)...")
 
         self._import_thread = QThread(self)
@@ -357,25 +485,47 @@ class MainWindow(QMainWindow):
 
         self._import_thread.started.connect(self._import_worker.run)
         self._import_worker.asset_ready.connect(self._on_asset_imported)
+        self._import_worker.asset_updated.connect(self._on_asset_details)
         self._import_worker.failed.connect(self._on_import_failed)
         self._import_worker.finished.connect(self._on_import_finished)
         self._import_worker.finished.connect(self._import_thread.quit)
 
         self._import_thread.start()
 
+    def cancel_import(self) -> None:
+        if self._import_worker is not None:
+            self._import_worker.cancel()
+            self.status_bar.showMessage("Cancelling import...")
+
     def _on_asset_imported(self, asset: MediaAsset) -> None:
         self.project.add_media_asset(asset)
         self.import_progress.setValue(self.import_progress.value() + 1)
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self._mark_dirty()
+        if self._auto_proxies_enabled() and needs_proxy(asset):
+            self.generate_proxy_for(asset.id)
+
+    def _on_asset_details(self, asset_id: str, thumbnail_path, waveform_path) -> None:
+        """Second import stage: a thumbnail/waveform arrived for an already-listed asset."""
+        asset = self.project.find_asset(asset_id)
+        if asset is None:
+            return
+        asset.thumbnail_path = thumbnail_path
+        asset.waveform_path = waveform_path
+        self._thumb_pixmap_cache.pop(asset_id, None)
+        self._waveform_cache.pop(asset_id, None)
+        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self.timeline.rebuild()
 
     def _on_import_failed(self, path: str, message: str) -> None:
         self._import_errors.append(f"{os.path.basename(path)}: {message}")
         self.import_progress.setValue(self.import_progress.value() + 1)
 
     def _on_import_finished(self) -> None:
+        cancelled = self._import_worker is not None and self._import_worker.cancelled
         self.import_progress.setVisible(False)
-        self.status_bar.showMessage("Import complete.", 3000)
+        self.import_cancel_btn.setVisible(False)
+        self.status_bar.showMessage("Import cancelled." if cancelled else "Import complete.", 3000)
         self._import_thread = None
         self._import_worker = None
         if self._import_errors:
@@ -401,13 +551,13 @@ class MainWindow(QMainWindow):
         return pixmap
 
     def _thumbnail_for_clip(self, clip: Clip) -> Optional[QPixmap]:
-        asset = self.project.find_asset_by_path(clip.source_path)
+        asset = self.project.asset_for_clip(clip)
         if asset is None:
             return None
         return self._thumbnail_for_asset(asset)
 
     def _waveform_for_clip(self, clip: Clip) -> Optional[WaveformData]:
-        asset = self.project.find_asset_by_path(clip.source_path)
+        asset = self.project.asset_for_clip(clip)
         if asset is None or not asset.waveform_path:
             return None
         if asset.id in self._waveform_cache:
@@ -415,6 +565,70 @@ class MainWindow(QMainWindow):
         data = load_waveform(asset.waveform_path)
         self._waveform_cache[asset.id] = data
         return data
+
+    def _place_selected_asset(self, overwrite: bool) -> None:
+        asset_id = self.media_bin.selected_asset_id()
+        asset = self.project.find_asset(asset_id) if asset_id else None
+        if asset is None:
+            self.status_bar.showMessage("Select a file in the Media Bin first.", 4000)
+            return
+        self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite)
+
+    def _reveal_asset(self, asset_id: str) -> None:
+        widget = self.media_bin.list_widget
+        for i in range(widget.count()):
+            if str(widget.item(i).data(Qt.UserRole)) == asset_id:
+                widget.setCurrentRow(i)
+                widget.scrollToItem(widget.item(i))
+                return
+
+    # ------------------------------------------------------------------
+    # Proxies (B10)
+    # ------------------------------------------------------------------
+    def _auto_proxies_enabled(self) -> bool:
+        return QSettings().value(AUTO_PROXY_SETTING, False, type=bool)
+
+    def _on_auto_proxy_toggled(self, checked: bool) -> None:
+        QSettings().setValue(AUTO_PROXY_SETTING, bool(checked))
+
+    def _proxy_for_selected_asset(self) -> None:
+        asset_id = self.media_bin.selected_asset_id()
+        if asset_id:
+            self.generate_proxy_for(asset_id)
+        else:
+            self.status_bar.showMessage("Select a video in the Media Bin first.", 4000)
+
+    def generate_proxy_for(self, asset_id: str) -> None:
+        """Encode a 540p preview proxy in the background (export keeps using the original)."""
+        asset = self.project.find_asset(asset_id)
+        if asset is None or not asset.has_video or asset_id in self._proxy_jobs:
+            return
+        self._proxy_jobs.add(asset_id)
+        self.status_bar.showMessage(f"Generating preview proxy for {asset.display_name}...")
+        snapshot = MediaAsset.from_dict(asset.to_dict())
+
+        def work() -> None:
+            try:
+                path = generate_proxy(snapshot)
+            except Exception:  # noqa: BLE001 - reported as a failed proxy
+                path = None
+            self._proxy_finished.emit(asset_id, path)
+
+        threading.Thread(target=work, name="proxy", daemon=True).start()
+
+    def _on_proxy_finished(self, asset_id: str, path) -> None:
+        self._proxy_jobs.discard(asset_id)
+        asset = self.project.find_asset(asset_id)
+        if asset is None:
+            return
+        if path:
+            asset.proxy_path = path
+            self._mark_dirty()
+            self.status_bar.showMessage(f"Preview proxy ready: {asset.display_name}", 4000)
+            self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+            self.preview.refresh_after_edit()
+        else:
+            self.status_bar.showMessage(f"Couldn't create a proxy for {asset.display_name}.", 6000)
 
     def add_text_clip(self) -> None:
         # TimelineWidget.add_text_clip() already selects and rebuilds; the
@@ -426,11 +640,14 @@ class MainWindow(QMainWindow):
     # Selection / sync
     # ------------------------------------------------------------------
     def _on_selection_changed(self, clip_id) -> None:
+        self.properties.set_playhead_time(self.timeline.playhead_time)
         self.properties.set_selected_clip(clip_id)
 
     def _on_project_modified(self) -> None:
         self._mark_dirty()
-        self.preview.seek_to(self.preview.current_time)
+        # Reseeks only if the clip under the playhead changed in a way the
+        # preview shows (not on every colour/opacity slider tick).
+        self.preview.refresh_after_edit()
         self._update_time_status()
 
     def _on_timeline_playhead_changed(self, t: float) -> None:
@@ -439,6 +656,7 @@ class MainWindow(QMainWindow):
         self._syncing_playhead = True
         self.preview.seek_to(t)
         self._syncing_playhead = False
+        self.properties.set_playhead_time(t)
         self._update_time_status()
 
     def _on_preview_time_changed(self, t: float) -> None:
@@ -447,11 +665,13 @@ class MainWindow(QMainWindow):
         self._syncing_playhead = True
         self.timeline.set_playhead(t)
         self._syncing_playhead = False
+        self.properties.set_playhead_time(t)
         self._update_time_status()
 
     def _update_time_status(self) -> None:
+        fps = self.project.settings.fps
         self.time_status_label.setText(
-            f"{PreviewPlayer.format_time(self.preview.current_time)} / {PreviewPlayer.format_time(self.project.total_duration)}"
+            f"{format_timecode(self.preview.current_time, fps)} / {format_timecode(self.project.total_duration, fps)}"
         )
 
     # ------------------------------------------------------------------
@@ -474,17 +694,20 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Redo: {label}", 2000)
 
     def _on_history_changed(self) -> None:
+        if not hasattr(self, "undo_action"):
+            return  # History notifies during construction, before the menus exist
         self.undo_action.setEnabled(self.history.can_undo)
         self.redo_action.setEnabled(self.history.can_redo)
-        self.toolbar_undo.setEnabled(self.history.can_undo)
-        self.toolbar_redo.setEnabled(self.history.can_redo)
-        self._mark_dirty()
+        # The title star follows the undo position (R4): undoing back to the
+        # saved state clears it again.
+        self._update_title()
 
     # ------------------------------------------------------------------
     # Project file management
     # ------------------------------------------------------------------
     def _mark_dirty(self) -> None:
-        self._dirty = True
+        """A change outside History (media import, proxy, recovered work)."""
+        self._media_dirty = True
         self._update_title()
 
     def _update_title(self) -> None:
@@ -518,7 +741,7 @@ class MainWindow(QMainWindow):
             return
         self._clear_autosave()
         self.project = Project()
-        self.history = History(on_change=self._on_history_changed)
+        self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
@@ -543,17 +766,31 @@ class MainWindow(QMainWindow):
     def _open_project_from_path(self, path: str) -> None:
         try:
             project = Project.load(path)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - includes ProjectVersionError's "newer version" message
             QMessageBox.critical(self, "Open Project", f"Could not open project:\n{exc}")
             return
         self._clear_autosave()
         self.project = project
-        self.history = History(on_change=self._on_history_changed)
+        self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
+        self._report_load_problems()
         self._warn_about_missing_media()
         self._add_recent_project(path)
+
+    def _report_load_problems(self) -> None:
+        """Show, once, what the loader had to default or skip and any timeline problems (B8, R6)."""
+        problems = list(self.project.load_warnings) + self.project.validate()
+        if not problems:
+            return
+        shown = "\n".join(f"- {p}" for p in problems[:15])
+        more = f"\n...and {len(problems) - 15} more" if len(problems) > 15 else ""
+        QMessageBox.warning(
+            self, "Project Opened With Problems",
+            "The project opened, but needs attention:\n\n" + shown + more
+            + "\n\nOverlapping clips render in an unpredictable order; move or trim them apart.",
+        )
 
     # ------------------------------------------------------------------
     # Recent Projects
@@ -602,14 +839,31 @@ class MainWindow(QMainWindow):
         preview = "\n".join(missing[:10])
         if len(missing) > 10:
             preview += f"\n... and {len(missing) - 10} more"
-        QMessageBox.warning(
+        answer = QMessageBox.warning(
             self,
             "Missing Media",
             "The following media files referenced by this project could not be found:\n\n"
             f"{preview}\n\n"
-            "Affected clips will appear blank/silent until the files are restored at their "
-            "original paths.",
+            "Affected clips are marked offline on the timeline. Relink them now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
         )
+        if answer == QMessageBox.Yes:
+            self.open_relink_dialog()
+
+    def open_relink_dialog(self) -> None:
+        dialog = RelinkDialog(self.project, self.history, self)
+        dialog.relinked.connect(self._on_media_relinked)
+        dialog.exec()
+
+    def _on_media_relinked(self, count: int) -> None:
+        self._thumb_pixmap_cache.clear()
+        self._waveform_cache.clear()
+        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self.timeline._layout_key = None
+        self.timeline.rebuild()
+        self.preview.refresh_after_edit()
+        self.status_bar.showMessage(f"Relinked {count} file(s).", 4000)
 
     def save_project(self) -> bool:
         """Save to the current file (or ask where, first time). Returns True if saved."""
@@ -627,6 +881,8 @@ class MainWindow(QMainWindow):
         return self._save_to(path)
 
     def _save_to(self, path: str) -> bool:
+        # The previous version of the file survives as <name>.vproj.bak (R2).
+        write_backup_copy(path)
         try:
             self.project.save(path)  # atomic: temp file + os.replace
         except Exception as exc:  # noqa: BLE001
@@ -645,67 +901,59 @@ class MainWindow(QMainWindow):
     def _autosave(self) -> None:
         """Best-effort periodic snapshot so a crash doesn't lose everything.
 
-        Writes to a fixed recovery slot rather than the project's own file
-        (which is only ever touched by an explicit Save), so autosaving
-        never overwrites the user's last deliberately-saved version.
+        Writes to this session's own recovery slot (core/autosave.py: one per
+        running editor, PID-locked, last 3 generations kept) rather than the
+        project's own file, so autosaving never overwrites the user's
+        deliberately saved version and two running editors never clobber
+        each other's recovery files.
         """
         if not self._dirty:
             return
         try:
-            # Atomic writes: a crash mid-autosave must not corrupt the very
-            # recovery slot meant to survive crashes.
-            write_json_atomic(_autosave_path(), self.project.to_dict())
-            write_json_atomic(
-                _autosave_meta_path(), {"original_path": self.project.file_path, "name": self.project.name}
+            self._autosave_session.write(
+                self.project.to_dict(), {"original_path": self.project.file_path, "name": self.project.name}
             )
         except (OSError, TypeError, ValueError):
             pass  # autosaving is a courtesy; never interrupt the user for it
 
     def _clear_autosave(self) -> None:
-        for path in (_autosave_path(), _autosave_meta_path()):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        self._autosave_session.clear()
 
     def _offer_autosave_recovery(self) -> None:
-        autosave_path = _autosave_path()
-        if not os.path.exists(autosave_path):
-            return
-        original_path = None
-        name = "an unsaved project"
-        try:
-            with open(_autosave_meta_path(), "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            original_path = meta.get("original_path")
-            name = meta.get("name") or name
-        except (OSError, json.JSONDecodeError):
-            pass
+        """Offer the newest autosave left by an editor that is no longer running.
 
+        Autosaves of editors that are still running (a second window) are
+        never offered; older crashed sessions stay for the next launch.
+        """
+        orphans = find_orphaned_autosaves(_autosave_dir(), exclude_session=self._autosave_session.session_id)
+        if not orphans:
+            return
+        orphan = orphans[0]
         result = QMessageBox.question(
             self,
             "Recover Unsaved Work",
             f"It looks like {APP_NAME} closed unexpectedly while editing "
-            f"'{name}' with unsaved changes.\n\nRecover that work now?",
+            f"'{orphan.name}' with unsaved changes.\n\nRecover that work now?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if result != QMessageBox.Yes:
-            self._clear_autosave()
+            orphan.discard()
             return
 
         try:
-            with open(autosave_path, "r", encoding="utf-8") as f:
+            with open(orphan.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             project = Project.from_dict(data)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Recover Unsaved Work", f"Could not recover the autosave:\n{exc}")
-            self._clear_autosave()
+            orphan.discard()
             return
+        orphan.discard()
+        original_path = orphan.original_path
 
         project.file_path = original_path
         self.project = project
-        self.history = History(on_change=self._on_history_changed)
+        self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
@@ -747,24 +995,63 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def open_export_dialog(self) -> None:
+        """Open a non-modal Export dialog: the editor stays usable while it renders a snapshot."""
         if not self.project.tracks or self.project.total_duration <= 0:
             QMessageBox.information(self, "Export Video", "Add some clips to the timeline before exporting.")
             return
-        dialog = ExportDialog(self.project, self)
-        dialog.exec()
+        dialog = ExportDialog(self.project, self, in_out_range=self.timeline.in_out_range())
+        dialog.setModal(False)
+        self._export_dialogs.append(dialog)
+        dialog.destroyed.connect(lambda _obj=None, d=dialog: self._forget_export_dialog(d))
+        dialog.show()
 
-    def show_about(self) -> None:
-        QMessageBox.about(
-            self,
-            f"About {APP_NAME}",
-            f"<h3>{APP_NAME}</h3>"
+    def _forget_export_dialog(self, dialog) -> None:
+        if dialog in self._export_dialogs:
+            self._export_dialogs.remove(dialog)
+
+    def running_exports(self) -> List[ExportDialog]:
+        alive = []
+        for dialog in list(self._export_dialogs):
+            try:
+                if dialog.is_running():
+                    alive.append(dialog)
+            except RuntimeError:  # already deleted
+                self._forget_export_dialog(dialog)
+        return alive
+
+    def show_shortcuts(self) -> None:
+        ShortcutsDialog(self.findChildren(QAction), self).exec()
+
+    def show_user_guide(self) -> None:
+        UserGuideDialog(self).exec()
+
+    def about_text(self) -> str:
+        ffmpeg = binary_version("ffmpeg") or "not found"
+        try:
+            gpu = "available" if nvenc_available() else "not available"
+        except Exception:  # noqa: BLE001
+            gpu = "unknown"
+        return (
+            f"<h3>{APP_NAME} {__version__}</h3>"
             "<p>A lightweight, extensible non-linear video editor built with "
             "Python, PySide6 and FFmpeg.</p>"
-            "<p>Import media, arrange it on a multi-track timeline, add text "
-            "overlays, and export a finished video.</p>",
+            f"<p>FFmpeg: {ffmpeg}<br>NVENC GPU encoding: {gpu}</p>"
         )
 
+    def show_about(self) -> None:
+        QMessageBox.about(self, f"About {APP_NAME}", self.about_text())
+
     def closeEvent(self, event) -> None:
+        running = self.running_exports()
+        if running:
+            result = QMessageBox.question(
+                self, "Export in Progress", "An export is still running. Cancel it and quit?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if result != QMessageBox.Yes or not all(d.cancel_and_wait() for d in running):
+                event.ignore()
+                return
+
         if self._import_thread is not None and self._import_thread.isRunning():
             result = QMessageBox.question(
                 self,
@@ -780,7 +1067,7 @@ class MainWindow(QMainWindow):
             self._autosave_timer.stop()
             # Either everything is saved, or the user just chose to discard
             # their changes — in both cases there's nothing to recover next launch.
-            self._clear_autosave()
+            self._autosave_session.close()
             self._save_window_state()
             event.accept()
         else:
