@@ -421,6 +421,23 @@ class MainWindowP2Tests(_QtCase):
         self.assertFalse(window.windowTitle().startswith("*"))
         window.deleteLater()
 
+    def test_open_project_file_from_the_command_line(self):  # K1: .vproj file association
+        from core.project import Project
+
+        tmp = tempfile.mkdtemp(prefix="ve_open_")
+        path = os.path.join(tmp, "Assoc.vproj")
+        saved = Project()
+        saved.name = "Assoc"
+        saved.save(path)
+        window = self._window()
+        window.open_project_file(path)
+        self.assertEqual(window.project.name, "Assoc")
+        with patch("ui.main_window.QMessageBox.warning") as warning:
+            window.open_project_file(os.path.join(tmp, "missing.vproj"))
+        warning.assert_called_once()
+        self.assertEqual(window.project.name, "Assoc")
+        window.deleteLater()
+
     def test_about_and_shortcut_list(self):  # K6, F14
         from core import __version__
         from ui.help_dialogs import shortcut_rows

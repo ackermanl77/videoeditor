@@ -754,6 +754,15 @@ class MainWindow(QMainWindow):
             return
         self._open_project_from_path(path)
 
+    def open_project_file(self, path: str) -> None:
+        """Open a .vproj passed on the command line (double-click via the installer's association)."""
+        if not self._confirm_discard_if_dirty():
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Open Project", f"This file could not be found:\n{path}")
+            return
+        self._open_project_from_path(path)
+
     def _open_recent_project(self, path: str) -> None:
         if not self._confirm_discard_if_dirty():
             return

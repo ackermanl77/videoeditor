@@ -15,7 +15,7 @@ import sys
 # from another directory or bundled by PyInstaller.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen  # noqa: E402
 
@@ -61,6 +61,18 @@ def _show_splash(app: QApplication) -> QSplashScreen | None:
     return splash
 
 
+def project_argument(argv: list[str]) -> str | None:
+    """The .vproj path given on the command line, if any (the first one wins).
+
+    Explorer passes it as the only argument when a project is double-clicked
+    (installer/VideoEditor.iss registers .vproj); options start with "-".
+    """
+    for arg in argv[1:]:
+        if not arg.startswith("-") and arg.lower().endswith(".vproj"):
+            return os.path.abspath(arg)
+    return None
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         # Checks the bundled FFmpeg, required filters and a real one-second
@@ -98,6 +110,13 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
+
+    project_path = project_argument(sys.argv)
+    if project_path:
+        # Queued after the window's own autosave-recovery offer (also a
+        # zero-delay timer), so a recovered session still gets the
+        # "discard unsaved changes?" question before the file replaces it.
+        QTimer.singleShot(0, lambda: window.open_project_file(project_path))
 
     if splash is not None:
         splash.finish(window)
