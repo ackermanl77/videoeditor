@@ -68,6 +68,35 @@ class Track:
                 return c
         return None
 
+    def overlapping_pairs(self, tolerance: float = 1e-3) -> List[tuple]:
+        """Every pair of clips on this track that overlap by more than ``tolerance`` seconds."""
+        ordered = self.sorted_clips()
+        pairs = []
+        for i, a in enumerate(ordered):
+            for b in ordered[i + 1:]:
+                if b.timeline_start >= a.timeline_end - tolerance:
+                    break
+                pairs.append((a, b))
+        return pairs
+
+    def validate(self) -> List[str]:
+        """Human-readable problems with this track (see :meth:`core.project.Project.validate`)."""
+        problems = [
+            f"Track '{self.name}': '{a.name}' and '{b.name}' overlap "
+            f"({b.timeline_start:.2f}s-{min(a.timeline_end, b.timeline_end):.2f}s)."
+            for a, b in self.overlapping_pairs()
+        ]
+        from core.clip import MediaType
+
+        allowed = {MediaType.AUDIO} if self.track_type == TrackType.AUDIO else {
+            MediaType.VIDEO, MediaType.IMAGE, MediaType.TEXT
+        }
+        problems += [
+            f"Track '{self.name}': {c.media_type.value} clip '{c.name}' doesn't belong on a {self.track_type.value} track."
+            for c in self.clips if c.media_type not in allowed
+        ]
+        return problems
+
     def has_overlap(self, clip: Clip, ignore_id: Optional[str] = None) -> bool:
         for other in self.clips:
             if other.id == (ignore_id or clip.id):
@@ -94,7 +123,7 @@ class Track:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Track":
+    def from_dict(cls, data: Dict[str, Any], warnings: Optional[List[str]] = None) -> "Track":
         track = cls(
             track_type=TrackType(data["track_type"]),
             name=data.get("name", ""),
@@ -109,5 +138,12 @@ class Track:
             duck_attack=data.get("duck_attack", 5.0),
             duck_release=data.get("duck_release", 250.0),
         )
-        track.clips = [Clip.from_dict(c) for c in data.get("clips", [])]
+        track.clips = []
+        for clip_data in data.get("clips", []):
+            try:
+                track.clips.append(Clip.from_dict(clip_data, warnings))
+            except (KeyError, ValueError, TypeError) as exc:
+                if warnings is None:
+                    raise
+                warnings.append(f"Track '{track.name}': skipped a clip this version can't read ({exc}).")
         return track

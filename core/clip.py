@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.effects import EffectInstance
+
 
 class MediaType(str, Enum):
     """The kind of media a clip represents."""
@@ -77,7 +79,18 @@ class TextStyle:
     italic: bool = False
     position_x: float = 0.5  # relative 0..1 (0 = left, 1 = right)
     position_y: float = 0.9  # relative 0..1 (0 = top, 1 = bottom)
-    alignment: str = "center"  # left | center | right
+    alignment: str = "center"  # left | center | right (line alignment within a multi-line block)
+    # Drop shadow and background box (drawtext shadowx/shadowy/shadowcolor
+    # and box/boxcolor/boxborderw). Off by default, so existing projects
+    # render exactly as before. Sizes/offsets are, like font_size, pixels at
+    # 1080p output height and scale with the export resolution.
+    shadow_enabled: bool = False
+    shadow_color: str = "#000000"
+    shadow_offset: int = 3
+    box_enabled: bool = False
+    box_color: str = "#000000"
+    box_opacity: float = 0.5  # 0..1
+    box_padding: int = 12
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -92,11 +105,59 @@ class TextStyle:
             "position_x": self.position_x,
             "position_y": self.position_y,
             "alignment": self.alignment,
+            "shadow_enabled": self.shadow_enabled,
+            "shadow_color": self.shadow_color,
+            "shadow_offset": self.shadow_offset,
+            "box_enabled": self.box_enabled,
+            "box_color": self.box_color,
+            "box_opacity": self.box_opacity,
+            "box_padding": self.box_padding,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TextStyle":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+def interpolate_keyframes(keyframes, t: float) -> Tuple[float, ...]:
+    """Value(s) at ``t`` under the export's piecewise-linear, hold-at-ends semantics."""
+    kfs = sorted(keyframes, key=lambda k: k[0])
+    if t <= kfs[0][0]:
+        return tuple(kfs[0][1:])
+    for (t0, *v0), (t1, *v1) in zip(kfs, kfs[1:]):
+        if t < t1:
+            frac = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+            return tuple(a + (b - a) * frac for a, b in zip(v0, v1))
+    return tuple(kfs[-1][1:])
+
+
+def _step_value(keyframes, t: float) -> Tuple[float, ...]:
+    """Step-function value in effect at ``t`` (speed keyframes, see Clip.speed_segments)."""
+    kfs = sorted(keyframes, key=lambda k: k[0])
+    value = tuple(kfs[0][1:])
+    for k in kfs:
+        if k[0] <= t + 1e-9:
+            value = tuple(k[1:])
+    return value
+
+
+def _rebase_keyframes(keyframes, shift: float, step: bool = False) -> list:
+    """Keyframes re-based so time ``shift`` becomes 0 (fewer than 2 = not animated: unchanged).
+
+    A positive shift (content cut from the front) drops the keyframes before
+    it and adds one at 0 holding the value in effect there; a negative shift
+    (front extended) just moves every keyframe later.
+    """
+    if len(keyframes) < 2:
+        return list(keyframes)
+    if shift <= 0:
+        return [(k[0] - shift, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0])]
+    value = _step_value(keyframes, shift) if step else interpolate_keyframes(keyframes, shift)
+    kept = [(k[0] - shift, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > shift + 1e-6]
+    rebased = [(0.0, *value)] + kept
+    if len(rebased) < 2:  # the cut is past the last keyframe: hold its value
+        rebased.append((max(1e-3, 1.0), *value))
+    return rebased
 
 
 @dataclass
@@ -113,7 +174,6 @@ class Clip:
     source_in: float = 0.0
     source_out: float = 5.0
     timeline_start: float = 0.0
-    track_index: int = 0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     name: str = ""
 
@@ -136,7 +196,6 @@ class Clip:
     # Transitions (duration in seconds, applied within the clip's own span)
     fade_in: float = 0.0
     fade_out: float = 0.0
-    transition_in: TransitionType = TransitionType.NONE
     transition_out: TransitionType = TransitionType.NONE
     # Crossfade duration used when transition_out == CROSSFADE, in seconds.
     # Independent of fade_out (which remains a simple fade to transparent).
@@ -205,6 +264,24 @@ class Clip:
     # Original untrimmed source duration, when known (seconds)
     source_duration: Optional[float] = None
 
+    # The media-pool asset this clip was made from (None for text clips and
+    # for clips from projects saved before asset ids existed, which are then
+    # matched by path). Relinking an asset rewrites every clip linked to it.
+    asset_id: Optional[str] = None
+
+    # Clips sharing a link_group move together (e.g. a video clip and the
+    # audio clip detached from it, see core.commands.build_detach_audio_command).
+    link_group: Optional[str] = None
+
+    # Volume automation: (clip-local timeline seconds, gain 0..2). 2+ entries
+    # override the scalar ``volume`` with a piecewise-linear envelope, exactly
+    # like opacity_keyframes override ``opacity``.
+    volume_keyframes: List[Tuple[float, float]] = field(default_factory=list)
+
+    # Generic effect stack (LUT, YUV chroma key, sharpen, blur, vignette,
+    # video denoise), applied in list order -- see core/effects.py.
+    effects: List[EffectInstance] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         if not self.name:
             self.name = self._default_name()
@@ -270,6 +347,80 @@ class Clip:
         speed = self.speed if self.speed > 0 else 1.0
         return self.source_length / speed
 
+    def source_offset_at(self, timeline_offset: float) -> float:
+        """Source seconds (from ``source_in``) on screen ``timeline_offset`` seconds into the clip.
+
+        Walks :attr:`speed_segments`, so it is right for speed-ramped clips
+        too (``offset * speed`` only holds at a constant speed). Past the
+        clip's end it extrapolates at the last segment's speed -- what
+        extending the clip's right edge would show.
+        """
+        if len(self.speed_keyframes) < 2:
+            return timeline_offset * (self.speed if self.speed > 0 else 1.0)
+        elapsed = 0.0
+        segments = self.speed_segments
+        for seg_in, seg_out, seg_speed in segments:
+            seg_len = (seg_out - seg_in) / seg_speed
+            if timeline_offset <= elapsed + seg_len:
+                return (seg_in - self.source_in) + (timeline_offset - elapsed) * seg_speed
+            elapsed += seg_len
+        last_in, last_out, last_speed = segments[-1]
+        return (last_out - self.source_in) + (timeline_offset - elapsed) * last_speed
+
+    def timeline_offset_at(self, source_offset: float) -> float:
+        """Inverse of :meth:`source_offset_at`: clip-local timeline seconds showing ``source_offset``."""
+        if len(self.speed_keyframes) < 2:
+            return source_offset / (self.speed if self.speed > 0 else 1.0)
+        elapsed = 0.0
+        segments = self.speed_segments
+        if source_offset <= 0:
+            return source_offset / segments[0][2]  # before the clip: first segment's speed
+        for seg_in, seg_out, seg_speed in segments:
+            rel_in, rel_out = seg_in - self.source_in, seg_out - self.source_in
+            if source_offset <= rel_out:
+                return elapsed + max(0.0, source_offset - rel_in) / seg_speed
+            elapsed += (seg_out - seg_in) / seg_speed
+        last_in, last_out, last_speed = segments[-1]
+        return elapsed + (source_offset - (last_out - self.source_in)) / last_speed
+
+    def speed_at(self, timeline_offset: float) -> float:
+        """Playback speed in effect ``timeline_offset`` seconds into the clip."""
+        if len(self.speed_keyframes) < 2:
+            return self.speed if self.speed > 0 else 1.0
+        elapsed = 0.0
+        for seg_in, seg_out, seg_speed in self.speed_segments:
+            elapsed += (seg_out - seg_in) / seg_speed
+            if timeline_offset < elapsed:
+                return seg_speed
+        return self.speed_segments[-1][2]
+
+    def with_source_range(self, source_in: float, source_out: float) -> "Clip":
+        """A shallow copy with a different trim: what the clip becomes after trimming.
+
+        Used wherever a trim's result is needed (the trim command itself,
+        ripple trim, the timeline's trim drag), so all three agree:
+        recomputing the length as ``(out - in) / speed`` ignored speed ramps
+        and let a ripple trim overlap the next clip.
+
+        Moving ``source_in`` re-bases the keyframes so they stay on the same
+        content: speed keyframes are ``source_in``-relative source seconds,
+        opacity/position/volume keyframes clip-relative timeline seconds. A
+        left trim used to leave them where they were, so a ramp or an
+        animation slid along the footage by the trimmed amount.
+        """
+        import copy as _copy
+
+        probe = _copy.copy(self)
+        probe.source_in, probe.source_out = source_in, source_out
+        source_shift = source_in - self.source_in
+        if abs(source_shift) > 1e-9:
+            timeline_shift = self.timeline_offset_at(source_shift)
+            probe.speed_keyframes = _rebase_keyframes(self.speed_keyframes, source_shift, step=True)
+            probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift)
+            probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift)
+            probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift)
+        return probe
+
     @property
     def timeline_end(self) -> float:
         return self.timeline_start + self.duration
@@ -297,6 +448,19 @@ class Clip:
     def has_transition(self) -> bool:
         return self.transition_out != TransitionType.NONE
 
+    @property
+    def has_effects(self) -> bool:
+        return any(e.is_renderable() for e in self.effects)
+
+    @property
+    def has_volume_automation(self) -> bool:
+        return len(self.volume_keyframes) >= 2
+
+    @property
+    def is_silent(self) -> bool:
+        """Muted, or at zero volume with no volume automation to bring it back up."""
+        return self.muted or (self.volume <= 0 and not self.has_volume_automation)
+
     def contains_time(self, t: float) -> bool:
         return self.timeline_start <= t < self.timeline_end
 
@@ -314,7 +478,6 @@ class Clip:
             "source_in": self.source_in,
             "source_out": self.source_out,
             "timeline_start": self.timeline_start,
-            "track_index": self.track_index,
             "volume": self.volume,
             "muted": self.muted,
             "speed": self.speed,
@@ -323,7 +486,6 @@ class Clip:
             "opacity": self.opacity,
             "fade_in": self.fade_in,
             "fade_out": self.fade_out,
-            "transition_in": self.transition_in.value,
             "transition_out": self.transition_out.value,
             "transition_duration": self.transition_duration,
             "brightness": self.brightness,
@@ -346,20 +508,43 @@ class Clip:
             "crop_focus_y": self.crop_focus_y,
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
+            "asset_id": self.asset_id,
+            "link_group": self.link_group,
+            "volume_keyframes": [list(kf) for kf in self.volume_keyframes],
+            "effects": [e.to_dict() for e in self.effects],
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Clip":
+    def from_dict(cls, data: Dict[str, Any], warnings: Optional[List[str]] = None) -> "Clip":
+        """Build a clip from saved data, tolerating values this version doesn't know.
+
+        An unknown ``transition_out``/``reframe_mode`` (e.g. a transition
+        added by a newer version) falls back to a safe default and is
+        reported in ``warnings`` rather than failing the whole load. An
+        unknown ``media_type`` still raises ``ValueError`` -- there is no
+        safe stand-in for it; :meth:`core.track.Track.from_dict` skips such
+        a clip with a warning.
+        """
         text_style = data.get("text_style")
+        name = data.get("name", "")
+
+        def enum(enum_cls, key, default):
+            raw = data.get(key, default.value)
+            try:
+                return enum_cls(raw)
+            except ValueError:
+                if warnings is not None:
+                    warnings.append(f"Clip '{name or data.get('id', '?')}': unknown {key} '{raw}', using '{default.value}'.")
+                return default
+
         return cls(
             media_type=MediaType(data["media_type"]),
             source_path=data.get("source_path", ""),
             source_in=data.get("source_in", 0.0),
             source_out=data.get("source_out", 0.0),
             timeline_start=data.get("timeline_start", 0.0),
-            track_index=data.get("track_index", 0),
             id=data.get("id", uuid.uuid4().hex[:12]),
-            name=data.get("name", ""),
+            name=name,
             volume=data.get("volume", 1.0),
             muted=data.get("muted", False),
             speed=data.get("speed", 1.0),
@@ -368,8 +553,7 @@ class Clip:
             opacity=data.get("opacity", 1.0),
             fade_in=data.get("fade_in", 0.0),
             fade_out=data.get("fade_out", 0.0),
-            transition_in=TransitionType(data.get("transition_in", "none")),
-            transition_out=TransitionType(data.get("transition_out", "none")),
+            transition_out=enum(TransitionType, "transition_out", TransitionType.NONE),
             transition_duration=data.get("transition_duration", 0.5),
             brightness=data.get("brightness", 0.0),
             contrast=data.get("contrast", 1.0),
@@ -386,9 +570,13 @@ class Clip:
             opacity_keyframes=[tuple(kf) for kf in data.get("opacity_keyframes", [])],
             position_keyframes=[tuple(kf) for kf in data.get("position_keyframes", [])],
             speed_keyframes=[tuple(kf) for kf in data.get("speed_keyframes", [])],
-            reframe_mode=ReframeMode(data.get("reframe_mode", "fit")),
+            reframe_mode=enum(ReframeMode, "reframe_mode", ReframeMode.FIT),
             crop_focus_x=data.get("crop_focus_x", 0.5),
             crop_focus_y=data.get("crop_focus_y", 0.5),
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
+            asset_id=data.get("asset_id"),
+            link_group=data.get("link_group"),
+            volume_keyframes=[tuple(kf) for kf in data.get("volume_keyframes", [])],
+            effects=[EffectInstance.from_dict(e) for e in data.get("effects", []) if isinstance(e, dict)],
         )

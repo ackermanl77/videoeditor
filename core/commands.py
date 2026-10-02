@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-from core.clip import Clip
+from core.clip import Clip, MediaType, interpolate_keyframes
 from core.history import CompositeCommand, Command
 from core.project import Marker, Project
 from core.track import Track, TrackType
@@ -95,7 +95,6 @@ class MoveClipCommand(Command):
             source_track.clips.remove(clip)
             target_track.clips.append(clip)
         clip.timeline_start = max(0.0, start)
-        clip.track_index = self.project.tracks.index(target_track)
 
 
 class TrimClipCommand(Command):
@@ -111,12 +110,23 @@ class TrimClipCommand(Command):
     ):
         self.project = project
         self.clip_id = clip_id
-        self.new_values = (source_in, source_out, timeline_start)
         clip = project.find_clip(clip_id)
-        self.old_values: Tuple[float, float, float] = (
-            (clip.source_in, clip.source_out, clip.timeline_start) if clip else (0.0, 0.0, 0.0)
-        )
+        self.old_values = self._snapshot(clip) if clip else None
+        if clip is not None:
+            # Keyframes re-based with the trim (see Clip.with_source_range).
+            trimmed = clip.with_source_range(source_in, source_out)
+            trimmed.timeline_start = timeline_start
+            self.new_values = self._snapshot(trimmed)
+        else:
+            self.new_values = None
         self.label = "Trim Clip"
+
+    _FIELDS = ("source_in", "source_out", "timeline_start", "speed_keyframes",
+               "opacity_keyframes", "position_keyframes", "volume_keyframes")
+
+    @classmethod
+    def _snapshot(cls, clip: Clip) -> dict:
+        return {name: copy.copy(getattr(clip, name)) for name in cls._FIELDS}
 
     def do(self) -> None:
         self._apply(self.new_values)
@@ -124,11 +134,12 @@ class TrimClipCommand(Command):
     def undo(self) -> None:
         self._apply(self.old_values)
 
-    def _apply(self, values: Tuple[float, float, float]) -> None:
+    def _apply(self, values: Optional[dict]) -> None:
         clip = self.project.find_clip(self.clip_id)
-        if clip is None:
+        if clip is None or values is None:
             return
-        clip.source_in, clip.source_out, clip.timeline_start = values
+        for name, value in values.items():
+            setattr(clip, name, copy.copy(value))
 
 
 class SplitClipCommand(Command):
@@ -201,32 +212,12 @@ _KF_EPS = 1e-6
 def _source_offset_at(clip: Clip, timeline_offset: float) -> float:
     """Source seconds (from ``source_in``) shown ``timeline_offset`` seconds into ``clip``.
 
-    Walks ``Clip.speed_segments``, so a speed-ramped clip splits at the
-    source frame actually on screen at the playhead -- ``offset * clip.speed``
-    was only right for a constant-speed clip.
+    Clamped to the clip's own trim; see :meth:`Clip.source_offset_at`.
     """
-    if len(clip.speed_keyframes) < 2:
-        speed = clip.speed if clip.speed > 0 else 1.0
-        return timeline_offset * speed
-    elapsed = 0.0
-    for seg_in, seg_out, seg_speed in clip.speed_segments:
-        seg_len = (seg_out - seg_in) / seg_speed
-        if timeline_offset <= elapsed + seg_len:
-            return (seg_in - clip.source_in) + (timeline_offset - elapsed) * seg_speed
-        elapsed += seg_len
-    return clip.source_length
+    return min(clip.source_offset_at(timeline_offset), clip.source_length)
 
 
-def _interpolate_keyframes(keyframes: List[Tuple[float, ...]], t: float) -> Tuple[float, ...]:
-    """Value(s) at ``t`` under filter_graph's piecewise-linear, hold-at-ends semantics."""
-    kfs = sorted(keyframes, key=lambda k: k[0])
-    if t <= kfs[0][0]:
-        return tuple(kfs[0][1:])
-    for (t0, *v0), (t1, *v1) in zip(kfs, kfs[1:]):
-        if t < t1:
-            frac = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
-            return tuple(a + (b - a) * frac for a, b in zip(v0, v1))
-    return tuple(kfs[-1][1:])
+_interpolate_keyframes = interpolate_keyframes
 
 
 def _keyframes_before(keyframes, cut: float):
@@ -297,9 +288,22 @@ def _apply_speed_keyframes(clip: Clip, keyframes) -> None:
 
 
 class UpdateClipPropertyCommand(Command):
-    """Generic setter for simple scalar clip properties (volume, speed, ...)."""
+    """Generic setter for simple scalar clip properties (volume, speed, ...).
 
-    def __init__(self, project: Project, clip_id: str, attribute: str, new_value: Any, label: Optional[str] = None):
+    ``mergeable=True`` (used for the Properties panel's live slider edits)
+    lets consecutive edits of the same clip attribute collapse into one undo
+    step that still undoes to the value from before the first of them.
+    """
+
+    def __init__(
+        self,
+        project: Project,
+        clip_id: str,
+        attribute: str,
+        new_value: Any,
+        label: Optional[str] = None,
+        mergeable: bool = False,
+    ):
         self.project = project
         self.clip_id = clip_id
         self.attribute = attribute
@@ -307,6 +311,13 @@ class UpdateClipPropertyCommand(Command):
         clip = project.find_clip(clip_id)
         self.old_value = getattr(clip, attribute, None) if clip else None
         self.label = label or f"Edit {attribute.replace('_', ' ').title()}"
+        self.merge_key = ("clip-property", clip_id, attribute) if mergeable else None
+
+    def merge(self, other: Command) -> bool:
+        if not isinstance(other, UpdateClipPropertyCommand):
+            return False
+        self.new_value = other.new_value
+        return True
 
     def do(self) -> None:
         clip = self.project.find_clip(self.clip_id)
@@ -348,19 +359,34 @@ class UpdateTrackPropertyCommand(Command):
 
 
 class AddTrackCommand(Command):
+    """Append a new track.
+
+    The :class:`Track` (and so its id) is created once, here, and the same
+    object is re-appended on redo. It used to be created inside ``do()``, so
+    every redo made a track with a new id -- breaking any later command in
+    the same history (e.g. a clip added to the new track) that referred to
+    the first one, and making "add a clip on a new track" impossible to
+    express as one undoable step.
+    """
+
     def __init__(self, project: Project, track_type: TrackType, name: Optional[str] = None):
         self.project = project
         self.track_type = track_type
-        self.name = name
-        self._track: Optional[Track] = None
+        count = sum(1 for t in project.tracks if t.track_type == track_type) + 1
+        default_name = f"{'Video' if track_type == TrackType.VIDEO else 'Audio'} {count}"
+        self.track = Track(track_type=track_type, name=name or default_name)
         self.label = "Add Track"
 
+    @property
+    def track_id(self) -> str:
+        return self.track.id
+
     def do(self) -> None:
-        self._track = self.project.add_track(self.track_type, self.name)
+        if self.project.find_track(self.track.id) is None:
+            self.project.tracks.append(self.track)
 
     def undo(self) -> None:
-        if self._track is not None:
-            self.project.remove_track(self._track.id)
+        self.project.remove_track(self.track.id)
 
 
 class RemoveTrackCommand(Command):
@@ -452,8 +478,10 @@ def build_ripple_trim_command(
         return trim_cmd
 
     old_end = clip.timeline_end
-    speed = clip.speed if clip.speed > 0 else 1.0
-    new_duration = max(0.0, source_out - source_in) / speed
+    # Clip.duration of the trimmed clip, so a speed ramp is accounted for
+    # (``(out - in) / speed`` shifted later clips by the wrong amount and
+    # could overlap them).
+    new_duration = clip.with_source_range(source_in, max(source_in, source_out)).duration
     delta = (timeline_start + new_duration) - old_end
     if abs(delta) <= 1e-6:
         return trim_cmd
@@ -523,3 +551,75 @@ class RenameMarkerCommand(Command):
         marker = self.project.find_marker(self.marker_id)
         if marker is not None:
             marker.name = self.old_name
+
+
+# Clip attributes whose change alters Clip.duration (and so can push a clip
+# into the next one on its track).
+DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "source_in", "source_out"})
+
+
+def property_change_overlaps(project: Project, clip_id: str, attribute: str, new_value: Any) -> bool:
+    """Whether setting ``attribute`` to ``new_value`` would make the clip overlap a neighbour.
+
+    Lowering Speed (or adding a slow-motion speed ramp) lengthens a clip on
+    the timeline; applied blindly it ran into the next clip, and the export
+    then composited two clips on one track. Callers refuse such an edit.
+    Always False for attributes that don't change the clip's duration.
+    """
+    if attribute not in DURATION_ATTRIBUTES:
+        return False
+    track = project.find_clip_track(clip_id)
+    clip = project.find_clip(clip_id)
+    if track is None or clip is None:
+        return False
+    probe = copy.copy(clip)
+    setattr(probe, attribute, new_value)
+    return track.has_overlap(probe)
+
+
+def find_free_track(
+    project: Project,
+    track_type: TrackType,
+    start: float,
+    duration: float,
+    preferred_track_id: Optional[str] = None,
+    order: Optional[List[Track]] = None,
+) -> Optional[Track]:
+    """First track of ``track_type`` where ``[start, start+duration)`` is free (and not locked).
+
+    Tries ``preferred_track_id`` first, then the other tracks of that type
+    in ``order`` (default: project order). None when every candidate would
+    overlap -- the caller then adds a new track (see :func:`build_add_clip_command`).
+    """
+    probe = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=max(duration, 1e-3), timeline_start=start)
+    candidates = [t for t in (order or project.tracks) if t.track_type == track_type]
+    preferred = project.find_track(preferred_track_id) if preferred_track_id else None
+    if preferred is not None and preferred.track_type == track_type:
+        candidates = [preferred] + [t for t in candidates if t.id != preferred.id]
+    for track in candidates:
+        if not track.locked and not track.has_overlap(probe):
+            return track
+    return None
+
+
+def build_add_clip_command(
+    project: Project,
+    clip: Clip,
+    track_type: TrackType,
+    preferred_track_id: Optional[str] = None,
+    order: Optional[List[Track]] = None,
+) -> Command:
+    """Add ``clip`` at its ``timeline_start`` without overlapping anything.
+
+    The preferred track if the spot is free there, else another track of the
+    same type where it is, else a brand-new track -- added through
+    :class:`AddTrackCommand` inside the same :class:`CompositeCommand`, so
+    one Undo removes both (auto-created tracks used to bypass History and
+    survive the undo as orphans). Dropping onto an occupied spot or pressing
+    T over an existing clip used to create overlapping clips.
+    """
+    track = find_free_track(project, track_type, clip.timeline_start, clip.duration, preferred_track_id, order)
+    if track is not None:
+        return AddClipCommand(project, track.id, clip)
+    add_track = AddTrackCommand(project, track_type)
+    return CompositeCommand([add_track, AddClipCommand(project, add_track.track_id, clip)], f"Add {clip.name}")
