@@ -46,3 +46,10 @@ Thumbnails and waveforms are cached under `~/.video_editor/thumbnails/` and `~/.
 ## Parallel import, timeouts and proxies (P2)
 
 `ImportWorker` probes every file in parallel on `min(4, cpu_count / 2)` threads, adds each asset to the bin as soon as it is probed, then generates thumbnails (at `min(1 s, duration / 2)`) and waveforms in a second parallel stage. **Cancel Import** (status bar or Media menu) stops work not yet started. ffprobe (30 s), thumbnails (30 s) and waveforms (60 s + duration / 20) have timeouts, and `core.ffmpeg_utils.run` defaults to 60 s. Probing also records pixel format, bit depth and colour tags; the bin marks HDR / 10-bit / offline / proxy. **Media > Generate Proxy** (or automatically for >1080p, 10-bit or HDR when enabled) encodes a 540p, 15-frame-GOP, no-B-frame H.264 proxy (NVENC when available) under `~/.video_editor/proxies/`.
+
+## Subtitle files, filmstrips, RMS waveforms, GPU decoding (round 4)
+
+- `.srt`/`.vtt` files given to Import Media (dialog or drop) are not probed as media: they go to `MainWindow.import_subtitle_file()` (see text-overlays/workflow.md).
+- The import worker also makes a **filmstrip** for video files (`media_probe.generate_filmstrip`: 8 tiles across the whole file, cached next to the thumbnails, `MediaAsset.filmstrip_path`); the timeline draws the tiles for the clip's own source range (fixed here: the tile lookup divided by `source_out` instead of the file length, so a clip trimmed short of the file's end showed the file's last frames).
+- Waveform caches hold peaks **and RMS** at 100 values per second (was 25). Older caches still load (RMS = peaks). The RMS sum runs in C (`map(operator.mul)`) so long files don't import noticeably slower.
+- With `VIDEO_EDITOR_HWACCEL` set, thumbnails and filmstrips try the GPU decoder first and fall back to software; a failed attempt's image is deleted so it can't be served from the cache later. The audio-only waveform decode never uses it.

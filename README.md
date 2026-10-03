@@ -28,6 +28,13 @@ deliberately layered and documented so it is easy to read, test and extend.
   (video and audio both)
 - **Speed ramps**: vary a clip's playback speed within itself (e.g.
   normal → slow-motion → normal) via speed keyframes
+- **Reverse and freeze frame**: play a clip (picture and sound) backwards,
+  and/or hold its last frame for a set time at its end
+- **Subtitles**: File > Import Subtitles (or drop a file) turns an SRT or
+  WebVTT file into editable, burned-in caption text clips on a "Subtitles"
+  track
+- **Audio level meters** (peak and RMS) next to the preview controls, and
+  title/action-safe guides over the preview
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
   split-screen, off-center framing
 - **Shorts / vertical video export**: crop-to-fill reframing (with a manual
@@ -76,6 +83,11 @@ deliberately layered and documented so it is easy to read, test and extend.
   23.976/29.97/59.94 rates
 - **Robust projects**: versioned file format, relative media paths, Relink
   Media, per-session autosave, `.bak` on save
+- **Optional GPU decoding**: set `VIDEO_EDITOR_HWACCEL=auto` (or `d3d11va` /
+  `cuda`) to decode video on the GPU for exports, preview frames, proxies and
+  thumbnails; anything the GPU decoder can't handle falls back to normal
+  software decoding automatically. Off by default (see the User Guide for when
+  it helps)
 
 ## Project layout
 
@@ -172,7 +184,7 @@ To check an installation or a built exe without opening the GUI:
 python main.py --self-test        # or: VideoEditor.exe --self-test
 ```
 
-It prints the version, the FFmpeg it found, NVENC availability and the 22 required filters, renders a one-second test export, and exits 0 on success.
+It prints the version, the FFmpeg it found, NVENC availability, the video-decoding setting and the 25 required filters, renders a one-second test export, and exits 0 on success.
 
 ## Building a standalone executable
 

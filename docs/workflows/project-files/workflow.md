@@ -39,3 +39,7 @@ On startup, if a recovery file exists, the user is asked whether to recover it. 
 ## Format 3 (round 3)
 
 - `file_version` 3 moves the clip fields `brightness`, `contrast`, `saturation`, `gamma` and `chroma_key_*` into the effect stack as `color_correction` / `colorkey` effects (`core.project._migrate_2_to_3`, using `core.effects.legacy_effect_dicts`): neutral values add nothing, a configured but disabled key is kept disabled, and the render is identical. Effects can now carry `"keyframes"` (`{param: [[t, v], ...]}`) for animatable parameters. Version 1 and 2 files open and are migrated in order; files saved now are refused by older versions with the usual "made by a newer version" message.
+
+## Reverse, freeze frame and subtitles (round 4)
+
+`Clip.reverse` and `Clip.freeze_frame_duration` are new clip keys with defaults (off / 0), so the file format stays **3**: older projects open unchanged, and a negative or malformed freeze value loads as 0. Imported subtitles are plain text clips. `MediaAsset.filmstrip_path` is a cache path, saved like the thumbnail path. Note that an older build opening a newer project ignores the new keys (a reversed clip would play forwards there).

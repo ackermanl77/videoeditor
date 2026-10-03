@@ -225,9 +225,32 @@ For video/audio clips, the **Clip Adjustments** group offers:
 | Speed | 0.25x–4.0x | Slow motion to 4x fast-forward (also changes how much of the source maps to the timeline). |
 | Opacity | 0–100% | How transparent the clip is (video/image only; not shown in the live preview, only in the exported file). |
 | Fade In / Fade Out | 0–30s | A gradual fade at the start/end — applied to video and to the clip's own audio. |
+| Reverse playback | on/off | Plays the clip back to front — picture and sound (video and audio clips). |
+| Freeze Frame | 0–30s | Makes a video clip longer by holding its last frame for this long, in silence. |
 
 Dragging a slider previews live; releasing it commits one single undo
 step for the whole drag. Everything here is undoable with **Ctrl+Z**.
+
+**Reverse and freeze frame in detail**
+
+- A reversed clip starts on the last frame of its trimmed range and ends on
+  the first. Its **left** edge is now the *end* of the source: dragging the
+  left edge in cuts the end of the footage, dragging the right edge in cuts
+  the beginning. Splitting a reversed clip gives two reversed halves that
+  together still play the same frames in the same order.
+- A freeze frame is shown hatched at the end of the clip and adds an **FF**
+  badge (a reversed clip shows **R**). Dragging the clip's right edge in
+  shortens the freeze first, then the footage; the freeze ends up on the
+  second half when you split the clip. You can't split *inside* a freeze
+  (the timeline tells you so) — shorten it with the right edge instead.
+  On a reversed clip the held frame is the first frame of the source range.
+- A freeze that would run into the next clip is refused, like a speed change
+  that would.
+- The sound stops where the freeze starts, and a Fade Out on the audio ends
+  there too; the picture's Fade Out runs over the held frame.
+- To reverse a clip FFmpeg holds all of its frames in memory while exporting,
+  so keep reversed clips short (a few seconds of HD is fine; minutes of 4K
+  are not).
 
 ## Transform: position, scale, rotation
 
@@ -351,6 +374,25 @@ once saved, they need this version (or newer) to open.
 *Note: the live preview shows text as a plain centered label rather than
 composited over your video — the exported file always shows it correctly
 overlaid at the position/style you set.*
+
+### Subtitles (SRT / WebVTT)
+
+**File > Import Subtitles...** (or drop an `.srt`/`.vtt` file on the window
+or pick it in Import Media) turns every cue into a text clip at its own time,
+centred near the bottom of the frame on a translucent box, on a video track
+named **Subtitles** (a second import that would overlap goes to
+**Subtitles 2**, and so on). The whole import is one undo step.
+
+- They are ordinary text clips: restyle, retime, edit or delete them like any
+  other, and they are saved in the project file. They are burned into the
+  exported picture; there are no separate (soft) subtitle tracks in the
+  exported file.
+- Accepted: SRT and WebVTT, UTF-8 or UTF-16 with a byte-order mark, or
+  Windows-1252 (common for older SRT files). Formatting tags (`<i>`, `{\an8}`
+  and similar) are removed. Cues that overlap are shortened so each ends when
+  the next starts (cues starting at the same moment are merged into one
+  two-line caption).
+- A file that isn't a subtitle file shows a message and changes nothing.
 
 ## Shorts / vertical video export
 
@@ -519,6 +561,23 @@ simplified view.
 When a cut between two different files is coming up, the preview opens the
 next file in advance, so cuts no longer pause briefly.
 
+**Reversed clips and freeze frames** play in the preview by stepping through
+the frames (the player can only play forwards), so they look a little less
+smooth there and are **silent** in the preview; the exported file has the
+reversed sound. **Accurate frame** shows them exactly.
+
+**Level meters**: the small bar next to **Safe areas** shows the sound level
+of the clip under the playhead — red for the peak, green for the average
+(RMS) level. It reads the waveform made at import, so it costs nothing while
+playing; it shows the active clip only (not the mix of every track), takes the
+clip's volume into account, and drops to zero for silence, a muted clip or
+track, a freeze frame, or media without sound (and until the waveform of a
+just-imported file is ready).
+
+**Safe areas** draws the action-safe (outer, 90 %) and title-safe (inner,
+80 %) rectangles over the preview, to keep titles and captions away from the
+edges.
+
 **The exported file is always the real, fully composited result** — every
 track, transition, text overlay, fade, and opacity setting included.
 
@@ -681,6 +740,15 @@ the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
   there.
 - **Your window size and panel layout are remembered** between sessions,
   so you don't have to re-arrange things every time you open the app.
+- **GPU decoding is opt-in.** Set the environment variable
+  `VIDEO_EDITOR_HWACCEL=auto` before starting the app (or `d3d11va` / `cuda`
+  for just one method) to let FFmpeg decode video on the graphics card during
+  export, Accurate frame, proxies and thumbnails. If the GPU decoder fails,
+  the same job runs again with normal (software) decoding, so it can only cost
+  time, never a failed export. It mostly helps with heavy 4K HEVC/AV1 camera
+  footage on a slower CPU; on a fast CPU it can even be slower (each frame
+  has to be copied back from the GPU), which is why it is off by default.
+  `python main.py --self-test` shows the current setting.
 
 ## Troubleshooting
 

@@ -42,3 +42,11 @@ There is no automated test for `PreviewPlayer` (it requires `QMediaPlayer`/a liv
 ## Stabilization in Accurate frame (round 3)
 
 - The Accurate-frame renderer builds the export graph with `stabilize_cached_only=True`: a stabilized clip shows stabilized only after an export has cached its motion analysis (`~/.video_editor/stabilize`), so scrubbing never waits for a full analysis pass.
+
+## Reverse/freeze stepping, level meters, safe areas (round 4)
+
+- **Reversed clips and freeze frames** can't be played by `QMediaPlayer` (forwards only), so `PreviewPlayer._is_stepped()` switches them to the same seek-per-poll-tick stepping the reverse shuttle uses: the player stays paused and `_load_for_time()` seeks to `Clip.source_time_at()` every 40 ms of wall-clock time. They are silent in the preview (the export reverses the sound). A forward clip with a freeze plays normally and then holds its last frame until the clip ends. Accurate frame renders them exactly.
+- **Meters.** `core/waveform.py` stores an RMS value next to each peak (100 per second; caches written before keep loading, with RMS = peak). `_update_audio_meters()` runs on every poll tick/seek and reads `window_levels()` -- a slice of ~13 cached values around the source time on screen, no decoding -- scaled by the clip's volume. Zero for: no clip, text/image, muted clip or track, freeze frame, no waveform yet (the cache is keyed by the waveform file, so one that arrives after import is picked up). It meters the active clip, not the mix.
+- **Safe areas** checkbox: a mouse-transparent overlay drawing the 90 % action-safe and 80 % title-safe rectangles.
+- **Accurate frame** now shows a quick half-size render first, then the full one (tooltip says which).
+- **Validation.** `tests/test_p4_ui.py::PreviewMeterTests` (levels at the playhead, reverse/mute/freeze, no audio data, stepping without `play()`).
