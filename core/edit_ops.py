@@ -336,30 +336,40 @@ def _source_limit(clip: Clip) -> float:
 
 
 def _trim_right_to(project: Project, clip: Clip, new_end: float) -> Optional[TrimClipCommand]:
-    """Trim/extend ``clip``'s right edge to timeline time ``new_end`` (None if impossible)."""
+    """Trim/extend ``clip``'s right edge to timeline time ``new_end`` (None if impossible).
+
+    The freeze-frame tail is trimmed first (see :meth:`Clip.trim_right_range`);
+    on a reversed clip the right edge is the ``source_in`` end.
+    """
     local = new_end - clip.timeline_start
     if local < MIN_CLIP_SECONDS - _EPS:
         return None
     if clip.media_type in (MediaType.IMAGE, MediaType.TEXT):
-        source_out = clip.source_in + local  # stills/text: any length
-    else:
-        source_out = clip.source_in + clip.source_offset_at(local)
-        if source_out > _source_limit(clip) + 1e-3:
-            return None  # not enough media after the current out point
-    return TrimClipCommand(project, clip.id, clip.source_in, source_out, clip.timeline_start)
+        source_out = clip.source_in + max(0.0, local - clip.freeze_frame_duration)  # stills/text: any length
+        return TrimClipCommand(project, clip.id, clip.source_in, source_out, clip.timeline_start)
+    source_in, source_out, freeze = clip.trim_right_range(local)
+    if source_out > _source_limit(clip) + 1e-3 or source_in < -1e-3:
+        return None  # not enough media past the current edge
+    return TrimClipCommand(project, clip.id, max(0.0, source_in), source_out, clip.timeline_start, freeze)
 
 
 def _trim_left_to(project: Project, clip: Clip, new_start: float) -> Optional[TrimClipCommand]:
-    """Trim/extend ``clip``'s left edge to timeline time ``new_start``, keeping its right edge."""
+    """Trim/extend ``clip``'s left edge to timeline time ``new_start``, keeping its right edge.
+
+    On a reversed clip the left edge is the ``source_out`` end; the left
+    edge never reaches into the freeze-frame tail.
+    """
     delta = new_start - clip.timeline_start
     if clip.timeline_end - new_start < MIN_CLIP_SECONDS - _EPS or new_start < -_EPS:
         return None
     if clip.media_type in (MediaType.IMAGE, MediaType.TEXT):
         return TrimClipCommand(project, clip.id, clip.source_in, clip.source_out - delta, new_start)
-    source_in = clip.source_in + clip.source_offset_at(delta)
-    if source_in < -1e-3:
+    if clip.playable_duration - delta < MIN_CLIP_SECONDS - _EPS:
         return None
-    return TrimClipCommand(project, clip.id, max(0.0, source_in), clip.source_out, new_start)
+    source_in, source_out = clip.trim_left_range(delta)
+    if source_in < -1e-3 or source_out > _source_limit(clip) + 1e-3:
+        return None
+    return TrimClipCommand(project, clip.id, max(0.0, source_in), source_out, new_start)
 
 
 def build_roll_command(project: Project, clip_id: str, new_edit_time: float) -> Optional[Command]:

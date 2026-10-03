@@ -16,7 +16,18 @@ from typing import Callable, List, Optional, Tuple
 
 from core.clip import MediaType, ReframeMode
 from core.effects import effect_files
-from core.ffmpeg_utils import encoder_supports_10bit, find_binary, nvenc_available, nvenc_encoder_available, popen
+from core.ffmpeg_utils import (
+    apply_decode_hwaccel,
+    decode_hwaccel_modes,
+    encoder_supports_10bit,
+    externalize_filter_graph,
+    find_binary,
+    is_hw_decode_failure,
+    nvenc_available,
+    nvenc_encoder_available,
+    popen,
+    remove_quietly,
+)
 from core.filter_graph import GraphResult, build_filter_graph, fps_expr
 from core.output_color import SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
@@ -44,7 +55,7 @@ ERROR_LOG_TAIL_LINES = 30
 # rather than a problem with the project itself -- see
 # Exporter._is_gpu_specific_failure.
 _GPU_FAILURE_RE = re.compile(
-    r"nvenc|nvcuda|cuda|no capable devices|OpenEncodeSession|out of memory|driver does not support",
+    r"nvenc|nvcuda|cuda|d3d11va|hwaccel|no capable devices|OpenEncodeSession|out of memory|driver does not support",
     re.IGNORECASE,
 )
 
@@ -981,16 +992,63 @@ class Exporter:
         progress_range: tuple,
         label: str,
     ) -> List[str]:
-        """Run one FFmpeg pass; returns its last log lines (progress lines excluded)."""
-        if self._cancelled:
-            raise ExportCancelled()
+        """Run one FFmpeg pass; returns its last log lines (progress lines excluded).
 
+        With GPU decoding enabled (``VIDEO_EDITOR_HWACCEL``, see
+        :func:`core.ffmpeg_utils.decode_hwaccel_modes`) the pass is tried with
+        each decode mode in turn, ending in plain software decoding. A failed
+        attempt is retried with the next mode only when it failed before
+        producing output or its log blames the hardware decoder -- a media,
+        disk or *encoder* problem fails straight away (the NVENC -> CPU
+        encoder fallback is the caller's job, as before). Every attempt
+        overwrites the same output (``-y``) and progress restarts at the
+        range's start, so nothing is counted twice; the exporter only renames
+        the ``.partial`` file into place after a successful attempt.
+        """
+        modes = decode_hwaccel_modes()
+        run_args, graph_file = externalize_filter_graph(args)
+        try:
+            for attempt, mode in enumerate(modes):
+                if self._cancelled:
+                    raise ExportCancelled()
+                if attempt and on_progress:
+                    on_progress(progress_range[0], f"{label}: GPU decoding failed -- retrying with "
+                                                   f"{mode or 'software'} decoding...")
+                returncode, log_tail, encoded_seconds = self._run_ffmpeg_once(
+                    apply_decode_hwaccel(run_args, mode), total_duration, on_progress, progress_range, label
+                )
+                if returncode == 0:
+                    return log_tail
+                error = ExportError(
+                    f"FFmpeg exited with code {returncode} ({label}).",
+                    log_tail=log_tail,
+                    encoded_seconds=encoded_seconds,
+                )
+                retry = mode is not None and (encoded_seconds <= 0.0 or is_hw_decode_failure(log_tail))
+                if not retry or attempt == len(modes) - 1:
+                    raise error
+        finally:
+            remove_quietly(graph_file)
+        return []  # unreachable: the last mode always returns or raises
+
+    def _run_ffmpeg_once(
+        self,
+        args: List[str],
+        total_duration: float,
+        on_progress: Optional[ProgressCallback],
+        progress_range: tuple,
+        label: str,
+    ) -> Tuple[int, List[str], float]:
+        """One FFmpeg process: ``(returncode, log tail, encoded seconds)``. Raises ExportCancelled."""
         process = popen(args)
         self._process = process
         log_tail: deque = deque(maxlen=ERROR_LOG_TAIL_LINES)
         encoded_seconds = 0.0
         speed = 0.0
         try:
+            if self._cancelled:  # cancel() ran before _process was set
+                process.terminate()
+                raise ExportCancelled()
             assert process.stdout is not None
             for line in process.stdout:
                 if self._cancelled:
@@ -1016,18 +1074,14 @@ class Exporter:
         finally:
             if process.stdout:
                 process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
             self._process = None
 
         if self._cancelled:
             raise ExportCancelled()
-
-        if process.returncode != 0:
-            raise ExportError(
-                f"FFmpeg exited with code {process.returncode} ({label}).",
-                log_tail=list(log_tail),
-                encoded_seconds=encoded_seconds,
-            )
-        return list(log_tail)
+        return process.returncode, list(log_tail), encoded_seconds
 
 
 def progress_message(

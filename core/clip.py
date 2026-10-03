@@ -149,6 +149,14 @@ def _step_value(keyframes, t: float) -> Tuple[float, ...]:
     return value
 
 
+def _non_negative(value: Any) -> float:
+    """A saved float that must be >= 0 (a bad or negative value becomes 0)."""
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _rebase_keyframes(keyframes, shift: float, step: bool = False) -> list:
     """Keyframes re-based so time ``shift`` becomes 0 (fewer than 2 = not animated: unchanged).
 
@@ -189,6 +197,8 @@ class Clip:
     volume: float = 1.0
     muted: bool = False
     speed: float = 1.0
+    reverse: bool = False
+    freeze_frame_duration: float = 0.0
 
     # Audio noise reduction, via FFmpeg's `afftdn` filter. Disabled (False)
     # by default so an unedited clip never emits the filter, matching the
@@ -367,9 +377,15 @@ class Clip:
     def duration(self) -> float:
         """Length of the clip as it appears on the timeline (seconds)."""
         if len(self.speed_keyframes) >= 2:
-            return sum((seg_out - seg_in) / seg_speed for seg_in, seg_out, seg_speed in self.speed_segments)
+            base = sum((seg_out - seg_in) / seg_speed for seg_in, seg_out, seg_speed in self.speed_segments)
+            return base + max(0.0, self.freeze_frame_duration)
         speed = self.speed if self.speed > 0 else 1.0
-        return self.source_length / speed
+        return (self.source_length / speed) + max(0.0, self.freeze_frame_duration)
+
+    @property
+    def playable_duration(self) -> float:
+        """Timeline duration before any freeze-frame extension."""
+        return max(0.0, self.duration - max(0.0, self.freeze_frame_duration))
 
     def source_offset_at(self, timeline_offset: float) -> float:
         """Source seconds (from ``source_in``) on screen ``timeline_offset`` seconds into the clip.
@@ -379,6 +395,11 @@ class Clip:
         clip's end it extrapolates at the last segment's speed -- what
         extending the clip's right edge would show.
         """
+        # A freeze frame holds the last source frame for its extra time. Only
+        # then is the mapping clamped: without one, offsets past the end must
+        # keep extrapolating (roll/slide/ripple trims rely on it).
+        if self.freeze_frame_duration > 0 and timeline_offset >= self.playable_duration:
+            return self.source_length
         if len(self.speed_keyframes) < 2:
             return timeline_offset * (self.speed if self.speed > 0 else 1.0)
         elapsed = 0.0
@@ -390,6 +411,102 @@ class Clip:
             elapsed += seg_len
         last_in, last_out, last_speed = segments[-1]
         return (last_out - self.source_in) + (timeline_offset - elapsed) * last_speed
+
+    # -- playback order (reverse) ------------------------------------------
+    # A reversed clip plays its trimmed source range [source_in, source_out]
+    # backwards: its first frame is the one at ``source_out``, its last the
+    # one at ``source_in``, and with a speed ramp the segments play in
+    # reverse order, each at its own speed (exactly what
+    # core/filter_graph.py renders). "Consumed" source time below is counted
+    # in playback order: from ``source_in`` for a forward clip, back from
+    # ``source_out`` for a reversed one. Both helpers extrapolate past either
+    # end at the nearest segment's speed, like :meth:`source_offset_at`.
+    def _play_segments(self) -> List[Tuple[float, float]]:
+        """``(source seconds, speed)`` of each speed segment, in playback order."""
+        segments = [(seg_out - seg_in, seg_speed) for seg_in, seg_out, seg_speed in self.speed_segments]
+        return segments[::-1] if self.reverse else segments
+
+    def playback_source_consumed(self, timeline_offset: float) -> float:
+        """Source seconds played (in playback order) ``timeline_offset`` seconds into the clip.
+
+        Ignores the freeze-frame tail: past the playable part it keeps
+        extrapolating, which is what extending an edge would show.
+        """
+        segments = self._play_segments()
+        if timeline_offset <= 0:
+            return timeline_offset * segments[0][1]
+        elapsed = consumed = 0.0
+        for length, speed in segments:
+            seg_time = length / speed
+            if timeline_offset <= elapsed + seg_time:
+                return consumed + (timeline_offset - elapsed) * speed
+            elapsed += seg_time
+            consumed += length
+        return consumed + (timeline_offset - elapsed) * segments[-1][1]
+
+    def playback_timeline_offset(self, consumed: float) -> float:
+        """Inverse of :meth:`playback_source_consumed`."""
+        segments = self._play_segments()
+        if consumed <= 0:
+            return consumed / segments[0][1]
+        elapsed = total = 0.0
+        for length, speed in segments:
+            if consumed <= total + length:
+                return elapsed + (consumed - total) / speed
+            elapsed += length / speed
+            total += length
+        return elapsed + (consumed - total) / segments[-1][1]
+
+    def source_time_at(self, timeline_offset: float) -> float:
+        """Absolute source seconds shown ``timeline_offset`` seconds into the clip.
+
+        Honours reverse (counts back from ``source_out``) and the freeze
+        frame (holds the last shown frame), and is clamped to the clip's own
+        trim. What the preview seeks to and the level meters read.
+        """
+        local = min(max(0.0, timeline_offset), self.playable_duration)
+        consumed = min(max(0.0, self.playback_source_consumed(local)), self.source_length)
+        return self.source_out - consumed if self.reverse else self.source_in + consumed
+
+    def in_freeze_frame(self, timeline_offset: float) -> bool:
+        """Whether ``timeline_offset`` (clip-local) falls in the freeze-frame tail."""
+        return self.freeze_frame_duration > 0 and timeline_offset >= self.playable_duration - 1e-9
+
+    def trim_left_range(self, delta: float) -> Tuple[float, float]:
+        """``(source_in, source_out)`` after moving the left (playback-start) edge ``delta`` timeline seconds right.
+
+        A negative ``delta`` extends the clip. Not clamped to the media; the
+        freeze frame (a right-edge tail) is unaffected. On a reversed clip
+        the left edge is the ``source_out`` end.
+        """
+        consumed = self.playback_source_consumed(delta)
+        if self.reverse:
+            return self.source_in, self.source_out - consumed
+        return self.source_in + consumed, self.source_out
+
+    def trim_right_range(self, new_length: float) -> Tuple[float, float, float]:
+        """``(source_in, source_out, freeze_frame_duration)`` for a new timeline length.
+
+        The right edge eats into (or grows) the freeze-frame tail first; only
+        once that is gone does it trim the footage itself (the freeze is then
+        0). On a reversed clip the right edge is the ``source_in`` end. Not
+        clamped to the media.
+        """
+        playable = self.playable_duration
+        if self.freeze_frame_duration > 0 and new_length >= playable - 1e-9:
+            return self.source_in, self.source_out, max(0.0, new_length - playable)
+        consumed = self.playback_source_consumed(new_length)
+        if self.reverse:
+            return self.source_out - consumed, self.source_out, 0.0
+        return self.source_in, self.source_in + consumed, 0.0
+
+    @property
+    def is_reversed(self) -> bool:
+        return self.reverse
+
+    @property
+    def has_freeze_frame(self) -> bool:
+        return self.freeze_frame_duration > 0
 
     def timeline_offset_at(self, source_offset: float) -> float:
         """Inverse of :meth:`source_offset_at`: clip-local timeline seconds showing ``source_offset``."""
@@ -438,8 +555,15 @@ class Clip:
         probe.source_in, probe.source_out = source_in, source_out
         source_shift = source_in - self.source_in
         if abs(source_shift) > 1e-9:
-            timeline_shift = self.timeline_offset_at(source_shift)
             probe.speed_keyframes = _rebase_keyframes(self.speed_keyframes, source_shift, step=True)
+        # Timeline keyframes follow whatever end the clip *starts playing*
+        # from: source_in normally, source_out on a reversed clip.
+        if self.reverse:
+            start_shift = self.source_out - source_out
+            timeline_shift = self.playback_timeline_offset(start_shift) if abs(start_shift) > 1e-9 else 0.0
+        else:
+            timeline_shift = self.timeline_offset_at(source_shift) if abs(source_shift) > 1e-9 else 0.0
+        if abs(timeline_shift) > 1e-9:
             probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift)
             probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift)
             probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift)
@@ -518,6 +642,8 @@ class Clip:
             "volume": self.volume,
             "muted": self.muted,
             "speed": self.speed,
+            "reverse": self.reverse,
+            "freeze_frame_duration": self.freeze_frame_duration,
             "denoise_enabled": self.denoise_enabled,
             "denoise_strength": self.denoise_strength,
             "opacity": self.opacity,
@@ -577,6 +703,9 @@ class Clip:
             volume=data.get("volume", 1.0),
             muted=data.get("muted", False),
             speed=data.get("speed", 1.0),
+            # Added without a format bump: absent (older files) = off.
+            reverse=bool(data.get("reverse", False)),
+            freeze_frame_duration=_non_negative(data.get("freeze_frame_duration", 0.0)),
             denoise_enabled=data.get("denoise_enabled", False),
             denoise_strength=data.get("denoise_strength", 12.0),
             opacity=data.get("opacity", 1.0),

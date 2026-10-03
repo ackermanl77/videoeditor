@@ -27,6 +27,7 @@ class MediaAsset:
     has_video: bool = False
     has_audio: bool = False
     thumbnail_path: Optional[str] = None
+    filmstrip_path: Optional[str] = None
     waveform_path: Optional[str] = None
     codec: str = ""
     # Colour description of the video stream, from ffprobe (empty = unknown).

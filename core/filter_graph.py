@@ -580,14 +580,7 @@ def _register_video_input(
     its end even though the graph kept only the clip's own trim.
     """
     idx = len(input_specs)
-    speed = clip.speed if clip.speed > 0 else 1.0
-    head = window.head(clip.timeline_start) if window is not None else 0.0
-    local_end = window.local_end(clip.timeline_start, clip.duration) if window is not None else clip.duration
-    if head <= 0 and local_end >= clip.duration:
-        source_in, source_length = clip.source_in, clip.source_length
-    else:
-        source_in = clip.source_in + head * speed
-        source_length = max(0.0, (local_end - head) * speed)
+    head, source_in, source_length = _clip_source_slice(clip, window, fps)
     if clip.media_type == MediaType.IMAGE:
         pre_args = ["-loop", "1", "-framerate", str(fps), "-t", f"{source_length:.3f}"]
     else:
@@ -597,6 +590,45 @@ def _register_video_input(
         ]
     input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
     return _InputSlice(index=idx, head=head, source_length=source_length)
+
+
+def _clip_source_slice(clip: Clip, window: Optional[_Window], fps: float) -> Tuple[float, float, float]:
+    """``(head, source_start, source_length)``: the part of a constant-speed clip's source a window needs.
+
+    ``head`` is the clip-local time of the slice's first frame. It equals
+    the window's own head except when the window starts inside the clip's
+    freeze-frame tail: the slice then backs up to the clip's last frame (one
+    frame's worth of source), which the freeze (``tpad``) holds, and the
+    caller trims to the window afterwards (see :func:`_slice_is_exact`). A
+    reversed clip plays ``source_out`` -> ``source_in``, so its slice is
+    mirrored: clip-local ``[h, e]`` reads source ``[out - e*speed, out - h*speed]``.
+    """
+    speed = clip.speed if clip.speed > 0 else 1.0
+    head = window.head(clip.timeline_start) if window is not None else 0.0
+    local_end = window.local_end(clip.timeline_start, clip.duration) if window is not None else clip.duration
+    if head <= 0 and local_end >= clip.duration:
+        return 0.0, clip.source_in, clip.source_length
+    playable = clip.playable_duration
+    end = min(local_end, playable)
+    head = min(head, playable)
+    if end - head <= 1e-9:  # the window starts in the freeze-frame tail
+        head = max(0.0, playable - 1.0 / (fps if fps > 0 else 30.0))
+        end = playable
+    length = max(0.0, (end - head) * speed)
+    if clip.reverse:
+        # A reversed clip's frames sit exactly on ``source_out - k/fps``, so
+        # this start is a frame time; the input's 3-decimal ``-ss`` could round
+        # it *up* past that frame and drop it. Round down instead; the
+        # ``trim`` duration counts from the first frame kept, so ``length``
+        # stays as it is.
+        start = clip.source_out - end * speed
+        return head, math.floor(start * 1000.0 + 1e-6) / 1000.0, length
+    return head, clip.source_in + head * speed, length
+
+
+def _slice_is_exact(clip: Clip, window: _Window, slice_head: float) -> bool:
+    """Whether a seeked slice starts exactly at the window's start (else it is trimmed afterwards)."""
+    return abs(slice_head - window.head(clip.timeline_start)) <= 1e-9
 
 
 def _build_video_clip_chain(
@@ -644,6 +676,8 @@ def _build_video_clip_chain(
         # clips are never seeked into, see _needs_full_decode).
         if head <= 0:
             chain += _stabilize_filters(clip, clip.source_in, length, ctx)
+        if clip.reverse:
+            chain += ",reverse"
 
     speed = clip.speed if clip.speed > 0 else 1.0
     if abs(speed - 1.0) > 1e-6:
@@ -681,6 +715,10 @@ def _video_fade_and_opacity_suffix(clip: Clip, skip_fade_in: bool = False, skip_
     """
     suffix = ""
     clip_len = clip.duration
+    # The freeze frame comes first, so fades and opacity animation reach
+    # into the held frame exactly as they would on footage.
+    if clip.freeze_frame_duration > 0:
+        suffix += f",tpad=stop_mode=clone:stop_duration={clip.freeze_frame_duration:.3f}"
     if clip.fade_in > 0 and not skip_fade_in:
         suffix += f",fade=t=in:st=0:d={clip.fade_in:.3f}:alpha=1"
     if clip.fade_out > 0 and not skip_fade_out:
@@ -756,9 +794,12 @@ def _build_speed_ramp_video_chain(
     seg_labels: List[str] = []
     segment_specs = _register_speed_ramp_inputs(clip, input_specs)
     t_offset = 0.0  # clip-local time of this segment's first frame (animated effects)
-    for i, (idx, seg_in, seg_out, seg_speed) in enumerate(segment_specs):
+    ordered_specs = list(reversed(segment_specs)) if clip.reverse else list(segment_specs)
+    for i, (idx, seg_in, seg_out, seg_speed) in enumerate(ordered_specs):
         seg_chain = f"[{idx}:v]trim=duration={(seg_out - seg_in):.3f},setpts=PTS-STARTPTS"
         seg_chain += _stabilize_filters(clip, seg_in, seg_out - seg_in, ctx)
+        if clip.reverse:
+            seg_chain += ",reverse"
         if abs(seg_speed - 1.0) > 1e-6:
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
         seg_chain += _source_color_filters(asset, ctx.color)
@@ -807,8 +848,11 @@ def _maybe_add_speed_ramped_audio(
         return
 
     seg_labels = []
-    for i, (idx, seg_in, seg_out, seg_speed) in enumerate(segment_specs):
+    ordered_specs = list(reversed(segment_specs)) if clip.reverse else list(segment_specs)
+    for i, (idx, seg_in, seg_out, seg_speed) in enumerate(ordered_specs):
         seg_chain = f"[{idx}:a]atrim=duration={(seg_out - seg_in):.3f},asetpts=PTS-STARTPTS"
+        if clip.reverse:
+            seg_chain += ",areverse"
         if abs(seg_speed - 1.0) > 1e-6:
             for f in _atempo_chain(seg_speed):
                 seg_chain += f",{f}"
@@ -826,7 +870,9 @@ def _maybe_add_speed_ramped_audio(
     tail = f",{_audio_format_filter(sample_rate)}"
     if clip.has_denoise:
         tail += f",afftdn=nr={clip.denoise_strength:.3f}"
-    clip_len = clip.duration
+    # The freeze-frame tail is silent (the audio simply ends there), so the
+    # fade-out ends where the sound does instead of inside the silence.
+    clip_len = clip.playable_duration
     if clip.fade_in > 0:
         tail += "," + _afade("in", 0.0, clip.fade_in)
     if clip.fade_out > 0:
@@ -1131,9 +1177,10 @@ def build_filter_graph(
                         source.index, clip, width, height, head=source.head, source_length=source.source_length,
                         asset=project.asset_for_clip(clip), ctx=ctx,
                     )
+                    exact = not full and _slice_is_exact(clip, window, source.head)
                     placement = _video_placement(
-                        clip.timeline_start, window.head(clip.timeline_start) if full else source.head, window,
-                        seeked=not full,
+                        clip.timeline_start, source.head if exact else window.head(clip.timeline_start), window,
+                        seeked=exact,
                     )
                     if placement:
                         chain += f",{placement}"
@@ -1146,11 +1193,12 @@ def build_filter_graph(
                     if source is None:
                         source = _register_video_input(clip, fps, input_specs, input_window)
                     _before = len(audio_labels)
+                    exact = not full and _slice_is_exact(clip, window, source.head)
                     _maybe_add_audio(
                         project, clip, source.index, filter_lines, audio_labels, clip_counter, probe_cache,
-                        window=window, head=window.head(clip.timeline_start) if full else source.head,
-                        source_length=None if full else source.source_length, seeked=not full,
-                        sample_rate=sample_rate,
+                        window=window, head=source.head if exact else window.head(clip.timeline_start),
+                        source_length=None if full else source.source_length, seeked=exact,
+                        sample_rate=sample_rate, input_head=None if full else source.head,
                     )
                     audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
                 clip_counter += 1
@@ -1315,21 +1363,15 @@ def build_filter_graph(
                 audio_labels_by_track.setdefault(track.id, []).append(label)
                 clip_counter += 1
                 continue
-            speed = clip.speed if clip.speed > 0 else 1.0
-            head = window.head(clip.timeline_start)
-            local_end = window.local_end(clip.timeline_start, clip.duration)
-            if head <= 0 and local_end >= clip.duration:
-                source_in, source_length = clip.source_in, clip.source_length
-            else:
-                source_in = clip.source_in + head * speed
-                source_length = max(0.0, (local_end - head) * speed)
+            slice_head, source_in, source_length = _clip_source_slice(clip, window, fps)
+            exact = _slice_is_exact(clip, window, slice_head)
             idx = len(input_specs)
             pre_args = ["-ss", f"{max(0.0, source_in):.3f}", "-t", f"{source_length + INPUT_DURATION_MARGIN:.3f}"]
             input_specs.append(InputSpec(pre_args=pre_args, path=clip.source_path))
             label = _build_audio_chain(
                 idx, clip, filter_lines, clip_counter,
-                window=window, head=head, source_length=source_length, seeked=True,
-                sample_rate=sample_rate,
+                window=window, head=slice_head if exact else window.head(clip.timeline_start),
+                source_length=source_length, seeked=exact, sample_rate=sample_rate, input_head=slice_head,
             )
             audio_labels.append(label)
             audio_labels_by_track.setdefault(track.id, []).append(label)
@@ -1438,6 +1480,7 @@ def _maybe_add_audio(
     sample_rate: int = 48000,
     curve_in: str = "",
     curve_out: str = "",
+    input_head: Optional[float] = None,
 ) -> None:
     """Append clip's audio chain to ``audio_labels`` if it's actually audible.
 
@@ -1452,7 +1495,7 @@ def _maybe_add_audio(
         _build_audio_chain(
             input_index, clip, filter_lines, counter,
             window=window, head=head, source_length=source_length, seeked=seeked,
-            sample_rate=sample_rate, curve_in=curve_in, curve_out=curve_out,
+            sample_rate=sample_rate, curve_in=curve_in, curve_out=curve_out, input_head=input_head,
         )
     )
 
@@ -1507,6 +1550,7 @@ def _build_audio_chain(
     sample_rate: int = 48000,
     curve_in: str = "",
     curve_out: str = "",
+    input_head: Optional[float] = None,
 ) -> str:
     """A clip's audio chain, placed on the output timeline, ending in ``[a<counter>]``.
 
@@ -1518,10 +1562,18 @@ def _build_audio_chain(
     seconds); its samples are re-stamped to clip-local time so the fades
     below land where they would for the whole clip. ``seeked=False`` inputs
     start at the clip's own start and are trimmed by ``head`` afterwards.
+
+    ``input_head`` (clip-local time of the input's first sample) is given
+    for a seeked slice that does *not* start at the window (one starting in
+    the freeze-frame tail, see ``_clip_source_slice``): its samples are
+    stamped at ``input_head`` and the unseeked trim to ``head`` follows.
     """
     label = f"a{counter}"
-    length = clip.source_length if source_length is None or not seeked else source_length
+    length = clip.source_length if source_length is None else source_length
+    stamp = head if seeked else (input_head or 0.0)
     chain = f"[{input_index}:a]atrim=duration={length:.3f},asetpts=PTS-STARTPTS,{_audio_format_filter(sample_rate)}"
+    if clip.reverse:
+        chain += ",areverse"
 
     speed = clip.speed if clip.speed > 0 else 1.0
     if abs(speed - 1.0) > 1e-6:
@@ -1533,13 +1585,15 @@ def _build_audio_chain(
     if clip.has_denoise:
         chain += f",afftdn=nr={clip.denoise_strength:.3f}"
 
-    if seeked and head > 0:
-        chain += f",asetpts=PTS+{head:.6f}/TB"
+    if stamp > 0:
+        chain += f",asetpts=PTS+{stamp:.6f}/TB"
 
     # Fade in/out apply to a clip's audio too, not just its video alpha —
     # otherwise the Properties panel's Fade sliders silently do nothing for
     # an audio-only clip (and don't duck a video clip's own audio either).
-    clip_len = clip.duration
+    # The freeze-frame tail is silent (the audio just ends), so the fade-out
+    # ends where the sound does rather than inside that silence.
+    clip_len = clip.playable_duration
     if clip.fade_in > 0:
         chain += "," + _afade("in", 0.0, clip.fade_in, curve_in)
     if clip.fade_out > 0:

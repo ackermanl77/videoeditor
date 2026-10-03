@@ -10,3 +10,6 @@ bin/
 *.vproj~
 .DS_Store
 .build-venv/
+
+# Ajustes locales del editor
+.vscode/

@@ -11,14 +11,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 #: Default timeout (seconds) for :func:`run`/:func:`run_binary`. ffprobe,
 #: thumbnail and waveform calls used to have none, so a damaged file or a
 #: stalled network share could hang an import (or the export-time probe)
 #: forever. Callers with legitimately longer work pass their own ``timeout``.
 DEFAULT_TIMEOUT_S = 60.0
+DECODE_HWACCEL_ENV = "VIDEO_EDITOR_HWACCEL"
 
 # When PyInstaller bundles the app, sys._MEIPASS points at the extracted
 # runtime directory. We look there first so a bundled ffmpeg/ffprobe binary
@@ -189,6 +191,117 @@ def binary_version(tool: str) -> str:
         return ""
     lines = (result.stdout or "").strip().splitlines()
     return lines[0] if lines else ""
+
+
+def decode_hwaccel_modes() -> List[Optional[str]]:
+    """FFmpeg ``-hwaccel`` modes to try for a video decode, in order, ending in ``None`` (software).
+
+    Opt-in through the ``VIDEO_EDITOR_HWACCEL`` environment variable:
+    unset/``off`` (the default) = software only; ``auto``/``on`` = D3D11VA
+    then CUDA on Windows (CUDA elsewhere); ``d3d11va`` or ``cuda`` = just
+    that one. The last entry is always ``None``: plain software decoding,
+    exactly what runs with the setting off, so a failing GPU decoder can
+    never make a job fail that would have worked without it. An
+    unrecognised value means off.
+    """
+    raw = (os.environ.get(DECODE_HWACCEL_ENV) or "off").strip().lower()
+    if raw in ("d3d11", "d3d11va"):
+        return ["d3d11va", None]
+    if raw == "cuda":
+        return ["cuda", None]
+    if raw in ("1", "on", "true", "auto"):
+        modes: List[Optional[str]] = ["d3d11va", "cuda"] if sys.platform.startswith("win") else ["cuda"]
+        return modes + [None]
+    return [None]
+
+
+def decode_hwaccel_setting() -> str:
+    """Human-readable decode setting for the self-test / About box, e.g. ``"auto (d3d11va, cuda, software)"``."""
+    modes = decode_hwaccel_modes()
+    if modes == [None]:
+        return "software (set VIDEO_EDITOR_HWACCEL=auto to try GPU decoding)"
+    return "GPU first: " + ", ".join(m or "software" for m in modes)
+
+
+def apply_decode_hwaccel(args: List[str], mode: Optional[str]) -> List[str]:
+    """Return ``args`` with ``-hwaccel <mode>`` before every ``-i`` (a copy; ``mode`` None = unchanged).
+
+    ``-hwaccel`` is a per-input option: placed once after the executable it
+    only reached the first input. Inputs FFmpeg can't hardware-decode
+    (lavfi sources, PNG/JPEG stills, audio-only files) just decode in
+    software as before; frames are downloaded to system memory, so every
+    software filter in the graph keeps working unchanged.
+    """
+    if not mode:
+        return list(args)
+    out: List[str] = []
+    for i, arg in enumerate(args):
+        if arg == "-i" and i > 0 and not _is_lavfi_input(args, i):
+            out += ["-hwaccel", mode]
+        out.append(arg)
+    return out
+
+
+def _is_lavfi_input(args: List[str], i_index: int) -> bool:
+    """Whether the ``-i`` at ``i_index`` is a ``-f lavfi`` generator (nothing to decode)."""
+    j = i_index - 1
+    while j > 0 and args[j] != "-i":
+        if args[j - 1] == "-f" and args[j] == "lavfi":
+            return True
+        j -= 1
+    return False
+
+
+#: FFmpeg log text that marks a failure of the *hardware decoder* (device
+#: creation, unsupported surface, hwaccel init) -- worth one more attempt with
+#: the next decode mode even after some output was written.
+_HWDECODE_FAILURE_MARKERS = (
+    "hwaccel", "d3d11va", "dxva", "hardware device", "device creation", "hw_frames",
+    "no device available for decoder", "cuvid", "failed setup for format",
+)
+
+
+def is_hw_decode_failure(log_lines: List[str]) -> bool:
+    """Whether a failed FFmpeg run's log points at the hardware decoder (not the encoder or the media)."""
+    text = " ".join(log_lines).lower()
+    if "nvenc" in text or "openencodesession" in text:
+        return False  # the GPU *encoder* failed: the exporter's NVENC -> CPU fallback handles it
+    return any(marker in text for marker in _HWDECODE_FAILURE_MARKERS)
+
+
+#: Longest ``-filter_complex`` value passed on the command line. Windows
+#: caps a whole command line at 32,767 characters; a timeline with a few
+#: hundred text clips (an imported subtitle file) easily builds a longer
+#: graph, and CreateProcess then fails outright.
+MAX_INLINE_FILTER_CHARS = 8000
+
+
+def externalize_filter_graph(args: List[str], max_inline: int = MAX_INLINE_FILTER_CHARS) -> Tuple[List[str], Optional[str]]:
+    """Move an over-long ``-filter_complex`` value into a temp file (``-/filter_complex <file>``).
+
+    Returns ``(args, temp_path)``; ``temp_path`` is None when nothing was
+    moved, otherwise the caller deletes it once FFmpeg has exited. FFmpeg 7+
+    reads any option's value from a file with the ``-/option`` form.
+    """
+    try:
+        i = args.index("-filter_complex")
+    except ValueError:
+        return list(args), None
+    if i + 1 >= len(args) or len(args[i + 1]) <= max_inline:
+        return list(args), None
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ve_graph_")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(args[i + 1])
+    return args[:i] + ["-/filter_complex", path] + args[i + 2:], path
+
+
+def remove_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def run(args: List[str], **kwargs) -> subprocess.CompletedProcess:

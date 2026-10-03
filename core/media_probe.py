@@ -1,4 +1,4 @@
-"""Media inspection: probing files with ffprobe and generating thumbnails."""
+"""Media inspection: probing files plus generating cached timeline artwork."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import re
 import subprocess
 from typing import Optional
 
-from core.ffmpeg_utils import find_binary, run
+from core.ffmpeg_utils import apply_decode_hwaccel, decode_hwaccel_modes, find_binary, run
 from core.media_asset import MediaAsset
 
 # Extensions ffprobe would otherwise report as a single-frame "video" stream
@@ -18,6 +18,8 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", "
 
 PROBE_TIMEOUT_S = 30.0
 THUMBNAIL_TIMEOUT_S = 30.0
+FILMSTRIP_TIMEOUT_S = 45.0
+FILMSTRIP_FRAMES = 8
 
 
 class MediaProbeError(Exception):
@@ -208,11 +210,63 @@ def generate_thumbnail(path: str, cache_dir: str, timestamp: float = 1.0) -> Opt
     if not is_image:
         args += ["-ss", str(max(0.0, timestamp))]
     args += ["-i", path, "-frames:v", "1", "-vf", "scale=320:-1", out_path]
+    return _run_image_job(args, out_path, THUMBNAIL_TIMEOUT_S)
+
+
+def _run_image_job(args, out_path: str, timeout: float) -> Optional[str]:
+    """Run an FFmpeg still-image job, GPU decode modes first when enabled; ``out_path`` or None.
+
+    A failed attempt's (possibly truncated) image is deleted, so a later
+    call can't find it in the cache and hand back a broken picture.
+    """
+    for mode in decode_hwaccel_modes():
+        try:
+            result = run(apply_decode_hwaccel(args, mode), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0 and os.path.exists(out_path):
+            return out_path
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    return None
+
+
+def generate_filmstrip(path: str, cache_dir: str, duration: float = 0.0, frames: int = FILMSTRIP_FRAMES) -> Optional[str]:
+    """Extract a horizontal strip of thumbnail frames for timeline clips."""
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    key = hashlib.sha1(f"{path}:{mtime}:filmstrip:{duration}:{frames}".encode("utf-8")).hexdigest()
+    out_path = os.path.join(cache_dir, f"{key}.jpg")
+    if os.path.exists(out_path):
+        return out_path
 
     try:
-        result = run(args, timeout=THUMBNAIL_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+        ffmpeg = find_binary("ffmpeg")
+    except FileNotFoundError:
         return None
-    if result.returncode != 0 or not os.path.exists(out_path):
-        return None
-    return out_path
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        return generate_thumbnail(path, cache_dir, 0.0)
+
+    if duration <= 0:
+        duration = 1.0
+    fps = max(0.25, frames / max(duration, 1.0))
+    args = [
+        ffmpeg,
+        "-y",
+        "-i",
+        path,
+        "-frames:v",
+        str(frames),
+        "-vf",
+        f"fps={fps:.6f},scale=96:54:force_original_aspect_ratio=decrease,"
+        f"pad=96:54:(ow-iw)/2:(oh-ih)/2:color=black,tile={frames}x1",
+        out_path,
+    ]
+    return _run_image_job(args, out_path, FILMSTRIP_TIMEOUT_S)

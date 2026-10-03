@@ -26,7 +26,7 @@ from core import __version__
 REQUIRED_FILTERS = (
     "drawtext", "xfade", "overlay", "amix", "alimiter", "loudnorm", "sidechaincompress", "afftdn",
     "colorkey", "chromakey", "despill", "zscale", "tonemap", "lut3d", "unsharp", "gblur", "vignette", "hqdn3d",
-    "eq", "setparams", "vidstabdetect", "vidstabtransform",
+    "eq", "setparams", "vidstabdetect", "vidstabtransform", "reverse", "areverse", "tpad",
 )
 REPORT_NAME = "VideoEditor-selftest.txt"
 
@@ -90,12 +90,13 @@ def run_self_test(out: Callable[[str], None] = print) -> int:
     log(f"Python {sys.version.split()[0]} ({'frozen' if getattr(sys, 'frozen', False) else 'source'})")
     workdir = tempfile.mkdtemp(prefix="ve_selftest_")
     try:
-        from core.ffmpeg_utils import binary_version, find_binary, nvenc_available
+        from core.ffmpeg_utils import binary_version, decode_hwaccel_setting, find_binary, nvenc_available
 
         ffmpeg, ffprobe = find_binary("ffmpeg"), find_binary("ffprobe")
         log(f"ok    ffmpeg:  {ffmpeg}  ({binary_version('ffmpeg') or 'version unknown'})")
         log(f"ok    ffprobe: {ffprobe}  ({binary_version('ffprobe') or 'version unknown'})")
         log(f"info  NVENC available: {'yes' if nvenc_available() else 'no'}")
+        log(f"info  video decoding: {decode_hwaccel_setting()}")
         missing = _filters_available(ffmpeg)
         if missing:
             ok = False

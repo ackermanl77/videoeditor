@@ -107,7 +107,9 @@ class TrimClipCommand(Command):
         source_in: float,
         source_out: float,
         timeline_start: float,
+        freeze_frame_duration: Optional[float] = None,
     ):
+        """``freeze_frame_duration`` None keeps the clip's freeze frame as it is."""
         self.project = project
         self.clip_id = clip_id
         clip = project.find_clip(clip_id)
@@ -116,12 +118,14 @@ class TrimClipCommand(Command):
             # Keyframes re-based with the trim (see Clip.with_source_range).
             trimmed = clip.with_source_range(source_in, source_out)
             trimmed.timeline_start = timeline_start
+            if freeze_frame_duration is not None:
+                trimmed.freeze_frame_duration = max(0.0, freeze_frame_duration)
             self.new_values = self._snapshot(trimmed)
         else:
             self.new_values = None
         self.label = "Trim Clip"
 
-    _FIELDS = ("source_in", "source_out", "timeline_start", "speed_keyframes",
+    _FIELDS = ("source_in", "source_out", "timeline_start", "freeze_frame_duration", "speed_keyframes",
                "opacity_keyframes", "position_keyframes", "volume_keyframes")
 
     @classmethod
@@ -165,23 +169,34 @@ class SplitClipCommand(Command):
             return
         if not (clip.timeline_start < self.split_time < clip.timeline_end):
             return  # split point outside clip; no-op
+        offset_in_timeline = self.split_time - clip.timeline_start
+        if clip.in_freeze_frame(offset_in_timeline):
+            # Inside the freeze-frame tail there is no footage left to give
+            # the second half; trim the freeze (drag the right edge) instead.
+            return
 
         self._original_snapshot = clip.copy()
 
-        offset_in_timeline = self.split_time - clip.timeline_start
-        offset_in_source = _source_offset_at(clip, offset_in_timeline)
+        # Source seconds from source_in at the cut. A reversed clip plays
+        # source_out -> source_in, so its first half keeps the *end* of the
+        # source range and the second half the start.
+        consumed = min(max(0.0, clip.playback_source_consumed(offset_in_timeline)), clip.source_length)
+        offset_in_source = clip.source_length - consumed if clip.reverse else consumed
 
         second = clip.copy()
         second.id = self._new_clip_id
-        second.source_in = clip.source_in + offset_in_source
         second.timeline_start = self.split_time
+        # The freeze frame belongs to the clip's end: only the second half keeps it.
+        clip_freeze = clip.freeze_frame_duration
+        clip.freeze_frame_duration = 0.0
+        second.freeze_frame_duration = clip_freeze
         second.fade_in = 0.0
         # Opacity/position keyframe times are clip-relative timeline seconds;
         # speed keyframe times are source_in-relative source seconds. Each
         # half keeps only its own side of the split, re-based to its own
         # start, with a keyframe added exactly at the cut so the animated
         # value (or speed) in effect there carries on unchanged.
-        tail_timeline = clip.duration - offset_in_timeline
+        tail_timeline = clip.duration + clip_freeze - offset_in_timeline
         second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline)
         second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline)
         second.volume_keyframes = _keyframes_after(clip.volume_keyframes, offset_in_timeline, tail_timeline)
@@ -189,10 +204,19 @@ class SplitClipCommand(Command):
             e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline))
             for e in clip.effects
         ]
-        _apply_speed_keyframes(second, _speed_keyframes_after(clip.speed_keyframes, offset_in_source))
-
-        first_speed_keyframes = _speed_keyframes_before(clip.speed_keyframes, offset_in_source)
-        clip.source_out = clip.source_in + offset_in_source
+        keys_before = _speed_keyframes_before(clip.speed_keyframes, offset_in_source)
+        keys_after = _speed_keyframes_after(clip.speed_keyframes, offset_in_source)
+        cut = clip.source_in + offset_in_source
+        if clip.reverse:
+            second.source_out = cut
+            _apply_speed_keyframes(second, keys_before)
+            first_speed_keyframes = keys_after
+            clip.source_in = cut
+        else:
+            second.source_in = cut
+            _apply_speed_keyframes(second, keys_after)
+            first_speed_keyframes = keys_before
+            clip.source_out = cut
         clip.fade_out = 0.0
         clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline)
         clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline)
@@ -470,6 +494,7 @@ def build_ripple_trim_command(
     source_in: float,
     source_out: float,
     timeline_start: float,
+    freeze_frame_duration: Optional[float] = None,
 ) -> Command:
     """Trim a clip and shift every later same-track clip by the resulting change in its end time.
 
@@ -482,7 +507,7 @@ def build_ripple_trim_command(
     """
     track = project.find_clip_track(clip_id)
     clip = project.find_clip(clip_id)
-    trim_cmd = TrimClipCommand(project, clip_id, source_in, source_out, timeline_start)
+    trim_cmd = TrimClipCommand(project, clip_id, source_in, source_out, timeline_start, freeze_frame_duration)
     if track is None or clip is None:
         return trim_cmd
 
@@ -490,7 +515,10 @@ def build_ripple_trim_command(
     # Clip.duration of the trimmed clip, so a speed ramp is accounted for
     # (``(out - in) / speed`` shifted later clips by the wrong amount and
     # could overlap them).
-    new_duration = clip.with_source_range(source_in, max(source_in, source_out)).duration
+    probe = clip.with_source_range(source_in, max(source_in, source_out))
+    if freeze_frame_duration is not None:
+        probe.freeze_frame_duration = max(0.0, freeze_frame_duration)
+    new_duration = probe.duration
     delta = (timeline_start + new_duration) - old_end
     if abs(delta) <= 1e-6:
         return trim_cmd
@@ -564,7 +592,7 @@ class RenameMarkerCommand(Command):
 
 # Clip attributes whose change alters Clip.duration (and so can push a clip
 # into the next one on its track).
-DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "source_in", "source_out"})
+DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "source_in", "source_out", "freeze_frame_duration"})
 
 
 def property_change_overlaps(project: Project, clip_id: str, attribute: str, new_value: Any) -> bool:

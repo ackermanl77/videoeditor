@@ -17,7 +17,14 @@ import copy
 import subprocess
 from typing import List, Optional, Tuple
 
-from core.ffmpeg_utils import find_binary, run_binary
+from core.ffmpeg_utils import (
+    apply_decode_hwaccel,
+    decode_hwaccel_modes,
+    externalize_filter_graph,
+    find_binary,
+    remove_quietly,
+    run_binary,
+)
 from core.filter_graph import build_filter_graph
 from core.project import Project, ProjectSettings
 
@@ -76,12 +83,20 @@ def render_frame(
         args, graph = build_frame_args(snapshot, t, width, height)
     except FileNotFoundError as exc:
         raise FrameRenderError(str(exc)) from exc
+    args, graph_file = externalize_filter_graph(args)
     try:
-        result = run_binary(args, timeout=timeout)
+        # GPU decode modes first when enabled, always ending in software
+        # decoding (see core.ffmpeg_utils.decode_hwaccel_modes).
+        result = None
+        for mode in decode_hwaccel_modes():
+            result = run_binary(apply_decode_hwaccel(args, mode), timeout=timeout)
+            if result.returncode == 0 and result.stdout.startswith(b"\x89PNG"):
+                break
     except subprocess.TimeoutExpired as exc:
         raise FrameRenderError(f"Rendering the frame took longer than {timeout:.0f} s.") from exc
     finally:
         graph.cleanup()
+        remove_quietly(graph_file)
     if result.returncode != 0 or not result.stdout.startswith(b"\x89PNG"):
         detail = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         raise FrameRenderError(detail[-1] if detail else "FFmpeg produced no frame.")

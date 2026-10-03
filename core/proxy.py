@@ -19,7 +19,7 @@ import os
 import subprocess
 from typing import List, Optional
 
-from core.ffmpeg_utils import find_binary, nvenc_available, run
+from core.ffmpeg_utils import apply_decode_hwaccel, decode_hwaccel_modes, find_binary, nvenc_available, run
 from core.filter_graph import _source_color_filters
 from core.media_asset import MediaAsset
 
@@ -84,15 +84,20 @@ def generate_proxy(asset: MediaAsset, cache_dir: Optional[str] = None, use_gpu: 
     partial = final_path[:-4] + ".partial.mp4"
     attempts = [True, False] if (nvenc_available() if use_gpu is None else use_gpu) else [False]
     for gpu in attempts:
-        try:
-            result = run(build_proxy_args(asset, partial, gpu), timeout=proxy_timeout(asset.duration))
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            result = None
-        if result is not None and result.returncode == 0 and os.path.isfile(partial):
-            os.replace(partial, final_path)
-            return final_path
-        try:
-            os.remove(partial)
-        except OSError:
-            pass
+        # GPU decode modes first when enabled, ending in software decoding;
+        # each attempt overwrites the same .partial file (-y) and a failed
+        # one is deleted, so only a complete encode is ever renamed into place.
+        for mode in decode_hwaccel_modes():
+            try:
+                result = run(apply_decode_hwaccel(build_proxy_args(asset, partial, gpu), mode),
+                             timeout=proxy_timeout(asset.duration))
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                result = None
+            if result is not None and result.returncode == 0 and os.path.isfile(partial):
+                os.replace(partial, final_path)
+                return final_path
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
     return None

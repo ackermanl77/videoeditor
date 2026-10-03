@@ -79,8 +79,10 @@ class LoadWaveformTests(unittest.TestCase):
         try:
             result = load_waveform(path)
             self.assertIsNotNone(result)
-            loaded_peaks, density = result
+            loaded_peaks, rms, density = result
             self.assertEqual(loaded_peaks, peaks)
+            # A cache written before RMS levels existed falls back to the peaks.
+            self.assertEqual(rms, peaks)
             self.assertEqual(density, float(PEAKS_PER_SECOND))
         finally:
             os.unlink(path)
