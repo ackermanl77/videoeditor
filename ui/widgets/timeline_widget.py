@@ -372,7 +372,9 @@ class TimelineWidget(QWidget):
         self._clip_items: Dict[str, ClipItem] = {}
         self._header_items: List[TrackHeaderItem] = []
         self._thumbnail_cache: Dict[str, QPixmap] = {}
+        self._filmstrip_cache: Dict[str, QPixmap] = {}
         self.get_thumbnail_for_clip = None  # injected callable: Clip -> Optional[QPixmap]
+        self.get_filmstrip_for_clip = None  # injected callable: Clip -> Optional[QPixmap]
         self.get_waveform_for_clip = None  # injected callable: Clip -> Optional[WaveformData]
         self.snap_enabled = True
         self.ripple_enabled = False
@@ -737,6 +739,7 @@ class TimelineWidget(QWidget):
     def _add_clip_item(self, clip: Clip, row: int, track: Optional[Track] = None,
                        offline_cache: Optional[Dict[str, bool]] = None) -> None:
         thumb = self._get_thumbnail(clip)
+        filmstrip = self._get_filmstrip(clip)
         waveform = self._get_waveform(clip)
         item = ClipItem(
             clip,
@@ -744,6 +747,7 @@ class TimelineWidget(QWidget):
             self.pixels_per_second,
             self.signals,
             thumb,
+            filmstrip=filmstrip,
             waveform=waveform,
             snap_targets_provider=self._snap_targets,
             track_name=track.name if track is not None else "",
@@ -768,6 +772,19 @@ class TimelineWidget(QWidget):
         if cached is None:
             cached = pixmap.scaledToHeight(TRACK_HEIGHT - 4, Qt.SmoothTransformation)
             self._thumbnail_cache[key] = cached
+        return cached
+
+    def _get_filmstrip(self, clip: Clip) -> Optional[QPixmap]:
+        if clip.media_type != MediaType.VIDEO or self.get_filmstrip_for_clip is None:
+            return None
+        pixmap = self.get_filmstrip_for_clip(clip)
+        if pixmap is None or pixmap.isNull():
+            return pixmap
+        key = f"{clip.source_path}|filmstrip|{pixmap.cacheKey()}"
+        cached = self._filmstrip_cache.get(key)
+        if cached is None:
+            cached = pixmap
+            self._filmstrip_cache[key] = cached
         return cached
 
     def _get_waveform(self, clip: Clip):
@@ -1159,9 +1176,7 @@ class TimelineWidget(QWidget):
     def split_selected(self) -> None:
         if self.project is None or self.history is None or self.selected_clip_id is None:
             return
-        self.history.execute(SplitClipCommand(self.project, self.selected_clip_id, self.playhead_time))
-        self.rebuild()
-        self._emit_modified()
+        self._split_clip(self.selected_clip_id, self.playhead_time)
 
     def delete_selected(self) -> None:
         if self.project is None or self.history is None:
@@ -1264,6 +1279,14 @@ class TimelineWidget(QWidget):
 
     def _on_clip_razor(self, clip_id: str, seconds: float) -> None:
         if self.project is None or self.history is None:
+            return
+        self._split_clip(clip_id, seconds)
+
+    def _split_clip(self, clip_id: str, seconds: float) -> None:
+        """Split ``clip_id`` at ``seconds`` -- refused (with a message) inside a freeze-frame tail."""
+        clip = self.project.find_clip(clip_id)
+        if clip is not None and clip.in_freeze_frame(seconds - clip.timeline_start) and seconds < clip.timeline_end:
+            self.status_message.emit("Can't split inside a freeze frame: drag the clip's right edge to shorten it.")
             return
         self.history.execute(SplitClipCommand(self.project, clip_id, seconds))
         self.rebuild()
@@ -1516,7 +1539,10 @@ class TimelineWidget(QWidget):
         self.rebuild()
         self._emit_modified()
 
-    def _on_clip_trimmed(self, clip_id: str, source_in: float, source_out: float, timeline_start: float) -> None:
+    def _on_clip_trimmed(
+        self, clip_id: str, source_in: float, source_out: float, timeline_start: float,
+        freeze_frame_duration: Optional[float] = None,
+    ) -> None:
         if self.project is None or self.history is None:
             self.rebuild()
             return
@@ -1528,6 +1554,8 @@ class TimelineWidget(QWidget):
         # A copy of the real clip (speed ramp included), not a constant-speed stand-in.
         probe = clip.with_source_range(source_in, source_out)
         probe.timeline_start = timeline_start
+        if freeze_frame_duration is not None:
+            probe.freeze_frame_duration = max(0.0, freeze_frame_duration)
         if self.ripple_enabled:
             # Clips at/after the clip's OLD end shift in lockstep with this
             # trim (see build_ripple_trim_command), so they can never newly
@@ -1538,12 +1566,14 @@ class TimelineWidget(QWidget):
             if any(probe.timeline_start < c.timeline_end and c.timeline_start < probe.timeline_end for c in stationary):
                 self.rebuild()
                 return
-            self.history.execute(build_ripple_trim_command(self.project, clip_id, source_in, source_out, timeline_start))
+            self.history.execute(build_ripple_trim_command(
+                self.project, clip_id, source_in, source_out, timeline_start, freeze_frame_duration))
         else:
             if track.has_overlap(probe, ignore_id=clip_id):
                 self.rebuild()
                 return
-            self.history.execute(TrimClipCommand(self.project, clip_id, source_in, source_out, timeline_start))
+            self.history.execute(TrimClipCommand(
+                self.project, clip_id, source_in, source_out, timeline_start, freeze_frame_duration))
         self.rebuild()
         self._emit_modified()
 

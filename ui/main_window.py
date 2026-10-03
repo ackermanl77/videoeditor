@@ -27,14 +27,16 @@ from PySide6.QtWidgets import (
 from core import __version__
 from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip
+from core.commands import AddClipCommand, AddTrackCommand
 from core.ffmpeg_utils import binary_version, encoder_supports_10bit, nvenc_available
-from core.history import History
+from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.project import Project, write_backup_copy
 from core.proxy import generate_proxy, needs_proxy
+from core.subtitles import SubtitleParseError, cues_to_text_clips, is_subtitle_path, parse_subtitle_file
 from core.timeline_nav import format_timecode
 from core.track import TrackType
-from core.waveform import load_waveform
+from core.waveform import WaveformData, load_waveform
 from ui.export_dialog import ExportDialog
 from ui.help_dialogs import ShortcutsDialog, UserGuideDialog
 from ui.import_worker import ImportWorker
@@ -49,9 +51,6 @@ APP_NAME = "Open Video Editor"
 PROJECT_FILE_FILTER = "Video Editor Project (*.vproj)"
 
 AUTOSAVE_INTERVAL_MS = 2 * 60 * 1000
-
-WaveformData = Tuple[List[float], float]
-
 
 def _cache_dir() -> str:
     path = os.path.join(os.path.expanduser("~"), ".video_editor", "thumbnails")
@@ -123,6 +122,7 @@ class MainWindow(QMainWindow):
         self._proxy_jobs: set = set()
         self._syncing_playhead = False
         self._thumb_pixmap_cache: Dict[str, QPixmap] = {}
+        self._filmstrip_pixmap_cache: Dict[str, QPixmap] = {}
         self._waveform_cache: Dict[str, Optional[WaveformData]] = {}
         self._icons_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icons")
 
@@ -242,6 +242,7 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "Save Project As...", self.save_project_as, QKeySequence.SaveAs)
         file_menu.addSeparator()
         self.import_action = self._add_action(file_menu, "Import Media...", self.import_media_dialog, "Ctrl+I", icon="import")
+        self.import_subtitles_action = self._add_action(file_menu, "Import Subtitles...", self.import_subtitles_dialog)
         self.relink_action = self._add_action(file_menu, "Relink Media...", self.open_relink_dialog)
         self.export_action = self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
         self.render_queue_action = self.render_queue_dock.toggleViewAction()
@@ -435,6 +436,7 @@ class MainWindow(QMainWindow):
         self.timeline.project_modified.connect(self._on_project_modified)
         self.timeline.playhead_changed.connect(self._on_timeline_playhead_changed)
         self.timeline.get_thumbnail_for_clip = self._thumbnail_for_clip
+        self.timeline.get_filmstrip_for_clip = self._filmstrip_for_clip
         self.timeline.get_waveform_for_clip = self._waveform_for_clip
 
         self.properties.project_modified.connect(self._on_project_modified)
@@ -449,6 +451,9 @@ class MainWindow(QMainWindow):
         self.timeline.set_project(self.project, self.history)
         self.preview.set_project(self.project)
         self.properties.set_project(self.project, self.history)
+        self.timeline.get_thumbnail_for_clip = self._thumbnail_for_clip
+        self.timeline.get_filmstrip_for_clip = self._filmstrip_for_clip
+        self.timeline.get_waveform_for_clip = self._waveform_for_clip
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self.history.clear()
         self.history.mark_clean()
@@ -480,6 +485,61 @@ class MainWindow(QMainWindow):
         if paths:
             self.import_media_paths(paths)
 
+    def import_subtitles_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Subtitles",
+            "",
+            "Subtitle Files (*.srt *.vtt);;All Files (*)",
+        )
+        if path:
+            self.import_subtitle_file(path)
+
+    def import_subtitle_file(self, path: str) -> int:
+        """Add an SRT/WebVTT file's cues as text clips on a "Subtitles" video track (one undo step).
+
+        Reuses the existing "Subtitles" track when the new cues fit on it
+        (no overlap, not locked); otherwise adds "Subtitles 2", "Subtitles 3"...
+        Returns the number of clips added (0 on an empty or unreadable file).
+        """
+        if self.history is None:
+            return 0
+        try:
+            cues = parse_subtitle_file(path)
+        except (OSError, SubtitleParseError) as exc:
+            QMessageBox.warning(self, "Import Subtitles", f"Could not read subtitles from\n{path}\n\n{exc}")
+            return 0
+        clips = cues_to_text_clips(cues)
+        if not clips:
+            self.status_bar.showMessage("No subtitle cues were found in that file.", 4000)
+            return 0
+        track = self._subtitle_track_for(clips)
+        commands = []
+        if track is None:
+            existing = sum(1 for t in self.project.tracks if t.name.startswith("Subtitles"))
+            add_track = AddTrackCommand(
+                self.project, TrackType.VIDEO, name="Subtitles" if existing == 0 else f"Subtitles {existing + 1}"
+            )
+            commands.append(add_track)
+            track_id = add_track.track_id
+        else:
+            track_id = track.id
+        commands.extend(AddClipCommand(self.project, track_id, clip) for clip in clips)
+        self.history.execute(CompositeCommand(commands, "Import Subtitles"))
+        self.timeline.rebuild()
+        self._on_project_modified()
+        self.status_bar.showMessage(f"Imported {len(clips)} subtitle cue(s).", 4000)
+        return len(clips)
+
+    def _subtitle_track_for(self, clips) -> Optional["Track"]:
+        """An existing unlocked "Subtitles..." video track all of ``clips`` fit on, else None."""
+        for track in self.project.tracks:
+            if track.track_type != TrackType.VIDEO or not track.name.startswith("Subtitles") or track.locked:
+                continue
+            if not any(track.has_overlap(clip) for clip in clips):
+                return track
+        return None
+
     def import_media_paths(self, paths) -> None:
         """Probe/thumbnail/waveform each path on a background thread.
 
@@ -489,6 +549,11 @@ class MainWindow(QMainWindow):
         on its own ``QThread``; only the final project/UI updates happen
         back on the main thread via the signal handlers below.
         """
+        # Subtitle files (dropped or picked with media) become text clips, not media.
+        paths = list(paths)
+        for path in [p for p in paths if is_subtitle_path(p)]:
+            self.import_subtitle_file(path)
+        paths = [p for p in paths if not is_subtitle_path(p)]
         new_paths = [p for p in paths if self.project.find_asset_by_path(p) is None]
         if not new_paths:
             return
@@ -529,14 +594,16 @@ class MainWindow(QMainWindow):
         if self._auto_proxies_enabled() and needs_proxy(asset):
             self.generate_proxy_for(asset.id)
 
-    def _on_asset_details(self, asset_id: str, thumbnail_path, waveform_path) -> None:
+    def _on_asset_details(self, asset_id: str, thumbnail_path, filmstrip_path, waveform_path) -> None:
         """Second import stage: a thumbnail/waveform arrived for an already-listed asset."""
         asset = self.project.find_asset(asset_id)
         if asset is None:
             return
         asset.thumbnail_path = thumbnail_path
+        asset.filmstrip_path = filmstrip_path
         asset.waveform_path = waveform_path
         self._thumb_pixmap_cache.pop(asset_id, None)
+        self._filmstrip_pixmap_cache.pop(asset_id, None)
         self._waveform_cache.pop(asset_id, None)
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self.timeline.rebuild()
@@ -579,6 +646,16 @@ class MainWindow(QMainWindow):
         if asset is None:
             return None
         return self._thumbnail_for_asset(asset)
+
+    def _filmstrip_for_clip(self, clip: Clip) -> Optional[QPixmap]:
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or not asset.filmstrip_path or not os.path.exists(asset.filmstrip_path):
+            return None
+        if asset.id in self._filmstrip_pixmap_cache:
+            return self._filmstrip_pixmap_cache[asset.id]
+        pixmap = QPixmap(asset.filmstrip_path)
+        self._filmstrip_pixmap_cache[asset.id] = pixmap
+        return pixmap
 
     def _waveform_for_clip(self, clip: Clip) -> Optional[WaveformData]:
         asset = self.project.asset_for_clip(clip)
@@ -767,6 +844,7 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
+        self._filmstrip_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
 
@@ -806,6 +884,7 @@ class MainWindow(QMainWindow):
         self.project = project
         self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
+        self._filmstrip_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
         self._report_load_problems()
@@ -891,6 +970,7 @@ class MainWindow(QMainWindow):
 
     def _on_media_relinked(self, count: int) -> None:
         self._thumb_pixmap_cache.clear()
+        self._filmstrip_pixmap_cache.clear()
         self._waveform_cache.clear()
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self.timeline._layout_key = None
@@ -988,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.project = project
         self.history = self._new_history()
         self._thumb_pixmap_cache.clear()
+        self._filmstrip_pixmap_cache.clear()
         self._waveform_cache.clear()
         self._load_project_into_panels()
         self._mark_dirty()  # recovered state doesn't exist on disk at `original_path` yet

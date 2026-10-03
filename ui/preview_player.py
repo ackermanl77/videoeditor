@@ -27,7 +27,7 @@ import threading
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -47,6 +47,7 @@ from core.frame_render import FrameRenderError, render_frame
 from core.project import Project
 from core.timeline_nav import format_timecode
 from core.track import Track, TrackType
+from core.waveform import load_waveform, window_levels
 from ui import theme
 
 POLL_INTERVAL_MS = 40
@@ -80,6 +81,7 @@ class PreviewPlayer(QWidget):
         self._shuttle_rate = 1.0
         # What the player was last loaded for (see refresh_after_edit).
         self._loaded_signature = None
+        self._waveform_cache = {}
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -134,6 +136,8 @@ class PreviewPlayer(QWidget):
         self.stack.addWidget(self.placeholder_label)
         self.stack.addWidget(self.frame_label)
         layout.addWidget(self.stack, 1)
+        self.safe_overlay = _SafeAreaOverlay(self.stack)
+        self.safe_overlay.hide()
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton()
@@ -157,6 +161,14 @@ class PreviewPlayer(QWidget):
         )
         self.accurate_checkbox.toggled.connect(self._on_accurate_toggled)
         controls.addWidget(self.accurate_checkbox)
+
+        self.safe_checkbox = QCheckBox("Safe areas")
+        self.safe_checkbox.setToolTip("Show action-safe and title-safe guides over the preview.")
+        self.safe_checkbox.toggled.connect(self._on_safe_areas_toggled)
+        controls.addWidget(self.safe_checkbox)
+
+        self.meters = _AudioLevelMeters()
+        controls.addWidget(self.meters)
 
         layout.addLayout(controls)
 
@@ -182,6 +194,7 @@ class PreviewPlayer(QWidget):
         self._current_source = None
         self._preloaded_source = None
         self._active_clip = None
+        self._waveform_cache.clear()
         self.seek_to(0.0)
 
     def media_path_for(self, clip: Clip) -> str:
@@ -288,7 +301,7 @@ class PreviewPlayer(QWidget):
             return None
         return (
             clip.id, clip.media_type, clip.source_path, clip.source_in, clip.source_out,
-            clip.timeline_start, clip.speed, tuple(clip.speed_keyframes),
+            clip.timeline_start, clip.speed, tuple(clip.speed_keyframes), clip.reverse, clip.freeze_frame_duration,
             clip.text_style.content if clip.text_style else None, self.media_path_for(clip),
         )
 
@@ -308,6 +321,7 @@ class PreviewPlayer(QWidget):
         if clip is not None:
             self.audio_output.setMuted(clip.muted or (track is not None and track.muted))
             self.audio_output.setVolume(max(0.0, min(1.0, clip.volume)))
+        self._update_audio_meters()
         self._update_time_label()
 
     def seek_to(self, t: float) -> None:
@@ -323,6 +337,7 @@ class PreviewPlayer(QWidget):
             self._update_slider()
         self.time_changed.emit(t)
         self.request_accurate_frame()
+        self._update_audio_meters()
 
     # ------------------------------------------------------------------
     # Accurate frame (F10b)
@@ -333,6 +348,10 @@ class PreviewPlayer(QWidget):
         else:
             self._frame_generation += 1  # drop anything still rendering
             self._load_for_time(self._current_time, autoplay=self._is_playing)
+
+    def _on_safe_areas_toggled(self, checked: bool) -> None:
+        self.safe_overlay.setVisible(bool(checked))
+        self.safe_overlay.raise_()
 
     def request_accurate_frame(self) -> None:
         """Schedule a render of the exact frame at the playhead (debounced; paused only)."""
@@ -352,12 +371,16 @@ class PreviewPlayer(QWidget):
             from core.frame_render import preview_size
 
             try:
+                quick = render_frame(project, t, preview_size(project, max(160, size[0] // 2), max(90, size[1] // 2)))
+                self._frame_ready.emit(generation, ("proxy", quick))
+                if generation != self._frame_generation:
+                    return
                 data = render_frame(project, t, preview_size(project, *size))
             except FrameRenderError as exc:
                 data = str(exc)
             except Exception as exc:  # noqa: BLE001 - never let the worker thread die silently
                 data = f"Frame render failed: {exc}"
-            self._frame_ready.emit(generation, data)
+            self._frame_ready.emit(generation, ("final", data))
 
         threading.Thread(target=work, name="frame-render", daemon=True).start()
 
@@ -365,18 +388,19 @@ class PreviewPlayer(QWidget):
         """Show a rendered frame -- unless a newer request superseded it, or playback started."""
         if generation != self._frame_generation or self._is_playing or not self.accurate_checkbox.isChecked():
             return
-        if isinstance(data, (bytes, bytearray)):
+        stage, payload = data if isinstance(data, tuple) and len(data) == 2 else ("final", data)
+        if isinstance(payload, (bytes, bytearray)):
             pixmap = QPixmap()
-            pixmap.loadFromData(bytes(data), "PNG")
+            pixmap.loadFromData(bytes(payload), "PNG")
             self.last_frame_error = None
             self.frame_label.setPixmap(
                 pixmap.scaled(self.frame_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
-            self.frame_label.setToolTip("Exact export frame")
+            self.frame_label.setToolTip("Exact export frame" if stage == "final" else "Low-resolution background render")
         else:
-            self.last_frame_error = str(data)
+            self.last_frame_error = str(payload)
             self.frame_label.setPixmap(QPixmap())
-            self.frame_label.setText(f"Couldn't render this frame:\n{data}")
+            self.frame_label.setText(f"Couldn't render this frame:\n{payload}")
         self.stack.setCurrentWidget(self.frame_label)
 
     # ------------------------------------------------------------------
@@ -457,9 +481,16 @@ class PreviewPlayer(QWidget):
             self.placeholder_label.setText(clip.name)
 
         # Timeline <-> source mapping through the clip's speed segments, so
-        # speed-ramped clips seek to (and play at) the right place/speed.
+        # speed-ramped clips seek to (and play at) the right place/speed;
+        # reverse and the freeze frame are honoured too (Clip.source_time_at).
         offset_in_clip = t - clip.timeline_start
-        source_position_s = clip.source_in + clip.source_offset_at(offset_in_clip)
+        source_position_s = clip.source_time_at(offset_in_clip)
+        if self._is_stepped(clip, offset_in_clip):
+            # QMediaPlayer can only play forwards: a reversed clip, and a
+            # freeze frame, are shown by seeking frame by frame from the poll
+            # timer (wall-clock time) with the player paused -- so they play
+            # silently here; the export reverses the sound too.
+            autoplay = False
 
         media_path = self.media_path_for(clip)
         if self._current_source != media_path:
@@ -482,7 +513,9 @@ class PreviewPlayer(QWidget):
             self.player.play()
         else:
             self.player.pause()
-            if self.accurate_checkbox.isChecked():
+            # Not while playing a stepped (reversed / frozen) clip: the
+            # exact-frame still would hide the frames being stepped through.
+            if self.accurate_checkbox.isChecked() and not self._is_playing:
                 self.stack.setCurrentWidget(self.frame_label)
 
     # ------------------------------------------------------------------
@@ -514,11 +547,29 @@ class PreviewPlayer(QWidget):
             self._advance_time_and_refresh(self._current_time + step)
             return
 
-        if clip.media_type in (MediaType.VIDEO, MediaType.AUDIO):
+        if clip.media_type in (MediaType.VIDEO, MediaType.AUDIO) and self._is_stepped(
+            clip, self._current_time - clip.timeline_start
+        ):
+            timeline_t = self._current_time + step
+            if timeline_t >= clip.timeline_end - 0.02:
+                self._advance_time_and_refresh(clip.timeline_end + 0.001)
+                return
+            self._load_for_time(timeline_t, autoplay=False)
+            self.maybe_preload()
+        elif clip.media_type in (MediaType.VIDEO, MediaType.AUDIO):
             position_s = self.player.position() / 1000.0
             local_t = clip.timeline_offset_at(position_s - clip.source_in)
             timeline_t = clip.timeline_start + local_t
             if position_s >= clip.source_out - 0.02:
+                if clip.freeze_frame_duration > 0:
+                    # Footage done: hold the last frame for the freeze (stepped from now on).
+                    self._current_time = clip.timeline_start + clip.playable_duration
+                    self._load_for_time(self._current_time, autoplay=False)
+                    self._update_time_label()
+                    self._update_slider()
+                    self.time_changed.emit(self._current_time)
+                    self._update_audio_meters()
+                    return
                 self._advance_time_and_refresh(clip.timeline_end + 0.001)
                 return
             # Crossing a speed-ramp boundary: follow the new segment's speed.
@@ -540,6 +591,7 @@ class PreviewPlayer(QWidget):
         self._update_time_label()
         self._update_slider()
         self.time_changed.emit(timeline_t)
+        self._update_audio_meters()
 
         if timeline_t >= self._total_duration():
             self.pause()
@@ -562,6 +614,7 @@ class PreviewPlayer(QWidget):
         self._update_time_label()
         self._update_slider()
         self.time_changed.emit(next_t)
+        self._update_audio_meters()
 
     # ------------------------------------------------------------------
     @property
@@ -596,3 +649,103 @@ class PreviewPlayer(QWidget):
         if error_string:
             self.placeholder_label.setText(f"Playback error: {error_string}")
             self.stack.setCurrentWidget(self.placeholder_label)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.safe_overlay.setGeometry(self.stack.rect())
+        self.safe_overlay.raise_()
+
+    @staticmethod
+    def _is_stepped(clip: Clip, offset_in_clip: float) -> bool:
+        """Whether the preview shows ``clip`` here by seeking per poll tick instead of playing it."""
+        return clip.reverse or clip.in_freeze_frame(offset_in_clip)
+
+    def _waveform_for_active_clip(self):
+        """The active clip's cached waveform levels (loaded once per cache file; None = no audio data)."""
+        clip = self._active_clip
+        if self.project is None or clip is None:
+            return None
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or not asset.waveform_path:
+            return None  # not cached: the waveform may still arrive from the import worker
+        path = asset.waveform_path
+        if path not in self._waveform_cache:
+            self._waveform_cache[path] = load_waveform(path)
+        return self._waveform_cache[path]
+
+    def _update_audio_meters(self) -> None:
+        """Peak/RMS meters for the sound under the playhead, read from the cached waveform.
+
+        No decoding: a slice of about a dozen cached values per call (see
+        core.waveform.window_levels), so it is cheap enough for every poll
+        tick. It shows the active clip only (the one the preview plays), and
+        drops to zero for silence: no clip, text/image, muted clip or track,
+        a freeze frame, or media without audio.
+        """
+        clip = self._active_clip
+        offset = self._current_time - clip.timeline_start if clip is not None else 0.0
+        track = self.project.find_clip_track(clip.id) if (clip is not None and self.project is not None) else None
+        if (
+            clip is None
+            or clip.media_type not in (MediaType.VIDEO, MediaType.AUDIO)
+            or clip.is_silent
+            or (track is not None and track.muted)
+            or clip.in_freeze_frame(offset)
+        ):
+            self.meters.set_levels(0.0, 0.0)
+            return
+        waveform = self._waveform_for_active_clip()
+        if waveform is None:
+            self.meters.set_levels(0.0, 0.0)
+            return
+        peak, rms = window_levels(waveform, clip.source_time_at(offset))
+        gain = max(0.0, clip.volume)
+        self.meters.set_levels(peak * gain, rms * gain)
+
+
+class _SafeAreaOverlay(QWidget):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        outer = self.rect().adjusted(6, 6, -6, -6)
+        title = outer.adjusted(int(outer.width() * 0.1), int(outer.height() * 0.1), -int(outer.width() * 0.1), -int(outer.height() * 0.1))
+        action = outer.adjusted(int(outer.width() * 0.05), int(outer.height() * 0.05), -int(outer.width() * 0.05), -int(outer.height() * 0.05))
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 1, Qt.DashLine))
+        painter.drawRect(action)
+        painter.setPen(QPen(QColor(255, 215, 0, 150), 1, Qt.DashLine))
+        painter.drawRect(title)
+
+
+class _AudioLevelMeters(QWidget):
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._peak = 0.0
+        self._rms = 0.0
+        self.setFixedSize(70, 18)
+        self.setToolTip("Audio level meters (peak / RMS)")
+
+    def set_levels(self, peak: float, rms: float) -> None:
+        peak, rms = max(0.0, min(1.0, peak)), max(0.0, min(1.0, rms))
+        if (peak, rms) == (self._peak, self._rms):
+            return  # nothing to repaint (silence stays silence)
+        self._peak, self._rms = peak, rms
+        self.update()
+
+    def levels(self) -> Tuple[float, float]:
+        """``(peak, rms)`` currently shown, 0..1."""
+        return self._peak, self._rms
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(theme.COLOR_BG_DARK))
+        peak_w = int((self.width() - 2) * self._peak)
+        rms_w = int((self.width() - 2) * self._rms)
+        painter.fillRect(1, 2, peak_w, 6, QColor("#ef4444"))
+        painter.fillRect(1, 10, rms_w, 6, QColor("#22c55e"))
+        painter.setPen(QColor(theme.COLOR_BORDER))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))

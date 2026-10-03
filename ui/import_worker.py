@@ -24,7 +24,7 @@ from typing import List, Optional
 from PySide6.QtCore import QObject, Signal
 
 from core.media_asset import MediaAsset
-from core.media_probe import generate_thumbnail, probe_file, safe_thumbnail_time
+from core.media_probe import generate_filmstrip, generate_thumbnail, probe_file, safe_thumbnail_time
 from core.waveform import generate_waveform
 
 
@@ -34,7 +34,7 @@ def default_worker_count() -> int:
 
 class ImportWorker(QObject):
     asset_ready = Signal(object)  # MediaAsset, probed (no thumbnail/waveform yet)
-    asset_updated = Signal(str, object, object)  # asset id, thumbnail path, waveform path
+    asset_updated = Signal(str, object, object, object)  # asset id, thumbnail path, filmstrip path, waveform path
     failed = Signal(str, str)  # path, error message
     finished = Signal()
 
@@ -62,10 +62,13 @@ class ImportWorker(QObject):
 
     def _extras(self, asset: MediaAsset):
         thumb = None
+        filmstrip = None
         if asset.has_video or asset.is_image:
             thumb = generate_thumbnail(asset.path, self._thumbnail_cache_dir, safe_thumbnail_time(asset.duration))
+        if asset.has_video:
+            filmstrip = generate_filmstrip(asset.path, self._thumbnail_cache_dir, asset.duration)
         waveform = generate_waveform(asset.path, self._waveform_cache_dir, asset.duration) if asset.has_audio else None
-        return asset.id, thumb, waveform
+        return asset.id, thumb, filmstrip, waveform
 
     def run(self) -> None:
         probed: List[MediaAsset] = []
@@ -89,10 +92,10 @@ class ImportWorker(QObject):
                     if self.cancelled:
                         break
                     try:
-                        asset_id, thumb, waveform = future.result()
+                        asset_id, thumb, filmstrip, waveform = future.result()
                     except Exception:  # noqa: BLE001 - a missing thumbnail/waveform isn't fatal
                         continue
-                    self.asset_updated.emit(asset_id, thumb, waveform)
+                    self.asset_updated.emit(asset_id, thumb, filmstrip, waveform)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
             self.finished.emit()

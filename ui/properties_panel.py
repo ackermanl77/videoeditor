@@ -223,6 +223,23 @@ class PropertiesPanel(QWidget):
         self.speed_spin.setSuffix(" x")
         clip_form.addRow("Speed", self._with_key_button(self.speed_spin, "speed"))
 
+        self.reverse_checkbox = QCheckBox("Reverse playback")
+        self.reverse_checkbox.setToolTip(
+            "Play the clip back to front (its sound too). FFmpeg buffers the whole clip to reverse it, "
+            "so keep reversed clips short."
+        )
+        clip_form.addRow("", self.reverse_checkbox)
+
+        self.freeze_spin = QDoubleSpinBox()
+        self.freeze_spin.setRange(0.0, 30.0)
+        self.freeze_spin.setSingleStep(0.1)
+        self.freeze_spin.setSuffix(" s")
+        self.freeze_spin.setToolTip(
+            "Extend the clip by holding its last displayed frame for this long (silent). "
+            "Dragging the clip's right edge in shortens the freeze first."
+        )
+        clip_form.addRow("Freeze Frame", self.freeze_spin)
+
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(0, 100)
         clip_form.addRow("Opacity", self._with_key_button(self.opacity_slider, "opacity"))
@@ -572,8 +589,10 @@ class PropertiesPanel(QWidget):
 
         self.mute_checkbox.toggled.connect(lambda checked: self._commit_now("muted", checked, "Toggle Mute"))
         self.denoise_checkbox.toggled.connect(lambda checked: self._commit_now("denoise_enabled", checked, "Toggle Noise Reduction"))
+        self.reverse_checkbox.toggled.connect(lambda checked: self._commit_now("reverse", checked, "Toggle Reverse"))
 
         self.speed_spin.editingFinished.connect(self._commit_speed)
+        self.freeze_spin.editingFinished.connect(self._commit_freeze)
         self.fade_in_spin.editingFinished.connect(lambda: self._commit_now("fade_in", self.fade_in_spin.value(), "Edit Fade In"))
         self.fade_out_spin.editingFinished.connect(lambda: self._commit_now("fade_out", self.fade_out_spin.value(), "Edit Fade Out"))
 
@@ -661,6 +680,11 @@ class PropertiesPanel(QWidget):
         self.denoise_checkbox.setChecked(clip.denoise_enabled)
         self.denoise_strength_slider.setValue(int(clip.denoise_strength))
         self.speed_spin.setValue(clip.speed)
+        self.reverse_checkbox.setChecked(clip.reverse)
+        self.freeze_spin.setValue(clip.freeze_frame_duration)
+        # Reverse needs footage or sound; a freeze frame needs a picture to hold.
+        self.reverse_checkbox.setEnabled(clip.media_type in (MediaType.VIDEO, MediaType.AUDIO) or clip.reverse)
+        self.freeze_spin.setEnabled(clip.media_type == MediaType.VIDEO or clip.freeze_frame_duration > 0)
         self.opacity_slider.setValue(int(clip.opacity * 100))
         self.fade_in_spin.setValue(clip.fade_in)
         self.fade_out_spin.setValue(clip.fade_out)
@@ -784,6 +808,15 @@ class PropertiesPanel(QWidget):
                 self.speed_spin.setValue(clip.speed)  # refused: show the real value again
                 self._loading = False
 
+    def _commit_freeze(self) -> None:
+        """Freeze Frame spin box: refused (and reset) when the longer clip would overlap the next one."""
+        if not self._commit_now("freeze_frame_duration", self.freeze_spin.value(), "Edit Freeze Frame"):
+            clip = self._current_clip()
+            if clip is not None and abs(clip.freeze_frame_duration - self.freeze_spin.value()) > 1e-9:
+                self._loading = True
+                self.freeze_spin.setValue(clip.freeze_frame_duration)
+                self._loading = False
+
     def _toggle_fill_frame(self, checked: bool) -> None:
         mode = ReframeMode.FILL if checked else ReframeMode.FIT
         self._commit_now("reframe_mode", mode, "Toggle Fill Frame")
@@ -848,7 +881,8 @@ class PropertiesPanel(QWidget):
         elif kind == "volume":
             attribute, entry = "volume_keyframes", (local, self.volume_slider.value() / 100.0)
         elif kind == "speed":
-            attribute, entry = "speed_keyframes", (clip.source_offset_at(local), self.speed_spin.value())
+            # The source frame on screen at the playhead (reverse/freeze aware).
+            attribute, entry = "speed_keyframes", (clip.source_time_at(local) - clip.source_in, self.speed_spin.value())
         else:
             return False
         keyframes = [tuple(k) for k in getattr(clip, attribute) if abs(k[0] - entry[0]) > 1e-3]

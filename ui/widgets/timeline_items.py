@@ -37,8 +37,8 @@ HANDLE_WIDTH = 8
 MIN_CLIP_PIXELS = 6
 SNAP_THRESHOLD_PX = 8
 
-# Waveform type alias: (peak amplitudes 0..1, peaks-per-second density).
-WaveformData = Tuple[List[float], float]
+# Waveform type alias: (peak amplitudes, RMS amplitudes, peaks-per-second density).
+WaveformData = Tuple[List[float], List[float], float]
 
 CLIP_COLORS = {
     MediaType.VIDEO: theme.CLIP_COLOR_VIDEO,
@@ -61,11 +61,13 @@ EFFECT_INDICATORS: Tuple[Tuple[str, str, str], ...] = (
     ("has_transition", "T", theme.CLIP_COLOR_TEXT),
     ("has_effects", "FX", "#8b6cd9"),
     ("has_volume_automation", "V", "#d9822b"),
+    ("is_reversed", "R", "#3fa7d6"),
+    ("has_freeze_frame", "FF", "#5c6bc0"),
 )
 # Full names for the badge tooltips (badges used to be colour + one letter only).
 EFFECT_NAMES = {
     "C": "Color Correction", "K": "Chroma Key", "N": "Noise Reduction", "T": "Transition",
-    "FX": "Effects", "V": "Volume Automation",
+    "FX": "Effects", "V": "Volume Automation", "R": "Reverse", "FF": "Freeze Frame",
 }
 EFFECT_BADGE_SIZE = 14
 EFFECT_BADGE_GAP = 2
@@ -153,7 +155,7 @@ class TimelineSignals(QObject):
     clip_context_menu = Signal(str, object)  # clip id, global QPoint
     clip_razor = Signal(str, float)  # clip id, timeline seconds to split at (Razor tool)
     clip_moved = Signal(str, float, int)  # clip_id, new_start, new_track_row
-    clip_trimmed = Signal(str, float, float, float)  # clip_id, in, out, start
+    clip_trimmed = Signal(str, float, float, float, float)  # clip_id, in, out, start, freeze-frame seconds
     # clip_id, gesture (an EDIT_GESTURES name), value: the new edit time for a
     # roll, source seconds for a slip, timeline seconds moved for slide/ripple.
     clip_edit_gesture = Signal(str, str, float)
@@ -180,6 +182,7 @@ class ClipItem(QGraphicsObject):
         pixels_per_second: float,
         signals: TimelineSignals,
         thumbnail: Optional[QPixmap] = None,
+        filmstrip: Optional[QPixmap] = None,
         waveform: Optional[WaveformData] = None,
         snap_targets_provider: Optional[Callable[[str], List[float]]] = None,
         track_name: str = "",
@@ -197,7 +200,8 @@ class ClipItem(QGraphicsObject):
         self.pixels_per_second = pixels_per_second
         self.signals = signals
         self.thumbnail = thumbnail
-        self._waveform_peaks, self._waveform_density = waveform if waveform else (None, 0.0)
+        self.filmstrip = filmstrip
+        self._waveform_peaks, self._waveform_rms, self._waveform_density = waveform if waveform else (None, None, 0.0)
         self.snap_targets_provider = snap_targets_provider
         self._media_type = clip.media_type
         self._name = clip.name
@@ -207,8 +211,12 @@ class ClipItem(QGraphicsObject):
         self._source_in = clip.source_in
         self._source_out = clip.source_out
         self._source_duration = clip.source_duration
+        self._reverse = clip.reverse
+        self._freeze = clip.freeze_frame_duration
         self._locked = False
         self._effect_badges = _active_effect_badges(clip)
+        self._transition_out = clip.transition_out
+        self._transition_duration = clip.transition_duration
         # A private copy of the model clip, so trim drags compute the
         # trimmed duration exactly as the model will (speed ramps included)
         # instead of assuming one constant speed.
@@ -233,6 +241,7 @@ class ClipItem(QGraphicsObject):
         self._press_duration = 0.0
         self._press_source_in = 0.0
         self._press_source_out = 0.0
+        self._press_freeze = 0.0
 
         self._sync_position()
 
@@ -245,7 +254,11 @@ class ClipItem(QGraphicsObject):
         self._source_in = clip.source_in
         self._source_out = clip.source_out
         self._source_duration = clip.source_duration
+        self._reverse = clip.reverse
+        self._freeze = clip.freeze_frame_duration
         self._effect_badges = _active_effect_badges(clip)
+        self._transition_out = clip.transition_out
+        self._transition_duration = clip.transition_duration
         self._model = clip.with_source_range(clip.source_in, clip.source_out)
         self._keyframe_times = [t - clip.timeline_start for t in clip_keyframe_points(clip)]
         self._describe(clip)
@@ -303,12 +316,23 @@ class ClipItem(QGraphicsObject):
         painter.setBrush(QBrush(gradient))
         painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
 
-        # Thumbnail strip (video/image clips only), clipped to rounded rect.
-        if self.thumbnail is not None and rect.width() > 30:
+        # Filmstrip thumbnails on video clips; a single poster frame on images.
+        if self.filmstrip is not None and rect.width() > 52:
+            self._paint_filmstrip(painter, rect)
+        elif self.thumbnail is not None and rect.width() > 30:
             painter.save()
             thumb_rect = QRectF(2, 2, min(rect.width() - 4, 46), rect.height() - 4)
             painter.setClipRect(thumb_rect)
             painter.drawPixmap(thumb_rect.toRect(), self.thumbnail)
+            painter.restore()
+
+        # Freeze-frame tail: hatched, so it reads as "held picture, no sound".
+        freeze_px = min(rect.width(), max(0.0, self._freeze) * self.pixels_per_second)
+        if freeze_px >= 2:
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 70), Qt.Dense6Pattern))
+            painter.drawRect(QRectF(rect.width() - freeze_px, 1, freeze_px - 1, rect.height() - 2))
             painter.restore()
 
         # Waveform: full clip body for audio clips, a thin strip along the
@@ -356,6 +380,8 @@ class ClipItem(QGraphicsObject):
         painter.setPen(QColor("#ffffff"))
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
 
+        self._paint_transition_mark(painter, rect)
+
         if show_badges:
             badge_font = QFont()
             badge_font.setPointSize(EFFECT_BADGE_FONT_PT)
@@ -391,6 +417,51 @@ class ClipItem(QGraphicsObject):
             painter.drawRect(QRectF(0, 0, HANDLE_WIDTH, rect.height()))
             painter.drawRect(QRectF(rect.width() - HANDLE_WIDTH, 0, HANDLE_WIDTH, rect.height()))
 
+    def _paint_filmstrip(self, painter: QPainter, rect: QRectF) -> None:
+        if self.filmstrip is None or self.filmstrip.isNull():
+            return
+        columns = max(1, self.filmstrip.width() // max(1, self.filmstrip.height()))
+        tile_w = self.filmstrip.width() / columns
+        band = QRectF(2, 2, max(0.0, self._playable_width(rect) - 4), min(rect.height() - 4, 26))
+        if band.width() < 18:
+            return
+        painter.save()
+        painter.setClipRect(band)
+        frames = max(2, min(columns, int(band.width() // 22) + 1))
+        clip_span = max(self._source_out - self._source_in, 0.001)
+        # The strip's tiles span the whole source file (see
+        # core.media_probe.generate_filmstrip), so a source time maps to
+        # time / file length -- not / source_out, which showed the file's
+        # last frames on any clip trimmed short of the end.
+        file_length = max(self._source_duration or self._source_out, 0.001)
+        for i in range(frames):
+            frac = 0.0 if frames == 1 else i / max(1, frames - 1)
+            shown = 1.0 - frac if self._reverse else frac
+            src_frac = min(0.999, max(0.0, (self._source_in + clip_span * shown) / file_length))
+            src_index = min(columns - 1, max(0, int(src_frac * columns)))
+            src = QRectF(src_index * tile_w, 0, tile_w, self.filmstrip.height())
+            x0 = band.left() + frac * band.width()
+            x1 = band.right() if i == frames - 1 else band.left() + ((i + 1) / frames) * band.width()
+            painter.drawPixmap(QRectF(x0, band.top(), max(1.0, x1 - x0), band.height()), self.filmstrip, src)
+        painter.restore()
+
+    def _playable_width(self, rect: QRectF) -> float:
+        """Width of the part that plays footage (the clip minus its freeze-frame tail)."""
+        return max(0.0, rect.width() - max(0.0, self._freeze) * self.pixels_per_second)
+
+    def _paint_transition_mark(self, painter: QPainter, rect: QRectF) -> None:
+        if getattr(self._transition_out, "value", "none") == "none" or rect.width() < 18:
+            return
+        width = min(20.0, max(8.0, self._transition_duration * self.pixels_per_second))
+        x0 = rect.width() - width - 2.0
+        y0 = 4.0
+        y1 = min(rect.height() - 4.0, y0 + 18.0)
+        painter.save()
+        painter.setPen(QPen(QColor(255, 255, 255, 170), 1, Qt.DashLine))
+        painter.drawLine(int(x0), int(y0), int(rect.width() - 2), int(y1))
+        painter.drawLine(int(x0), int(y1), int(rect.width() - 2), int(y0))
+        painter.restore()
+
     def _paint_waveform(self, painter: QPainter, rect: QRectF, top: float, bottom: float) -> None:
         """Draw the portion of the cached peak data this clip's trim shows.
 
@@ -404,27 +475,33 @@ class ClipItem(QGraphicsObject):
         idx_start = max(0, min(total_peaks, int(self._source_in * density)))
         idx_end = max(idx_start, min(total_peaks, int(self._source_out * density)))
         peaks = self._waveform_peaks[idx_start:idx_end]
+        rms_values = (self._waveform_rms or self._waveform_peaks)[idx_start:idx_end]
         if not peaks:
             return
+        if self._reverse:  # a reversed clip plays (and sounds) back to front
+            peaks, rms_values = peaks[::-1], rms_values[::-1]
 
-        width = int(rect.width())
+        width = int(self._playable_width(rect))  # the freeze-frame tail is silent
         if width <= 2:
             return
         mid = (top + bottom) / 2.0
         half = (bottom - top) / 2.0
-        painter.setPen(QPen(QColor(255, 255, 255, 140), 1))
+        painter.setPen(QPen(QColor(255, 255, 255, 165), 1))
 
         m = len(peaks)
-        # Cap how many bars we draw regardless of pixel width — a waveform
-        # preview doesn't need per-pixel resolution, and this keeps very
-        # wide (heavily zoomed) clips fast to repaint.
-        max_bars = min(width, 400)
+        max_bars = min(width, 640)
         step_px = max(1, width // max_bars)
         for x in range(0, width, step_px):
-            src_idx = int(x * m / width)
-            amp = peaks[src_idx] if 0 <= src_idx < m else 0.0
-            h = amp * half
-            painter.drawLine(int(x), int(mid - h), int(x), int(mid + h))
+            a = int(x * m / width)
+            b = max(a + 1, int((x + step_px) * m / width))
+            peak = max(peaks[a:b], default=0.0)
+            rms = sum(rms_values[a:b]) / max(1, b - a)
+            rms_h = rms * half
+            peak_h = peak * half
+            painter.setPen(QPen(QColor(255, 255, 255, 80), 1))
+            painter.drawLine(int(x), int(mid - rms_h), int(x), int(mid + rms_h))
+            painter.setPen(QPen(QColor(255, 255, 255, 175), 1))
+            painter.drawLine(int(x), int(mid - peak_h), int(x), int(mid + peak_h))
 
     # -- interaction ------------------------------------------------------
     def hoverMoveEvent(self, event) -> None:
@@ -524,6 +601,7 @@ class ClipItem(QGraphicsObject):
         self._press_duration = self._duration
         self._press_source_in = self._source_in
         self._press_source_out = self._source_out
+        self._press_freeze = self._freeze
         if mode in GESTURE_HINTS:
             self.setToolTip(GESTURE_HINTS[mode])
 
@@ -554,8 +632,10 @@ class ClipItem(QGraphicsObject):
             self._start = max(0.0, self._press_start + delta_timeline_s)
             self._sync_position()
         elif mode == "slip":
-            # Content moves with the mouse: dragging right shows earlier source.
-            shift = -self._model.source_offset_at(delta_timeline_s)
+            # Content moves with the mouse: dragging right shows earlier source
+            # (later source on a reversed clip, which plays back to front).
+            consumed = self._model.playback_source_consumed(delta_timeline_s)
+            shift = consumed if self._model.reverse else -consumed
             self._source_in = self._press_source_in + shift
             self._source_out = self._press_source_out + shift
         self.prepareGeometryChange()
@@ -566,7 +646,7 @@ class ClipItem(QGraphicsObject):
         mode, self._drag_mode = self._drag_mode, None
         self.signals.snap_guide_hide.emit()
         if mode in ("trim_left", "trim_right"):
-            self.signals.clip_trimmed.emit(self.clip_id, self._source_in, self._source_out, self._start)
+            self.signals.clip_trimmed.emit(self.clip_id, self._source_in, self._source_out, self._start, self._freeze)
         elif mode == "roll_left":
             self.signals.clip_edit_gesture.emit(self.clip_id, mode, self._start)
         elif mode == "roll_right":
@@ -588,32 +668,49 @@ class ClipItem(QGraphicsObject):
         return 0.1 * self._model.speed_at(0.0)
 
     def _apply_trim_left(self, delta_timeline_s: float) -> None:
-        """Move the left edge by ``delta_timeline_s`` (clamped), updating in/start/duration.
+        """Move the left edge by ``delta_timeline_s`` (clamped), updating in/out/start/duration.
 
         Source and timeline offsets go through the model clip's own
-        time mapping (:meth:`Clip.source_offset_at`), and the resulting
-        length is the trimmed clip's real ``Clip.duration`` -- the old
-        ``/ self._speed`` math was wrong for speed-ramped clips.
+        playback mapping (:meth:`Clip.playback_source_consumed`), so speed
+        ramps are right and a reversed clip -- whose left edge is its
+        ``source_out`` end -- trims the correct end. The resulting length is
+        the trimmed clip's real ``Clip.duration`` (freeze frame included).
         """
         model = self._model
         delta_timeline_s = max(delta_timeline_s, -self._press_start)  # timeline start can't go below 0
-        src_delta = model.source_offset_at(delta_timeline_s)
-        src_delta = max(src_delta, -self._press_source_in)  # can't trim before the source's start
-        src_delta = min(src_delta, self._press_source_out - self._press_source_in - self._min_source_length())
-        self._source_in = self._press_source_in + src_delta
-        self._start = max(0.0, self._press_start + model.timeline_offset_at(src_delta))
-        self._duration = model.with_source_range(self._source_in, self._press_source_out).duration
+        consumed = model.playback_source_consumed(delta_timeline_s)
+        limit = self._source_duration if self._source_duration is not None else math.inf
+        room = (limit - self._press_source_out) if model.reverse else self._press_source_in
+        consumed = max(consumed, -room)  # can't extend past the media's start (reversed: its end)
+        consumed = min(consumed, self._press_source_out - self._press_source_in - self._min_source_length())
+        if model.reverse:
+            self._source_in, self._source_out = self._press_source_in, self._press_source_out - consumed
+        else:
+            self._source_in, self._source_out = self._press_source_in + consumed, self._press_source_out
+        self._freeze = self._press_freeze
+        self._start = max(0.0, self._press_start + model.playback_timeline_offset(consumed))
+        self._duration = model.with_source_range(self._source_in, self._source_out).duration
 
     def _apply_trim_right(self, delta_timeline_s: float) -> None:
-        """Move the right edge by ``delta_timeline_s`` (clamped); see :meth:`_apply_trim_left`."""
+        """Move the right edge by ``delta_timeline_s`` (clamped); see :meth:`_apply_trim_left`.
+
+        The freeze-frame tail shrinks/grows first (:meth:`Clip.trim_right_range`);
+        on a reversed clip the right edge is the ``source_in`` end.
+        """
         model = self._model
-        new_len = self._press_duration + delta_timeline_s
-        source_out = self._press_source_in + model.source_offset_at(max(0.0, new_len))
-        source_out = max(source_out, self._press_source_in + self._min_source_length())
-        if self._source_duration is not None:
-            source_out = min(source_out, self._source_duration)
-        self._source_out = source_out
-        self._duration = model.with_source_range(self._press_source_in, source_out).duration
+        min_length = model.playback_timeline_offset(self._min_source_length())
+        new_len = max(self._press_duration + delta_timeline_s, min_length)
+        source_in, source_out, freeze = model.trim_right_range(new_len)
+        if model.reverse:
+            source_in = min(max(0.0, source_in), self._press_source_out - self._min_source_length())
+        else:
+            source_out = max(source_out, self._press_source_in + self._min_source_length())
+            if self._source_duration is not None:
+                source_out = min(source_out, self._source_duration)
+        self._source_in, self._source_out, self._freeze = source_in, source_out, freeze
+        probe = model.with_source_range(source_in, source_out)
+        probe.freeze_frame_duration = freeze
+        self._duration = probe.duration
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         self.signals.snap_guide_hide.emit()
