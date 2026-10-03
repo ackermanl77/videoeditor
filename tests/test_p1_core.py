@@ -193,7 +193,9 @@ class TextStyleGraphTests(unittest.TestCase):
         self.assertNotIn("box=1", self._draw(TextStyle()))
 
     def test_bold_italic_family_resolve_to_a_font_file(self):
-        with patch("core.fonts.resolve_font_file", return_value=r"C:\Windows\Fonts\georgiab.ttf") as resolve:
+        # Forward slashes: backslash-to-slash conversion is os.sep-dependent, so a
+        # Windows-style path would come out differently on the Ubuntu CI job.
+        with patch("core.fonts.resolve_font_file", return_value="C:/Windows/Fonts/georgiab.ttf") as resolve:
             f = self._draw(TextStyle(font_family="Georgia", bold=True))
         resolve.assert_called_once_with("Georgia", True, False)
         self.assertIn("fontfile=C\\\\:/Windows/Fonts/georgiab.ttf", f)
