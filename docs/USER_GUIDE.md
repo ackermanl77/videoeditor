@@ -59,13 +59,19 @@ project open it in the editor. Uninstall it from Windows Settings > Apps.
 No Python installation is needed. If you'd rather not install anything,
 download `VideoEditor-<version>-portable.zip` instead, unzip it anywhere and
 run `VideoEditor.exe` from that folder (keep the `_internal` folder next to
-it).
+it). Both include FFmpeg, so nothing else needs installing. (The repository
+is private, so the Releases page needs a GitHub account with access to it;
+the installer and portable zip come from the current release workflow, while
+the older `v0.1.0` release only has a single `VideoEditor.exe`.)
 
 **If you're running it from source:**
 
 1. Install [Python 3.10+](https://www.python.org/) and
    [FFmpeg](https://ffmpeg.org/download.html) (with `ffprobe`), and make
-   sure `ffmpeg`/`ffprobe` are on your system `PATH`.
+   sure `ffmpeg`/`ffprobe` are on your system `PATH`. On Windows you can
+   instead run `python scripts/fetch_ffmpeg.py`, which downloads the exact
+   FFmpeg build the app is tested with into the project's `bin\` folder
+   (the app looks there first).
 2. From the project folder:
    ```bash
    python -m venv .venv
@@ -82,7 +88,7 @@ restart.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Menu bar (File · Edit · Timeline · Help)                    │
+│  Menu bar (File · Edit · Timeline · Playback · Media · Help) │
 ├─────────────────────────────────────────────────────────────┤
 │  Toolbar (Import · Save · Undo/Redo · Split · Delete · ...)  │
 ├───────────────┬───────────────────────────┬─────────────────┤
@@ -98,6 +104,9 @@ restart.
 │  Audio 1        [clip]                                       │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+The **Render Queue** (**File > Render Queue**, **Ctrl+Shift+E**) opens as an
+extra panel when you need it.
 
 Every panel is resizable — drag the thin divider between any two of them.
 They can be made very narrow, but never dragged away completely, so you
@@ -138,8 +147,12 @@ remembered the next time you open the app.
   error listing exactly which file(s) failed and why.
 - If a project references a file that's since been moved or deleted,
   opening it warns you which files are missing; affected clips stay in the
-  project but appear blank/silent until the file is restored at its
-  original location.
+  project, red-hatched and marked "(offline)", until you restore the file or
+  point the project at its new location with **File > Relink Media...**
+  (see [Offline media and relinking](#effects-audio-automation-and-editing-tools)).
+- **Subtitle files** (`.srt`, `.vtt`) picked here or dropped on the window
+  become caption clips — see [Subtitles](#subtitles-srt--webvtt).
+- Large batches can be stopped with **Media > Cancel Import**.
 
 ## The Media Bin
 
@@ -165,11 +178,13 @@ The timeline is where you arrange your edit.
   the clip, then press **S** or click **Split**.
 - **Delete a clip**: select it and press **Delete**, or click **Delete**.
 - **Add/remove tracks**: **+ Video Track** / **+ Audio Track** in the
-  timeline toolbar; select a clip and click **Delete Track** to remove its
-  track.
+  timeline toolbar (or the **Timeline** menu); click a track's header (or
+  select one of its clips) and click **Delete Track** to remove it.
 - **Mute / Lock / Hide a track**: click a track header's **M** / **L** /
   **H** buttons. A locked track's clips can't be dragged or trimmed; a
-  hidden video track is skipped by both the preview and the final export.
+  hidden video track's picture is left out of the preview and the export,
+  but its sound is kept (mute it to silence it). The **D** button sets up
+  ducking (see [Ducking settings](#effects-audio-automation-and-editing-tools)).
 - Tracks are strictly non-overlapping — a move or trim that would overlap
   another clip on the same track snaps back instead of applying.
 
@@ -186,7 +201,21 @@ Delete and Trim. Ripple only affects the track you're editing; other
 tracks are never shifted.
 
 **Zoom.** Use the Zoom slider in the timeline toolbar, or **Ctrl+=**/
-**Ctrl+-** (or **Ctrl+scroll**), to zoom the timeline in or out.
+**Ctrl+-** (or **Ctrl+scroll**), to zoom the timeline in or out around the
+playhead; **Shift+Z** (Zoom to Fit) shows the whole edit.
+
+**Moving around.** Drag on the ruler to scrub. The **Playback** menu lists the
+transport keys: **J** / **K** / **L** shuttle backwards / stop / forwards
+(press J or L again to go faster), **Left**/**Right** step one frame,
+**Shift+Left**/**Shift+Right** one second, **Home**/**End** jump to the start
+or end, **Up**/**Down** to the previous/next cut, **Shift+M** /
+**Ctrl+Shift+M** to the previous/next marker. **I** and **O** set In and Out
+points (**Alt+X** clears them); the Export dialog's Trim Range starts from
+them. Times are shown as `HH:MM:SS:FF` timecode.
+
+**Clip look.** Video clips show a filmstrip of frames along the clip and audio
+shows its waveform. Lettered badges mark what's applied to a clip (hover one
+for its name), and a small glyph at the end marks a transition out.
 
 **Narrow windows.** If the window gets too narrow for every timeline
 toolbar button to fit on one row, the extra buttons wrap onto additional
@@ -222,6 +251,7 @@ For video/audio clips, the **Clip Adjustments** group offers:
 |---|---|---|
 | Volume | 0–200% | Above 100% amplifies the audio. |
 | Mute | on/off | Silences the clip's own audio. |
+| Reduce noise (afftdn) | on/off, strength | Removes steady background hiss/hum from the clip's audio (an **N** badge marks the clip). |
 | Speed | 0.25x–4.0x | Slow motion to 4x fast-forward (also changes how much of the source maps to the timeline). |
 | Opacity | 0–100% | How transparent the clip is (video/image only; not shown in the live preview, only in the exported file). |
 | Fade In / Fade Out | 0–30s | A gradual fade at the start/end — applied to video and to the clip's own audio. |
@@ -313,19 +343,23 @@ clip.
 
 To blend one clip into the next instead of a hard cut:
 
-1. Select a clip that's immediately followed (no gap) by another
-   video/image clip on the *same* track.
-2. In the **Transition** group, check **Crossfade into next clip** and
-   set a **Duration**.
+1. Select a clip that's immediately followed (no gap) by another clip on
+   the *same* track.
+2. In the **Transition** group, pick a **Transition Out** — **Crossfade**,
+   **Wipe** (Left/Right/Up/Down), **Slide** (Left/Right/Up/Down), **Circle
+   Crop** or **Dissolve** — and set a **Duration** (0.1–10 s).
 
 Notes:
-- Only one crossfade per pair of clips — chaining three or more
-  consecutive crossfades on one track isn't supported.
-- The audio doesn't crossfade with it — it cuts cleanly at the original
-  boundary while the video blends.
-- The transition shortens that pair's combined on-screen time; nothing
-  after it on the track automatically shifts left to close the resulting
-  gap — drag the next clip over manually if you want it snug.
+- The sound crossfades over the same moment, with an equal-power curve (no
+  dip in the middle); on audio clips, Transition Out gives that audio
+  crossfade on its own.
+- Only one transition per pair of clips — chaining three or more
+  consecutive transitions on one track isn't supported.
+- The second clip starts the transition duration early, so the pair ends
+  that much sooner than the timeline shows; nothing after it on the track
+  shifts left to close the resulting gap — drag the next clip over manually
+  if you want it snug.
+- The duration is limited to what both clips can provide.
 
 ## Color correction
 
@@ -366,14 +400,16 @@ once saved, they need this version (or newer) to open.
 1. Press **T**, click **Add Text**, or use **Edit > Add Text Clip**. This
    drops a 4-second text clip onto a video track at the playhead and
    selects it.
-2. In the Properties panel, edit the **Content**, **Font Size**, **Color**,
-   **Bold**/**Italic**, position, and alignment.
+2. In the Properties panel, edit the **Content**, **Font**, **Font Size**
+   (scales with the export resolution), **Color**, **Outline** (width and
+   colour), **Shadow**, **Background box**, **Bold**/**Italic**, position,
+   and alignment.
 3. Trim and move it on the timeline like any other clip to control when it
    appears and for how long.
 
-*Note: the live preview shows text as a plain centered label rather than
-composited over your video — the exported file always shows it correctly
-overlaid at the position/style you set.*
+*Note: during playback the preview shows text as a plain centered label
+rather than composited over your video; pause with **Accurate frame** ticked
+to see it exactly as exported.*
 
 ### Subtitles (SRT / WebVTT)
 
@@ -646,14 +682,21 @@ timeline to a real video file via FFmpeg.
    the footage's mastering-display and brightness metadata; GPU and AV1
    exports carry the HDR colour tags only. Check HDR exports on an HDR
    screen or TV.
-5. *(Optional)* Check **Two-pass, target file size** and enter a target
+5. *(Optional)* **Use GPU encoding (NVENC) when available** (on by default
+   when an NVIDIA encoder is found) renders H.264/HEVC/AV1 on the graphics
+   card; if the GPU encode fails, the export is redone on the CPU
+   automatically. Check **Two-pass, target file size** and enter a target
    size in MB instead of a quality preset — useful when you need to hit a
    specific file-size limit (e.g. for an upload cap). With an NVIDIA GPU,
    **Target size on the GPU** does this in one fast pass that lands close to
    the size; leave it off to hit the size exactly.
-6. *(Optional)* Set up vertical/Shorts export settings — see
+6. *(Optional)* Audio: pick the **Audio Bitrate**, and a **Loudness** target
+   (-14 / -16 / -23 LUFS) to normalise the whole mix to a platform's level
+   (this measures the audio first, so the export takes a little longer). A
+   limiter always keeps the mix from clipping (peaks stay below -1 dBFS).
+7. *(Optional)* Set up vertical/Shorts export settings — see
    [above](#shorts--vertical-video-export).
-7. Click **Export**. You'll be asked to confirm if the output file already
+8. Click **Export**. You'll be asked to confirm if the output file already
    exists. Progress shows the render speed and time left. The editor stays
    usable while it renders (it exports the project as it was when you clicked
    Export). **Cancel**, **Esc** or closing the dialog stops the render.
@@ -686,13 +729,22 @@ disabled and explained when GIF is selected.
 | Import Media | Ctrl+I |
 | Export Video | Ctrl+E |
 | Show / hide the Render Queue | Ctrl+Shift+E |
+| Exit | Ctrl+Q |
 | Undo / Redo | Ctrl+Z / Ctrl+Y |
 | Play / Pause | Space |
+| Shuttle back / stop / forward | J / K / L |
+| Previous / next frame (timeline or preview focused) | Left / Right |
+| Back / forward 1 second | Shift+Left / Shift+Right |
+| Go to start / end | Home / End |
+| Previous / next edit point | Up / Down |
+| Previous / next marker | Shift+M / Ctrl+Shift+M |
+| Set In / Out point, clear both | I / O, Alt+X |
 | Split clip at playhead | S |
 | Delete selected clip | Delete |
 | Add text clip | T |
 | Add marker at playhead | M |
 | Zoom timeline in / out | Ctrl+= / Ctrl+- (or Ctrl+scroll) |
+| Zoom to fit | Shift+Z |
 | Copy / Cut / Paste at playhead | Ctrl+C / Ctrl+X / Ctrl+V |
 | Duplicate / Paste attributes | Ctrl+D / Ctrl+Alt+V |
 | Select all clips | Ctrl+A |
@@ -760,9 +812,9 @@ app. If you're running the packaged `.exe`, placing `ffmpeg.exe`/
 `ffprobe.exe` next to it also works.
 
 **A clip in my project looks blank or plays silent.** Its source media
-file has probably moved or been deleted since it was imported — restore
-the file to its original path, or re-import it and rebuild that part of
-the timeline.
+file has probably moved or been deleted since it was imported (the clip is
+red-hatched and marked "(offline)") — restore the file, or use **File >
+Relink Media...** to point the project at its new location.
 
 **I can't fit a clip where I want it to go.** Tracks don't allow
 overlapping clips by design — trim, split, or move the clip in the way

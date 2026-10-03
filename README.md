@@ -93,42 +93,49 @@ deliberately layered and documented so it is easy to read, test and extend.
 
 ```
 video_editor/
-├── main.py                  # Application entry point (splash screen, taskbar icon, etc.)
-├── build.spec                # PyInstaller build spec (produces the standalone .exe / app)
-├── build.py                  # Convenience wrapper: `python build.py`
-├── version_info.txt          # Windows .exe version resource (Company/Product/File version)
+├── main.py                  # Entry point (splash, taskbar icon, a .vproj argument, --self-test)
+├── build.spec               # PyInstaller spec (folder build: dist/VideoEditor/)
+├── build.py                 # `python build.py [--installer]`
+├── version_info.txt         # Template for the exe's version resource (filled from core.__version__)
+├── ffmpeg.lock              # Pinned FFmpeg build (version, URL, SHA256s) for CI and releases
 ├── requirements.txt
-├── core/                      # Pure-Python editing engine (no Qt dependency)
-│   ├── clip.py                 # Clip / TextStyle data models
-│   ├── track.py                # Track data model
-│   ├── project.py               # Project model + JSON save/load
-│   ├── media_asset.py            # Imported-media metadata
-│   ├── media_probe.py             # ffprobe wrapper + thumbnail generation
-│   ├── ffmpeg_utils.py             # Locate/run the ffmpeg & ffprobe binaries
-│   ├── history.py                   # Undo/redo command stack (Command pattern)
-│   ├── commands.py                   # Concrete undoable editing operations
-│   ├── filter_graph.py                # Builds the FFmpeg filter_complex graph
+├── core/                    # Pure-Python editing engine (no Qt dependency)
+│   ├── clip.py, track.py, project.py   # Data models + versioned .vproj save/load
+│   ├── media_asset.py, media_probe.py  # Imported-media metadata, ffprobe, thumbnails/filmstrips
+│   ├── waveform.py                     # Peak/RMS waveform caches (timeline + level meters)
+│   ├── ffmpeg_utils.py                 # Locate/run ffmpeg/ffprobe, NVENC and GPU-decode probes
+│   ├── history.py, commands.py         # Undo/redo (Command pattern) and the undoable operations
+│   ├── edit_ops.py, timeline_nav.py    # Multi-clip edits (clipboard, roll/slip/slide...), navigation
+│   ├── filter_graph.py                 # Builds the FFmpeg filter_complex graph
 │   ├── effects.py                      # Effect registry (schema, animatable params) + instances
 │   ├── output_color.py                 # 8/10-bit SDR and HDR (PQ/HLG) export targets
 │   ├── stabilize.py                    # vid.stab motion-analysis pass + cache
+│   ├── exporter.py, export_presets.py  # Runs FFmpeg with progress; export presets
 │   ├── render_queue.py                 # Render queue model (project snapshots)
-│   └── exporter.py                     # Runs FFmpeg, reports progress
-├── ui/                         # PySide6 UI layer (imports from core, never the reverse)
-│   ├── theme.py                  # Dark Qt stylesheet
-│   ├── main_window.py              # Menus, toolbar, panel layout, wiring
-│   ├── media_bin.py                  # Media bin panel
-│   ├── preview_player.py               # Preview panel (QMediaPlayer-based)
-│   ├── properties_panel.py               # Clip inspector panel
-│   ├── export_dialog.py                   # Export settings + progress dialog
-│   ├── render_queue.py                    # Render Queue dock
+│   ├── frame_render.py, proxy.py       # Accurate preview frames; preview proxies
+│   ├── subtitles.py, fonts.py          # SRT/WebVTT import; font files for drawtext
+│   ├── autosave.py, relink.py          # Per-session autosave; Relink Media matching
+│   └── selftest.py                     # `--self-test`
+├── ui/                      # PySide6 UI layer (imports from core, never the reverse)
+│   ├── main_window.py                  # Menus, toolbar, panel layout, wiring
+│   ├── media_bin.py, import_worker.py  # Media bin; background import
+│   ├── preview_player.py               # Preview panel (QMediaPlayer, Accurate frame, meters)
+│   ├── properties_panel.py             # Clip inspector panel
+│   ├── export_dialog.py, render_queue.py  # Export dialog; Render Queue dock
+│   ├── relink_dialog.py, help_dialogs.py  # Relink Media; shortcuts / User Guide / About
+│   ├── theme.py                        # Dark Qt stylesheet
 │   └── widgets/
-│       ├── timeline_widget.py                # The timeline panel (QGraphicsView)
-│       ├── timeline_items.py                   # Clip / ruler / header graphics items
-│       └── timeline_accessibility.py           # Screen-reader interfaces for tracks/clips
-├── tests/                     # Unit tests for the core engine (no Qt required)
+│       ├── timeline_widget.py          # The timeline panel (QGraphicsView)
+│       ├── timeline_items.py           # Clip / ruler / header graphics items
+│       └── timeline_accessibility.py   # Screen-reader interfaces for tracks/clips
+├── scripts/                 # fetch_ffmpeg.py (pinned FFmpeg into bin/), version_info.py
+├── installer/VideoEditor.iss  # Per-user Inno Setup installer
+├── tests/                   # Core unit tests (stdlib only), real-FFmpeg tests (tests/integration/)
+│                            # and offscreen Qt tests; each kind skips without its dependency
+├── docs/                    # USER_GUIDE.md, PROJECT_STATUS.md, workflows/
 └── assets/
-    └── icons/                  # App icon (PNG + Windows .ico), splash screen,
-        └── toolbar/              # and the toolbar/menu icon set (all generated art)
+    └── icons/               # App icon (PNG + .ico), splash screen,
+        └── toolbar/         # and the toolbar/menu icon set (all generated art)
 ```
 
 **Why this layout?** `core/` contains the entire editing model and the
@@ -140,8 +147,12 @@ and the two layers can be worked on independently.
 
 ## Installing
 
-Requires **Python 3.10+** and **FFmpeg** (with `ffprobe`) installed and
-available on your `PATH`.
+Requires **Python 3.10+** and **FFmpeg** (with `ffprobe`). The app looks for
+it in a `bin/` folder next to `main.py` (or inside the built app), then on your
+`PATH`, then (`ffmpeg` only) in the `imageio-ffmpeg` package. On Windows,
+`python scripts/fetch_ffmpeg.py` puts the exact, checksum-verified build CI and
+releases use (`ffmpeg.lock`, FFmpeg 9.0.1 essentials) into `bin/`. Otherwise
+install it on your `PATH`:
 
 - Windows: https://ffmpeg.org/download.html (or `winget install ffmpeg`)
 - macOS: `brew install ffmpeg`
@@ -169,12 +180,16 @@ New to the app? [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) walks through the who
 
 ## Running the tests
 
-The editing engine (`core/`) has no GUI dependency, so its test suite runs
-anywhere Python does, without a display:
+The editing engine (`core/`) has no GUI dependency, so its tests run
+anywhere Python does, without a display; the real-FFmpeg and offscreen Qt
+tests run too when FFmpeg and PySide6 are available, and skip otherwise:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -q                       # or: python -m unittest discover -s tests -v
 ```
+
+Current result (2026-10-03, Windows, with FFmpeg in `bin/` and PySide6):
+**478 passed plus 71 subtests**, none skipped.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
 
@@ -208,7 +223,9 @@ unpacking anything; the earlier single-file exe unpacked ~293 MB into
    install it separately: download an FFmpeg **Windows build** (e.g. from
    https://www.gyan.dev/ffmpeg/builds/, the "essentials" zip), and copy
    `ffmpeg.exe` and `ffprobe.exe` from its `bin\` folder into a new `bin\`
-   folder at the root of this project (next to `build.spec`).
+   folder at the root of this project (next to `build.spec`) — or just run
+   `python scripts/fetch_ffmpeg.py`, which downloads and verifies the pinned
+   build from `ffmpeg.lock` into `bin\`.
 4. Build:
    ```powershell
    python build.py               # the folder only
@@ -241,7 +258,8 @@ cross-compile (build on Windows for a `.exe`, on macOS for a macOS app).
 
 ### Automated builds
 
-Push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) and
+Push a version tag matching `core.__version__` (currently `0.2.0`:
+`git tag v0.2.0 && git push origin v0.2.0`) and
 `.github/workflows/release.yml` builds the app on GitHub's own Windows
 runner (FFmpeg bundled), self-tests it, and publishes the installer
 (`VideoEditor-<version>-setup.exe`) and a portable zip of the folder as
@@ -275,6 +293,11 @@ publishes it as a prerelease, for a one-off test build.
 | Razor tool                               | C |
 | Roll / slip / slide / ripple move (drag) | Ctrl+edge / Alt / Ctrl+Alt / Shift |
 | Select next/previous clip, edit its properties | Tab / Shift+Tab, Enter |
+| Shuttle back / stop / forward            | J / K / L |
+| Frame / second steps, start / end        | Left/Right, Shift+Left/Right, Home / End |
+| Previous / next edit point, marker       | Up / Down, Shift+M / Ctrl+Shift+M |
+| In / Out point, clear                    | I / O, Alt+X |
+| Previous / next keyframe                 | Shift+K / Ctrl+Shift+K |
 | All shortcuts                            | F1 |
 
 ## How editing works
@@ -288,7 +311,9 @@ publishes it as a prerelease, for a one-off test build.
   audio-only clip when nothing is visible) via `QMediaPlayer`. It does
   **not** perform full multi-track alpha compositing in real time — that
   would require a custom video-frame compositor. This keeps the preview
-  implementation simple and fast. The **export**, by contrast, always
+  implementation simple and fast; while paused or scrubbing, the optional
+  **Accurate frame** view shows the exact frame rendered by the export
+  engine (`core/frame_render.py`). The **export**, by contrast, always
   renders the true, fully composited multi-track timeline (transitions,
   text overlays, opacity, fades and all) through FFmpeg — what you get in
   the exported file reflects the whole timeline, not just the preview.
@@ -301,18 +326,19 @@ publishes it as a prerelease, for a one-off test build.
 
 ## Extending the app
 
-A few natural next steps, each isolated to one or two files:
-
-- **More effects** (color grading, blur, chroma key): add filter fragments
-  in `core/filter_graph.py`'s per-clip chain, and matching controls in
-  `ui/properties_panel.py`.
-- **Keyframed properties** (e.g. animating opacity over time): extend
-  `Clip` with keyframe data and generate the corresponding FFmpeg
-  expression (e.g. `enable`/`if()` expressions) in `filter_graph.py`.
-- **Proxy/low-res preview**: generate downscaled proxies in
-  `core/media_probe.py` and have `PreviewPlayer` prefer them.
-- **Real multi-track WYSIWYG preview**: replace `QMediaPlayer` with a
+- **A new effect**: register it in `core/effects.py` (its parameter schema,
+  which parameters are animatable, and the FFmpeg filter text); the
+  Properties panel's Effects list builds its controls from that schema, and
+  `core/filter_graph.py` places it in the clip's chain.
+- **A new editing operation**: add an undoable `Command` (or a composite of
+  existing ones) in `core/commands.py` / `core/edit_ops.py` and call it from
+  the UI through `History`.
+- **Real multi-track WYSIWYG playback**: replace `QMediaPlayer` with a
   custom decoder + compositor (e.g. via PyAV) feeding a `QVideoSink`.
+  Today only paused frames are exact (Accurate frame).
+
+Known gaps are listed under "Known Limitations" in
+[`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 ## License
 

@@ -14,8 +14,8 @@ While every track is empty (a brand-new project, or one that's had everything de
 2. Drag a clip horizontally to move it; drag its left/right edge (the `HANDLE_WIDTH`-wide strip at each end, `ui/widgets/timeline_items.py`) to trim in/out without affecting the rest of the timeline.
 3. Position the playhead (click the ruler, or drag it) and press **S** / click **Split** to split the selected clip at the playhead.
 4. Press **Delete** / click **Delete** to remove the selected clip.
-5. Use **+ Video Track** / **+ Audio Track** to add tracks; select a clip and click **Delete Track** to remove its track.
-6. Click a track header's **M** / **L** / **H** buttons to mute, lock, or hide that track. A locked track's clips can't be dragged or trimmed; a hidden video track is skipped entirely by both the preview and the export filter graph.
+5. Use **+ Video Track** / **+ Audio Track** to add tracks; click a track header (or select one of its clips) and click **Delete Track** to remove it.
+6. Click a track header's **M** / **L** / **H** buttons to mute, lock, or hide that track (and **D** for its ducking settings). A locked track's clips can't be dragged or trimmed; a hidden video track's picture is left out of both the preview and the export filter graph, but its embedded audio is still mixed (mute the track to silence it). Each toggle is an undoable `UpdateTrackPropertyCommand`.
 
 ## Snapping
 

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Position/scale/rotate a video/image clip (optionally animated over time), grade its color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg, none of it visible in the live preview.
+Position/scale/rotate a video/image clip (optionally animated over time), grade its color, key out a solid-color background, and/or crossfade it into the next clip on its track — all applied at export time via FFmpeg; none of it is visible during preview playback, only in the paused **Accurate frame** view (rendered by the export engine) and the exported file.
 
 ## Transform (position, scale, rotation)
 
@@ -58,7 +58,7 @@ Both were verified against real FFmpeg (a `geq` alpha ramp and an `overlay` posi
 ## Crossfade transitions
 
 1. Select a clip that has another video/image clip immediately following it on the *same track*, with no gap between them (clips can't overlap — see [timeline-editing/workflow.md](../timeline-editing/workflow.md)).
-2. In the Properties panel's **Transition** group, check **Crossfade into next clip** and set a **Duration**.
+2. In the Properties panel's **Transition** group, pick a **Transition Out** (Crossfade, Wipe Left/Right/Up/Down, Slide Left/Right/Up/Down, Circle Crop or Dissolve; each maps to an `xfade` transition via `_XFADE_TRANSITION_NAMES`) and set a **Duration** (0.1–10 s).
 3. At export, `core/filter_graph.py::_find_crossfade_partner()` detects the pair and merges both clips' chains with FFmpeg's `xfade` filter into a single composited layer, instead of two independent ones.
 
 **Known scope limits** (deliberate, to keep this contained):

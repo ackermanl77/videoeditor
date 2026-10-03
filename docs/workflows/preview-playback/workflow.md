@@ -19,7 +19,7 @@ This means the preview does **not**:
 - Show text overlays drawn on top of video underneath them — a text clip either wins as the topmost clip (shown alone) or is invisible if a video clip is on top of it in track order.
 - Show fades, transitions, or opacity.
 
-All of the above **are** rendered correctly in the exported file — export always builds the full multi-track FFmpeg filter graph (see [export/workflow.md](../export/workflow.md)). This is a deliberate trade-off for a simple, fast, maintainable preview implementation rather than a custom frame compositor; the panel shows a permanent on-screen reminder of this ("Preview shows the top active video clip only...").
+All of the above **are** rendered correctly in the exported file — export always builds the full multi-track FFmpeg filter graph (see [export/workflow.md](../export/workflow.md)). This is a deliberate trade-off for a simple, fast, maintainable preview implementation rather than a custom frame compositor; the panel shows a permanent on-screen reminder of this ("Playback shows the top active video clip only. Tick 'Accurate frame' to see the exact export composite (transitions, text, effects) while paused."). While paused or scrubbing, **Accurate frame** closes the gap (see below).
 
 ## Playback across gaps and speed
 
@@ -27,11 +27,11 @@ All of the above **are** rendered correctly in the exported file — export alwa
 - The timeline<->source mapping goes through the clip's speed segments (`Clip.source_offset_at()`/`timeline_offset_at()`/`speed_at()`), and the playback rate follows the segment under the playhead, so speed-ramped clips no longer drift (it used the constant `speed` only).
 - Property edits don't reseek: `PreviewPlayer.refresh_after_edit()` reseeks only when the clip under the playhead changed in a way this preview shows (source, trim, timing, speed); volume/mute are applied in place. Every Properties slider tick used to call `QMediaPlayer.setPosition()`.
 - Keyboard transport (**Playback** menu): J/K/L shuttle (repeat J or L for 2x/4x; reverse is stepped by seeking, since `QMediaPlayer` can't play backwards). The time label shows `HH:MM:SS:FF` at the project frame rate.
-- Not done yet: preloading the next clip's file in a second player, so a cut between two different files still pauses briefly while `QMediaPlayer` opens the next one.
+- Cuts between two different files no longer pause: the next file is preloaded in a second player (see "Accurate frame, preloading and proxies" below).
 
 ## Validation
 
-There is no automated test for `PreviewPlayer` (it requires `QMediaPlayer`/a live event loop and, for real playback, actual media files with a working backend). Verify manually: play across a gap between clips, scrub during playback, and confirm a video clip on a higher track correctly takes over from one below it as the playhead crosses into its span.
+Offscreen Qt tests cover the preview's logic without real playback: preloading, proxies and dropping stale Accurate-frame results (`tests/test_p2_ui.py`), and the level meters and stepped playback of reversed/frozen clips (`tests/test_p4_ui.py`); `tests/integration/` checks rendered preview frames against the export with real FFmpeg. Actual `QMediaPlayer` output still needs a manual check: play across a gap between clips, scrub during playback, and confirm a video clip on a higher track correctly takes over from one below it as the playhead crosses into its span.
 
 ## Accurate frame, preloading and proxies (P2)
 
