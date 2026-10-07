@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
       - run: python -m unittest discover -s tests -v
 
   build-and-release:
@@ -47,14 +47,15 @@ jobs:
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
 
       - name: Check the tag matches core.__version__
         if: github.ref_type == 'tag'
         run: python scripts/version_info.py --check-tag "${{ github.ref_name }}"
 
+      # The tested versions (requirements-lock.txt, scripts/make_lock.py).
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-build.txt -c requirements-lock.txt
 
       # Bundles the "essentials" FFmpeg build, not "full" -- see
       # docs/workflows/packaging/workflow.md for the size trade-off. The

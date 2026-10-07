@@ -1,0 +1,5 @@
+# Everything a release build needs: the runtime plus PyInstaller. Install with the lock as
+# constraints so a rebuild gets the tested versions:
+#   pip install -r requirements-build.txt -c requirements-lock.txt
+-r requirements.txt
+pyinstaller>=6.3

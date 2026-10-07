@@ -213,12 +213,16 @@ unpacking anything; the earlier single-file exe unpacked ~293 MB into
 ### Windows, step by step
 
 1. Open **PowerShell** (or Command Prompt) in the project folder.
-2. Create and activate a virtual environment, then install dependencies:
+2. Create and activate a virtual environment with the Python version releases
+   use (`.python-version`, currently 3.14), then install the build
+   dependencies at their tested versions:
    ```powershell
-   py -m venv .venv
+   py -3.14 -m venv .venv
    .venv\Scripts\activate
-   pip install -r requirements.txt
+   pip install -r requirements-build.txt -c requirements-lock.txt
    ```
+   (`requirements.txt` alone is the runtime; `scripts/make_lock.py`
+   regenerates the lock from a clean venv when a bound is raised.)
 3. *(Optional but recommended)* Bundle FFmpeg so your users don't need to
    install it separately: download an FFmpeg **Windows build** (e.g. from
    https://www.gyan.dev/ffmpeg/builds/, the "essentials" zip), and copy
@@ -231,6 +235,11 @@ unpacking anything; the earlier single-file exe unpacked ~293 MB into
    python build.py               # the folder only
    python build.py --installer   # the folder, then the installer (needs Inno Setup 6)
    ```
+   `build.py` stops when the interpreter isn't the `.python-version` one
+   (`--any-python` overrides). `--sign` Authenticode-signs the exe and the
+   installer with signtool (Windows SDK) and the certificate whose SHA-1
+   thumbprint is in `VIDEO_EDITOR_SIGN_THUMBPRINT`, timestamped (DigiCert by
+   default; `VIDEO_EDITOR_TIMESTAMP_URL` changes it).
 5. Your app is at `dist\VideoEditor\VideoEditor.exe` — share the whole
    `dist\VideoEditor\` folder (zipped), not just the exe. With
    `--installer`, `dist\installer\VideoEditor-<version>-setup.exe` installs
