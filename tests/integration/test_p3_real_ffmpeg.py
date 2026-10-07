@@ -43,8 +43,12 @@ def setUpModule():
     p2.setUpModule()
     _TMP = tempfile.mkdtemp(prefix="ve_p3_integration_")
     FIX["grad10"] = os.path.join(_TMP, "grad10.mkv")
+    # A horizontal ramp of odd 10-bit levels (65, 71, ... 827): none survives a trip through
+    # 8 bits, so any value that isn't a multiple of 4 after an export proves 10-bit precision.
+    # (The lavfi "gradients" source used before is random by default and stepped in multiples
+    # of 4, so the check only passed when a lossy encoder happened to add odd values.)
     _run([FFMPEG, "-y", "-v", "error", "-f", "lavfi", "-i",
-          f"gradients=s={W}x{H}:d=1:r=30:speed=0:c0=black:c1=white:x0=0:y0=0:x1={W}:y1=0,format=yuv420p10le",
+          f"nullsrc=s={W}x{H}:d=1:r=30,format=yuv420p10le,geq=lum='65+X*6':cb=512:cr=512",
           "-c:v", "ffv1", FIX["grad10"]])
     for kind, trc in (("pq", "smpte2084"), ("hlg", "arib-std-b67")):
         FIX[kind] = os.path.join(_TMP, f"{kind}.mp4")
