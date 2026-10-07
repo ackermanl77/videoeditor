@@ -214,7 +214,9 @@ points (**Alt+X** clears them); the Export dialog's Trim Range starts from
 them. Times are shown as `HH:MM:SS:FF` timecode.
 
 **Clip look.** Video clips show a filmstrip of frames along the clip and audio
-shows its waveform. Lettered badges mark what's applied to a clip (hover one
+shows its waveform, drawn at the clip's volume: it follows the volume
+automation, is flat when the clip is muted, and peaks that the volume pushes past
+full scale turn red (they will clip). Lettered badges mark what's applied to a clip (hover one
 for its name), and a small glyph at the end marks a transition out. When
 that transition can't be applied -- no clip right after it (a gap, or the end of
 the track), a next clip of another kind, a speed ramp on either side, clips too

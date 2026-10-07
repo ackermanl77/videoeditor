@@ -156,3 +156,20 @@ def window_levels(data: WaveformData, source_time: float, window_s: float = 0.12
     peak = max(peaks[start:end]) if peaks else 0.0
     rms = sum(rms_values[start:end]) / max(1, end - start)
     return float(peak), float(rms)
+
+
+def display_gains(clip, count: int) -> List[float]:
+    """The gain at `count` evenly spaced points across `clip` (F11), for drawing its
+    waveform as it will sound: 0 when muted, the volume automation envelope when it
+    has one (clip-local timeline seconds, piecewise linear -- what the export's
+    volume filter applies), else the scalar volume."""
+    from core.clip import interpolate_keyframes
+
+    if count <= 0:
+        return []
+    if clip.muted:
+        return [0.0] * count
+    if not clip.has_volume_automation:
+        return [max(0.0, float(clip.volume))] * count
+    duration = max(clip.duration, 1e-9)
+    return [max(0.0, interpolate_keyframes(clip.volume_keyframes, (i + 0.5) / count * duration)[0]) for i in range(count)]

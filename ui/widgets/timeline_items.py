@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from core.clip import Clip, MediaType
 from core.timeline_nav import clip_keyframe_points, format_timecode
+from core.waveform import display_gains
 from ui import theme
 
 TRACK_HEIGHT = 64
@@ -514,16 +515,20 @@ class ClipItem(QGraphicsObject):
         m = len(peaks)
         max_bars = min(width, 640)
         step_px = max(1, width // max_bars)
-        for x in range(0, width, step_px):
+        # Drawn as it will sound (F11): scaled by the clip's volume / automation envelope, flat
+        # when muted; a peak the gain pushes past full scale is red (it will clip).
+        gains = display_gains(self._model, -(-width // step_px))
+        for bar, x in enumerate(range(0, width, step_px)):
             a = int(x * m / width)
             b = max(a + 1, int((x + step_px) * m / width))
-            peak = max(peaks[a:b], default=0.0)
-            rms = sum(rms_values[a:b]) / max(1, b - a)
-            rms_h = rms * half
-            peak_h = peak * half
+            gain = gains[bar] if bar < len(gains) else 1.0
+            peak = max(peaks[a:b], default=0.0) * gain
+            rms = sum(rms_values[a:b]) / max(1, b - a) * gain
+            rms_h = min(rms, 1.0) * half
+            peak_h = min(peak, 1.0) * half
             painter.setPen(QPen(QColor(255, 255, 255, 80), 1))
             painter.drawLine(int(x), int(mid - rms_h), int(x), int(mid + rms_h))
-            painter.setPen(QPen(QColor(255, 255, 255, 175), 1))
+            painter.setPen(QPen(QColor(theme.COLOR_DANGER) if peak > 1.0 else QColor(255, 255, 255, 175), 1))
             painter.drawLine(int(x), int(mid - peak_h), int(x), int(mid + peak_h))
 
     # -- interaction ------------------------------------------------------
