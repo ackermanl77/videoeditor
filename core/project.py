@@ -161,6 +161,13 @@ def write_json_atomic(path: str, data: Any, indent: Optional[int] = None) -> Non
         raise
 
 
+# Marker colours offered by the timeline (F15); any "#rrggbb" a project holds still shows.
+MARKER_COLORS = {
+    "Blue": "#3b82f6", "Red": "#ef4444", "Orange": "#f97316", "Yellow": "#eab308",
+    "Green": "#22c55e", "Purple": "#a855f7", "Pink": "#ec4899", "Gray": "#9ca3af",
+}
+
+
 @dataclass
 class Marker:
     """A named point on the project's shared timeline (a "chapter" point).

@@ -590,6 +590,28 @@ class RenameMarkerCommand(Command):
             marker.name = self.old_name
 
 
+class RecolorMarkerCommand(Command):
+    """Change a marker's colour (F15)."""
+
+    def __init__(self, project: Project, marker_id: str, color: str):
+        self.project = project
+        self.marker_id = marker_id
+        self.new_color = color
+        marker = project.find_marker(marker_id)
+        self.old_color = marker.color if marker else ""
+        self.label = "Recolor Marker"
+
+    def do(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.color = self.new_color
+
+    def undo(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.color = self.old_color
+
+
 # Clip attributes whose change alters Clip.duration (and so can push a clip
 # into the next one on its track).
 DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "source_in", "source_out", "freeze_frame_duration"})

@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPen,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.clip import Clip, MediaType
+from core.project import MARKER_COLORS
 from core.timeline_nav import clip_keyframe_points, format_timecode
 from core.waveform import display_gains
 from ui import theme
@@ -171,6 +173,7 @@ class TimelineSignals(QObject):
     marker_clicked = Signal(str)  # marker_id -> seek the playhead there
     marker_rename_requested = Signal(str, str)  # marker_id, new_name
     marker_delete_requested = Signal(str)  # marker_id
+    marker_color_requested = Signal(str, str)  # marker_id, "#rrggbb" (F15)
 
 
 class ClipItem(QGraphicsObject):
@@ -1028,8 +1031,20 @@ class MarkerItem(QGraphicsObject):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu()
         rename_action = menu.addAction("Rename...")
+        color_menu = menu.addMenu("Colour")
+        color_actions = {}
+        for color_name, value in MARKER_COLORS.items():
+            swatch = QPixmap(12, 12)
+            swatch.fill(QColor(value))
+            action = color_menu.addAction(QIcon(swatch), color_name)
+            action.setCheckable(True)
+            action.setChecked(value.lower() == str(self.color).lower())
+            color_actions[action] = value
         delete_action = menu.addAction("Delete Marker")
         chosen = menu.exec(event.screenPos())
+        if chosen in color_actions:
+            self.signals.marker_color_requested.emit(self.marker_id, color_actions[chosen])
+            return
         if chosen == rename_action:
             self.signals.marker_rename_requested.emit(self.marker_id, self.name)
         elif chosen == delete_action:

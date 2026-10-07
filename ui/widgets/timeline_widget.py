@@ -40,6 +40,7 @@ from core.commands import (
     RemoveClipCommand,
     RemoveMarkerCommand,
     RemoveTrackCommand,
+    RecolorMarkerCommand,
     RenameMarkerCommand,
     SplitClipCommand,
     TrimClipCommand,
@@ -507,6 +508,7 @@ class TimelineWidget(QWidget):
         self.signals.marker_clicked.connect(self._on_marker_clicked)
         self.signals.marker_rename_requested.connect(self._on_marker_rename_requested)
         self.signals.marker_delete_requested.connect(self._on_marker_delete_requested)
+        self.signals.marker_color_requested.connect(self._on_marker_color_requested)
 
     # ------------------------------------------------------------------
     def set_project(self, project: Project, history: History) -> None:
@@ -1152,6 +1154,16 @@ class TimelineWidget(QWidget):
         if not ok or not new_name.strip() or new_name.strip() == current_name:
             return
         self.history.execute(RenameMarkerCommand(self.project, marker_id, new_name.strip()))
+        self.rebuild()
+        self._emit_modified()
+
+    def _on_marker_color_requested(self, marker_id: str, color: str) -> None:
+        if self.project is None or self.history is None:
+            return
+        marker = self.project.find_marker(marker_id)
+        if marker is None or marker.color.lower() == color.lower():
+            return
+        self.history.execute(RecolorMarkerCommand(self.project, marker_id, color))
         self.rebuild()
         self._emit_modified()
 
