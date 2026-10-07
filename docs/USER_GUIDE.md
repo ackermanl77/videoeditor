@@ -236,7 +236,9 @@ track — handy for noting "intro ends here" or "add B-roll here."
   **M**, or use **Timeline > Add Marker at Playhead**. You'll be asked to
   name it.
 - Markers show as a small colored flag with a dashed line through the
-  tracks. **Left-click** to seek there; **right-click** to **Rename** or
+  tracks. **Left-click** to seek there; **right-click** to **Rename**, pick a
+  **Colour** (blue, red, orange, yellow, green, purple, pink or gray -- to sort
+  chapters, cuts and notes at a glance; undoable and saved with the project) or
   **Delete**.
 - Markers participate in snapping, just like clip edges and the playhead.
 - **On export, every marker becomes a real, player-navigable chapter** —
@@ -663,6 +665,10 @@ video file.
 
 **File > Export Video...** (**Ctrl+E**) renders your full, composited
 timeline to a real video file via FFmpeg.
+
+**File > Export Frame...** (**Ctrl+Alt+E**) saves the single frame under the
+playhead as a PNG or JPEG still -- composited exactly as the export renders it
+(every track, text, effects, transitions), at the project's full resolution.
 
 1. *(Optional)* Pick a **Preset**: YouTube 1080p, YouTube 4K (HEVC),
    Shorts/Reels/TikTok, Archive (ProRes) or Animated GIF, or one you saved

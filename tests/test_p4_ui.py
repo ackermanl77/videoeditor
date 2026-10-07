@@ -258,3 +258,56 @@ class PreviewMeterTests(_QtCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameExportUiTests(_QtCase):  # F15: File > Export Frame
+    _window = SubtitleImportTests._window
+
+    def test_export_frame_writes_png_and_jpeg_at_the_playhead(self):
+        from PySide6.QtGui import QColor, QImage
+
+        window = self._window()
+        window.project.tracks[0].clips.append(Clip(media_type=MediaType.VIDEO, source_path="x.mp4", source_out=5.0))
+        window.timeline.set_playhead(2.5)
+        image = QImage(64, 36, QImage.Format_RGB32)
+        image.fill(QColor("#336699"))
+        from PySide6.QtCore import QBuffer
+
+        buffer = QBuffer()
+        buffer.open(QBuffer.WriteOnly)
+        image.save(buffer, "PNG")
+        calls = []
+        folder = tempfile.mkdtemp(prefix="ve_frame_")
+        with patch("ui.main_window.render_frame", lambda project, t, size, timeout: calls.append((t, size)) or bytes(buffer.data())):
+            png = window.export_frame_dialog(os.path.join(folder, "still.png"))
+            jpg = window.export_frame_dialog(os.path.join(folder, "still.jpg"))
+            bare = window.export_frame_dialog(os.path.join(folder, "still"))
+        self.assertEqual([c[0] for c in calls], [2.5, 2.5, 2.5])
+        self.assertEqual(calls[0][1], (window.project.settings.width // 2 * 2, window.project.settings.height // 2 * 2))
+        self.assertTrue(QImage(png).width() == 64 and QImage(jpg).width() == 64)
+        self.assertTrue(bare.endswith("still.png"))
+        with open(jpg, "rb") as handle:
+            self.assertEqual(handle.read(2), b"\xff\xd8")  # really a JPEG
+
+
+class MarkerColourTests(_QtCase):  # F15: marker colours
+    def test_recolouring_a_marker_is_undoable_and_saved(self):
+        from core.commands import RecolorMarkerCommand
+        from core.project import MARKER_COLORS
+
+        project = Project()
+        marker = project.add_marker(2.0, "Intro")
+        history = History()
+        timeline = TimelineWidget()
+        timeline.set_project(project, history)
+        timeline.signals.marker_color_requested.emit(marker.id, MARKER_COLORS["Red"])
+        self.assertEqual(marker.color, MARKER_COLORS["Red"])
+        self.assertEqual(Project.from_dict(project.to_dict()).markers[0].color, MARKER_COLORS["Red"])
+        self.assertEqual(timeline._marker_items[0].color, MARKER_COLORS["Red"])
+        history.undo()
+        self.assertEqual(marker.color, "#3b82f6")
+        # Picking the colour it already has adds no undo step.
+        before = len(history._undo_stack)
+        timeline.signals.marker_color_requested.emit(marker.id, "#3b82f6")
+        self.assertEqual(len(history._undo_stack), before)
+        self.assertIsInstance(RecolorMarkerCommand(project, marker.id, "#000000").label, str)

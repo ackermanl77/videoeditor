@@ -8,8 +8,9 @@ import threading
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -29,6 +30,7 @@ from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip
 from core.commands import AddClipCommand, AddTrackCommand
 from core.ffmpeg_utils import binary_version, encoder_supports_10bit, nvenc_available
+from core.frame_render import FrameRenderError, full_size, render_frame
 from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.project import Project, write_backup_copy
@@ -245,6 +247,7 @@ class MainWindow(QMainWindow):
         self.import_subtitles_action = self._add_action(file_menu, "Import Subtitles...", self.import_subtitles_dialog)
         self.relink_action = self._add_action(file_menu, "Relink Media...", self.open_relink_dialog)
         self.export_action = self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
+        self.export_frame_action = self._add_action(file_menu, "Export Frame...", self.export_frame_dialog, "Ctrl+Alt+E")
         self.render_queue_action = self.render_queue_dock.toggleViewAction()
         self.render_queue_action.setText("Render Queue")
         self.render_queue_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
@@ -1119,6 +1122,38 @@ class MainWindow(QMainWindow):
         self._export_dialogs.append(dialog)
         dialog.destroyed.connect(lambda _obj=None, d=dialog: self._forget_export_dialog(d))
         dialog.show()
+
+    def export_frame_dialog(self, path: str | None = None) -> str | None:
+        """Save the frame under the playhead -- composited as the export renders it, at the
+        project's full resolution -- as PNG or JPEG (F15). `path` skips the file dialog."""
+        if not self.project.tracks or self.project.total_duration <= 0:
+            QMessageBox.information(self, "Export Frame", "Add some clips to the timeline first.")
+            return None
+        t = self.timeline.playhead_time
+        if path is None:
+            stamp = format_timecode(t, self.project.settings.fps).replace(":", "-").replace(";", "-")
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Frame", f"{self.project.name}_{stamp}.png", "PNG image (*.png);;JPEG image (*.jpg *.jpeg)"
+            )
+            if not path:
+                return None
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            path += ".png"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            data = render_frame(self.project, t, full_size(self.project), timeout=80.0)
+            if path.lower().endswith(".png"):
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            elif not QImage.fromData(data, "PNG").save(path, "JPG", 95):
+                raise OSError(f"couldn't write {path}")
+        except (FrameRenderError, OSError) as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Export Frame", f"The frame couldn't be exported:\n{exc}")
+            return None
+        QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"Frame at {format_timecode(t, self.project.settings.fps)} saved to {path}", 6000)
+        return path
 
     def queue_export(self, settings) -> None:
         """Queue an export of the project as it is right now (a snapshot) and show the queue."""

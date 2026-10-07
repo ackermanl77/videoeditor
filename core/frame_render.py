@@ -101,3 +101,18 @@ def render_frame(
         detail = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         raise FrameRenderError(detail[-1] if detail else "FFmpeg produced no frame.")
     return result.stdout
+
+
+def full_size(project: Project) -> Tuple[int, int]:
+    """The project's own frame size, rounded down to even dimensions."""
+    return max(2, project.settings.width // 2 * 2), max(2, project.settings.height // 2 * 2)
+
+
+def export_frame(project: Project, t: float, path: str, timeout: float = FRAME_RENDER_TIMEOUT_S * 4) -> str:
+    """Write the composited frame at timeline time ``t`` -- what the export
+    shows there, at the project's full resolution -- to ``path`` as a PNG
+    (F15 "frame export"). Returns the path; raises :class:`FrameRenderError`."""
+    data = render_frame(project, t, full_size(project), timeout=timeout)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path

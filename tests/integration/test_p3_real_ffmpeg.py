@@ -260,3 +260,20 @@ class StabilizeAndAnimationTests(unittest.TestCase):  # B7 vidstab, F12
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/FFprobe not found")
+class FrameExportTests(unittest.TestCase):  # F15 "frame export"
+    def test_the_frame_under_the_playhead_is_written_at_full_resolution(self):
+        from core.frame_render import export_frame
+
+        asset = _probe_asset("grad10")
+        project = _project(asset, size=(320, 180))
+        project.tracks[0].clips.append(_clip(asset))
+        out = os.path.join(_TMP, "frame.png")
+        with patch("core.frame_render.find_binary", return_value=FFMPEG):
+            self.assertEqual(export_frame(project, 0.5, out), out)
+        with open(out, "rb") as handle:
+            header = handle.read(24)
+        self.assertEqual(header[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">II", header[16:24]), (320, 180))  # the project's size, not a preview's
