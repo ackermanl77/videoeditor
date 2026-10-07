@@ -65,6 +65,7 @@ from core.edit_ops import (
     copy_clips,
     linked_clip_ids,
 )
+from core.filter_graph import track_transition_issues
 from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.project import Project
@@ -560,6 +561,7 @@ class TimelineWidget(QWidget):
         offline_cache: Dict[str, bool] = {}
         seen = set()
         for row, track in enumerate(self._row_tracks):
+            issues = track_transition_issues(track)
             for clip in track.sorted_clips():
                 seen.add(clip.id)
                 item = self._clip_items.get(clip.id)
@@ -571,6 +573,7 @@ class TimelineWidget(QWidget):
                 item.set_row(row)
                 item.set_source_clip(clip)
                 item.set_locked(track.locked)
+                item.set_transition_issue(issues.get(clip.id))
         for clip_id in [cid for cid in self._clip_items if cid not in seen]:
             item = self._clip_items.pop(clip_id)
             self.scene.removeItem(item)
@@ -669,8 +672,19 @@ class TimelineWidget(QWidget):
             self.rebuild()
             return
         item.set_source_clip(clip)
+        self._refresh_transition_issues(clip_id)
         self.ruler_item.set_scale(self.pixels_per_second, max(self.project.total_duration, 60.0))
         self.scene.setSceneRect(0, 0, self._scene_width(), self._scene_height())
+
+    def _refresh_transition_issues(self, clip_id: str) -> None:
+        """A clip's edit can make its neighbours' transitions join or not (F14)."""
+        for track in self.project.tracks:
+            if any(c.id == clip_id for c in track.clips):
+                issues = track_transition_issues(track)
+                for clip in track.clips:
+                    item = self._clip_items.get(clip.id)
+                    if item is not None:
+                        item.set_transition_issue(issues.get(clip.id))
 
     def _update_empty_hint(self) -> None:
         has_any_clip = self.project is not None and any(track.clips for track in self.project.tracks)
@@ -757,6 +771,8 @@ class TimelineWidget(QWidget):
         item.razor_mode = self.razor_mode
         if track is not None and track.locked:
             item.set_locked(True)
+        if track is not None:
+            item.set_transition_issue(track_transition_issues(track).get(clip.id))
         self.scene.addItem(item)
         self._clip_items[clip.id] = item
 

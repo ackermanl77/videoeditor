@@ -228,3 +228,31 @@ class DuckToggleIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 is not installed in this interpreter")
+class TransitionNotAppliedTests(unittest.TestCase):
+    """F14: a clip whose transition out won't render is marked and says why."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_a_gap_marks_the_transition_and_closing_it_clears_the_mark(self):
+        project = Project(name="Transition marks")
+        track = project.tracks[0]
+        first = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0, timeline_start=0.0,
+                     transition_out=TransitionType.CROSSFADE, transition_duration=1.0)
+        second = Clip(media_type=MediaType.VIDEO, source_in=0.0, source_out=5.0, timeline_start=6.0)
+        track.clips = [first, second]
+        widget = TimelineWidget()
+        widget.set_project(project, History())
+        item = widget._clip_items[first.id]
+        self.assertEqual(item.transition_issue, "there's a gap before the next clip")
+        self.assertIn("Transition not applied: there's a gap", item.toolTip())
+        self.assertIsNone(widget._clip_items[second.id].transition_issue)
+
+        second.timeline_start = 5.0  # closing the gap
+        widget.refresh_clip(second.id)  # the Properties panel path: neighbours re-checked too
+        self.assertIsNone(item.transition_issue)
+        self.assertNotIn("Transition not applied", item.toolTip())

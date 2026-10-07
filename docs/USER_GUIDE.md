@@ -215,7 +215,11 @@ them. Times are shown as `HH:MM:SS:FF` timecode.
 
 **Clip look.** Video clips show a filmstrip of frames along the clip and audio
 shows its waveform. Lettered badges mark what's applied to a clip (hover one
-for its name), and a small glyph at the end marks a transition out.
+for its name), and a small glyph at the end marks a transition out. When
+that transition can't be applied -- no clip right after it (a gap, or the end of
+the track), a next clip of another kind, a speed ramp on either side, clips too
+short for it, or a clip that already ends the previous transition -- the glyph
+turns into a solid red cross with a "!", and hovering the clip says why.
 
 **Narrow windows.** If the window gets too narrow for every timeline
 toolbar button to fit on one row, the extra buttons wrap onto additional

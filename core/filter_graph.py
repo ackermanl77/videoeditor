@@ -30,7 +30,7 @@ from core.media_asset import MediaAsset
 from core.output_color import REFERENCE_WHITE_NITS, SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
 from core.stabilize import StabilizeJob, make_job
-from core.track import TrackType
+from core.track import Track, TrackType
 
 # Minimum overlap FFmpeg's xfade is allowed to use for a crossfade — below
 # this it's not worth the extra filter graph complexity over a hard cut.
@@ -925,6 +925,65 @@ def _find_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:
     if _crossfade_duration(clip, nxt) <= MIN_CROSSFADE_SECONDS:
         return None
     return i + 1
+
+
+def transition_issue(clips: List[Clip], i: int) -> Optional[str]:
+    """Why ``clips[i]``'s requested transition out won't be rendered, or
+    None when it isn't requested or does join (F14: the timeline marks such
+    a clip). ``clips`` is the track's clips in timeline order, as passed to
+    :func:`_find_crossfade_partner` / :func:`_find_audio_crossfade_partner`,
+    whose rules this spells out."""
+    clip = clips[i]
+    if not clip.has_transition:
+        return None
+    audio = clip.media_type == MediaType.AUDIO
+    if not audio and len(clip.speed_keyframes) >= 2:
+        return "this clip has a speed ramp"
+    if i + 1 >= len(clips):
+        return "no clip follows it on this track"
+    nxt = clips[i + 1]
+    if audio and nxt.media_type != MediaType.AUDIO:
+        return "the next clip isn't audio"
+    if not audio and nxt.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
+        return "the next clip isn't a video or an image"
+    if not audio and len(nxt.speed_keyframes) >= 2:
+        return "the next clip has a speed ramp"
+    if abs(nxt.timeline_start - clip.timeline_end) > 0.02:
+        return "there's a gap before the next clip"
+    if _crossfade_duration(clip, nxt) <= MIN_CROSSFADE_SECONDS:
+        return "the clips are too short for it"
+    if i in _transition_partners(clips, audio):
+        return "it already ends the previous clip's transition (transitions can't be chained)"
+    return None
+
+
+def _transition_partners(clips: List[Clip], audio: bool) -> set:
+    """Indices taken as the second half of a pair, by the renderer's own
+    left-to-right pass: a clip that ends one transition can't start another."""
+    finder = _find_audio_crossfade_partner if audio else _find_crossfade_partner
+    taken: set = set()
+    for index in range(len(clips)):
+        if index in taken:
+            continue
+        partner = finder(clips, index)
+        if partner is not None:
+            taken.add(partner)
+    return taken
+
+
+def track_transition_issues(track: Track) -> Dict[str, str]:
+    """{clip id: reason} for every clip on `track` whose transition out
+    won't be rendered, judged on the same clip list the renderer uses (an
+    audio track's audio clips only)."""
+    clips = track.sorted_clips()
+    if track.track_type == TrackType.AUDIO:
+        clips = [c for c in clips if c.media_type == MediaType.AUDIO]
+    issues = {}
+    for i, clip in enumerate(clips):
+        reason = transition_issue(clips, i)
+        if reason:
+            issues[clip.id] = reason
+    return issues
 
 
 def _find_audio_crossfade_partner(clips: List[Clip], i: int) -> Optional[int]:

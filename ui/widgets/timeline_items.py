@@ -217,6 +217,9 @@ class ClipItem(QGraphicsObject):
         self._effect_badges = _active_effect_badges(clip)
         self._transition_out = clip.transition_out
         self._transition_duration = clip.transition_duration
+        # Why the transition out won't render (core.filter_graph.track_transition_issues), set by
+        # the timeline, which knows the neighbours; None when it joins or there's none (F14).
+        self.transition_issue: Optional[str] = None
         # A private copy of the model clip, so trim drags compute the
         # trimmed duration exactly as the model will (speed ramps included)
         # instead of assuming one constant speed.
@@ -270,7 +273,17 @@ class ClipItem(QGraphicsObject):
         """Tooltip and accessible name/description (the screen reader's view of this clip)."""
         self.accessible_name = clip_accessible_name(clip, self.track_name, self.fps)
         self.accessible_description = clip_description(clip, self.track_name, self.fps, self.offline)
+        if self.transition_issue:
+            self.accessible_description += f" Transition not applied: {self.transition_issue}."
         self.setToolTip(self.accessible_description)
+
+    def set_transition_issue(self, reason: Optional[str]) -> None:
+        """F14: mark a transition out that won't render, and say why in the tooltip."""
+        if reason == self.transition_issue:
+            return
+        self.transition_issue = reason
+        self._describe(self._model)
+        self.update()
 
     def keyframe_times(self) -> List[float]:
         """Clip-local times of the keyframe ticks drawn on this clip."""
@@ -457,9 +470,19 @@ class ClipItem(QGraphicsObject):
         y0 = 4.0
         y1 = min(rect.height() - 4.0, y0 + 18.0)
         painter.save()
-        painter.setPen(QPen(QColor(255, 255, 255, 170), 1, Qt.DashLine))
+        if self.transition_issue:
+            # Not applied (F14): a solid warning-coloured cross with "!" -- the tooltip says why.
+            painter.setPen(QPen(QColor(theme.COLOR_DANGER), 2, Qt.SolidLine))
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 170), 1, Qt.DashLine))
         painter.drawLine(int(x0), int(y0), int(rect.width() - 2), int(y1))
         painter.drawLine(int(x0), int(y1), int(rect.width() - 2), int(y0))
+        if self.transition_issue:
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(EFFECT_BADGE_FONT_PT)
+            painter.setFont(font)
+            painter.drawText(QRectF(x0 - 12.0, y0, 10.0, y1 - y0), Qt.AlignCenter, "!")
         painter.restore()
 
     def _paint_waveform(self, painter: QPainter, rect: QRectF, top: float, bottom: float) -> None:
