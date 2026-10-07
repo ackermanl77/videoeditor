@@ -811,9 +811,10 @@ the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
   there.
 - **Your window size and panel layout are remembered** between sessions,
   so you don't have to re-arrange things every time you open the app.
-- **GPU decoding is opt-in.** Set the environment variable
-  `VIDEO_EDITOR_HWACCEL=auto` before starting the app (or `d3d11va` / `cuda`
-  for just one method) to let FFmpeg decode video on the graphics card during
+- **GPU decoding is opt-in.** Pick **Playback > GPU Decoding > Auto** (or
+  D3D11VA / CUDA for just one method; remembered between sessions) -- or set
+  the environment variable `VIDEO_EDITOR_HWACCEL` before starting the app,
+  which then takes priority and locks the menu -- to let FFmpeg decode video on the graphics card during
   export, Accurate frame, proxies and thumbnails. If the GPU decoder fails,
   the same job runs again with normal (software) decoding, so it can only cost
   time, never a failed export. It mostly helps with heavy 4K HEVC/AV1 camera

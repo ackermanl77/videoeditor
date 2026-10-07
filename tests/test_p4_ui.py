@@ -365,3 +365,35 @@ class CanvasTransformTests(_QtCase):  # F15: on-canvas transform
         self.assertIsNotNone(window._transform_target())
         window.timeline.set_playhead(8.0)
         self.assertIsNone(window._transform_target())  # not under the playhead
+
+
+class GpuDecodingMenuTests(_QtCase):  # PG2: GPU decoding setting in the UI
+    def test_the_choice_switches_decoding_and_is_remembered(self):
+        from core import ffmpeg_utils
+
+        with patch.dict(os.environ, {}, clear=False), patch.object(ffmpeg_utils, "LAUNCH_DECODE_HWACCEL", None), \
+                patch("ui.main_window.LAUNCH_DECODE_HWACCEL", None):
+            os.environ.pop(ffmpeg_utils.DECODE_HWACCEL_ENV, None)
+            window = SubtitleImportTests._window(self)
+            self.assertTrue(window.gpu_decoding_actions["off"].isChecked())
+            self.assertEqual(ffmpeg_utils.decode_hwaccel_modes(), [None])
+            saved = {}
+
+            class _Settings:  # the tests' QSettings has no organisation, so it stores nothing
+                def setValue(self, key, value):
+                    saved[key] = value
+
+            with patch("ui.main_window.QSettings", _Settings):
+                window.gpu_decoding_actions["cuda"].trigger()
+            self.assertEqual(ffmpeg_utils.decode_hwaccel_modes(), ["cuda", None])
+            self.assertEqual(saved, {"decode/hwaccel": "cuda"})
+            self.assertTrue(window.gpu_decoding_actions["cuda"].isChecked())
+            window.set_gpu_decoding("off")
+            self.assertEqual(ffmpeg_utils.decode_hwaccel_modes(), [None])
+
+    def test_a_value_set_outside_the_app_wins_and_locks_the_menu(self):
+        with patch.dict(os.environ, {"VIDEO_EDITOR_HWACCEL": "auto"}), patch("ui.main_window.LAUNCH_DECODE_HWACCEL", "auto"):
+            window = SubtitleImportTests._window(self)
+            self.assertTrue(window.gpu_decoding_actions["auto"].isChecked())
+            self.assertFalse(window.gpu_decoding_actions["off"].isEnabled())
+            self.assertEqual(os.environ["VIDEO_EDITOR_HWACCEL"], "auto")

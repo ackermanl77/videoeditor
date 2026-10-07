@@ -83,8 +83,8 @@ deliberately layered and documented so it is easy to read, test and extend.
   23.976/29.97/59.94 rates
 - **Robust projects**: versioned file format, relative media paths, Relink
   Media, per-session autosave, `.bak` on save
-- **Optional GPU decoding**: set `VIDEO_EDITOR_HWACCEL=auto` (or `d3d11va` /
-  `cuda`) to decode video on the GPU for exports, preview frames, proxies and
+- **Optional GPU decoding**: **Playback > GPU Decoding** (or
+  `VIDEO_EDITOR_HWACCEL=auto` / `d3d11va` / `cuda`) decodes video on the GPU for exports, preview frames, proxies and
   thumbnails; anything the GPU decoder can't handle falls back to normal
   software decoding automatically. Off by default (see the User Guide for when
   it helps)

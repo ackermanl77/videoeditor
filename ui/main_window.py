@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -29,7 +30,14 @@ from core import __version__
 from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip, MediaType, ReframeMode
 from core.commands import AddClipCommand, AddTrackCommand, UpdateClipPropertyCommand
-from core.ffmpeg_utils import binary_version, encoder_supports_10bit, nvenc_available
+from core.ffmpeg_utils import (
+    DECODE_HWACCEL_CHOICES,
+    LAUNCH_DECODE_HWACCEL,
+    binary_version,
+    encoder_supports_10bit,
+    nvenc_available,
+    set_decode_hwaccel,
+)
 from core.frame_render import FrameRenderError, full_size, render_frame
 from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
@@ -73,6 +81,7 @@ def _autosave_dir() -> str:
 
 
 AUTO_PROXY_SETTING = "media/auto_proxies"
+GPU_DECODING_SETTING = "decode/hwaccel"
 
 
 def _strict_mode() -> bool:
@@ -353,6 +362,45 @@ class MainWindow(QMainWindow):
         self._add_action(menu, "Set In Point", self.timeline.set_in_point, "I")
         self._add_action(menu, "Set Out Point", self.timeline.set_out_point, "O")
         self._add_action(menu, "Clear In/Out", self.timeline.clear_in_out, "Alt+X")
+        menu.addSeparator()
+        self._build_gpu_decoding_menu(menu.addMenu("GPU Decoding"))
+
+    def _build_gpu_decoding_menu(self, menu) -> None:
+        """PG2: GPU (hardware) decoding for export, preview frames, proxies and thumbnails --
+        opt-in, always falling back to software. Remembered; VIDEO_EDITOR_HWACCEL set outside
+        the app wins (the menu then says so and is disabled)."""
+        self.gpu_decoding_actions = {}
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        external = LAUNCH_DECODE_HWACCEL is not None
+        current = (LAUNCH_DECODE_HWACCEL if external else QSettings().value(GPU_DECODING_SETTING, "off", type=str)) or "off"
+        current = current.strip().lower()
+        if current not in DECODE_HWACCEL_CHOICES:
+            current = "off"
+        if not external:
+            set_decode_hwaccel(current)
+        for mode, label in DECODE_HWACCEL_CHOICES.items():
+            if mode == "d3d11va" and not sys.platform.startswith("win"):
+                continue
+            action = QAction(label, self, checkable=True)
+            action.setChecked(mode == current)
+            action.setEnabled(not external)
+            action.triggered.connect(lambda _checked=False, m=mode: self.set_gpu_decoding(m))
+            group.addAction(action)
+            menu.addAction(action)
+            self.gpu_decoding_actions[mode] = action
+        menu.setToolTipsVisible(True)
+        menu.setToolTip(
+            f"Set by VIDEO_EDITOR_HWACCEL={LAUNCH_DECODE_HWACCEL} outside the app." if external else
+            "Decode video on the GPU first (heavy HEVC/AV1 sources); software decoding is always the fallback."
+        )
+
+    def set_gpu_decoding(self, mode: str) -> None:
+        set_decode_hwaccel(mode)
+        QSettings().setValue(GPU_DECODING_SETTING, mode)
+        if mode in self.gpu_decoding_actions:
+            self.gpu_decoding_actions[mode].setChecked(True)
+        self.status_bar.showMessage(f"GPU decoding: {DECODE_HWACCEL_CHOICES[mode]}", 4000)
 
     def _icon(self, name: str) -> QIcon:
         path = os.path.join(self._icons_dir, "toolbar", f"{name}.png")

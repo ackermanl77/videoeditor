@@ -215,11 +215,25 @@ def decode_hwaccel_modes() -> List[Optional[str]]:
     return [None]
 
 
+#: The GPU decoding choices the UI offers (PG2): value of DECODE_HWACCEL_ENV -> label.
+DECODE_HWACCEL_CHOICES = {"off": "Off (software)", "auto": "Auto (try the GPU, then software)", "d3d11va": "D3D11VA", "cuda": "CUDA (NVDEC)"}
+# The value DECODE_HWACCEL_ENV had when the process started (None: unset), so a setting
+# chosen outside the app keeps priority over the app's own remembered choice.
+LAUNCH_DECODE_HWACCEL = os.environ.get(DECODE_HWACCEL_ENV)
+
+
+def set_decode_hwaccel(mode: str) -> None:
+    """Switch GPU decoding for every later decode in this process (one of DECODE_HWACCEL_CHOICES)."""
+    if mode not in DECODE_HWACCEL_CHOICES:
+        raise ValueError(f"unknown GPU decoding mode {mode!r}")
+    os.environ[DECODE_HWACCEL_ENV] = mode
+
+
 def decode_hwaccel_setting() -> str:
     """Human-readable decode setting for the self-test / About box, e.g. ``"auto (d3d11va, cuda, software)"``."""
     modes = decode_hwaccel_modes()
     if modes == [None]:
-        return "software (set VIDEO_EDITOR_HWACCEL=auto to try GPU decoding)"
+        return "software (Playback > GPU Decoding, or VIDEO_EDITOR_HWACCEL=auto, tries GPU decoding)"
     return "GPU first: " + ", ".join(m or "software" for m in modes)
 
 
