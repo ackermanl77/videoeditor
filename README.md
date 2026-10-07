@@ -236,10 +236,12 @@ unpacking anything; the earlier single-file exe unpacked ~293 MB into
    python build.py --installer   # the folder, then the installer (needs Inno Setup 6)
    ```
    `build.py` stops when the interpreter isn't the `.python-version` one
-   (`--any-python` overrides). `--sign` Authenticode-signs the exe and the
-   installer with signtool (Windows SDK) and the certificate whose SHA-1
-   thumbprint is in `VIDEO_EDITOR_SIGN_THUMBPRINT`, timestamped (DigiCert by
-   default; `VIDEO_EDITOR_TIMESTAMP_URL` changes it).
+   (`--any-python` overrides). `--sign` Authenticode-signs the exe and, with
+   `--installer`, the installer and its uninstaller (through Inno Setup's
+   SignTool) with signtool (Windows SDK) and the certificate whose SHA-1
+   thumbprint is in `VIDEO_EDITOR_SIGN_THUMBPRINT` (or `CODESIGN_THUMBPRINT`),
+   timestamped (DigiCert by default; `VIDEO_EDITOR_TIMESTAMP_URL` or
+   `CODESIGN_TIMESTAMP_URL` changes it).
 5. Your app is at `dist\VideoEditor\VideoEditor.exe` — share the whole
    `dist\VideoEditor\` folder (zipped), not just the exe. With
    `--installer`, `dist\installer\VideoEditor-<version>-setup.exe` installs

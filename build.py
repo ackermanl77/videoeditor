@@ -13,9 +13,9 @@ The result is a folder, ``dist/VideoEditor/`` (``VideoEditor.exe`` plus its
 
 Builds use the Python version in ``.python-version`` (the one CI tests and
 the release workflow builds with); ``--any-python`` skips that check.
-``--sign`` Authenticode-signs ``VideoEditor.exe`` (and the installer) with
+``--sign`` Authenticode-signs ``VideoEditor.exe``, the installer and its uninstaller with
 signtool and the certificate whose SHA-1 thumbprint is in
-``VIDEO_EDITOR_SIGN_THUMBPRINT`` (from the Windows certificate store),
+``VIDEO_EDITOR_SIGN_THUMBPRINT`` or ``CODESIGN_THUMBPRINT`` (Windows certificate store),
 timestamped by ``VIDEO_EDITOR_TIMESTAMP_URL`` (default DigiCert's).
 """
 
@@ -60,19 +60,36 @@ def sign_command(signtool: str, thumbprint: str, path: str, timestamp_url: str =
     return [signtool, "sign", "/sha1", thumbprint, "/fd", "SHA256", "/tr", timestamp_url, "/td", "SHA256", path]
 
 
-def sign(path: str) -> int:
-    """Sign `path` (see the module docstring); non-zero on any failure."""
-    thumbprint = os.environ.get("VIDEO_EDITOR_SIGN_THUMBPRINT", "").replace(" ", "")
+def signing_settings() -> tuple[str, str, str] | None:
+    """(signtool, thumbprint, timestamp URL) for --sign, or None (with the reason printed).
+    The thumbprint comes from VIDEO_EDITOR_SIGN_THUMBPRINT, else CODESIGN_THUMBPRINT -- the
+    variable all of this machine's projects read, so one setting signs every build."""
+    thumbprint = (os.environ.get("VIDEO_EDITOR_SIGN_THUMBPRINT") or os.environ.get("CODESIGN_THUMBPRINT") or "").replace(" ", "")
     if not thumbprint:
-        print("--sign needs VIDEO_EDITOR_SIGN_THUMBPRINT: the SHA-1 thumbprint of a code-signing certificate")
-        return 1
+        print("--sign needs VIDEO_EDITOR_SIGN_THUMBPRINT (or CODESIGN_THUMBPRINT): the SHA-1 thumbprint of a code-signing certificate")
+        return None
     signtool = find_signtool()
     if signtool is None:
         print("signtool.exe was not found (install the Windows SDK's signing tools)")
+        return None
+    timestamp = os.environ.get("VIDEO_EDITOR_TIMESTAMP_URL") or os.environ.get("CODESIGN_TIMESTAMP_URL") or DEFAULT_TIMESTAMP_URL
+    return signtool, thumbprint, timestamp
+
+
+def inno_sign_args(signtool: str, thumbprint: str, timestamp_url: str) -> list[str]:
+    """ISCC arguments that make Inno Setup sign the installer and its uninstaller
+    (installer/VideoEditor.iss: SignTool=codesign under #ifdef Sign; $q = quote, $f = file)."""
+    return ["/DSign", f"/Scodesign=$q{signtool}$q sign /sha1 {thumbprint} /fd SHA256 /tr {timestamp_url} /td SHA256 $f"]
+
+
+def sign(path: str) -> int:
+    """Sign `path` (see the module docstring); non-zero on any failure."""
+    settings = signing_settings()
+    if settings is None:
         return 1
-    cmd = sign_command(signtool, thumbprint, path, os.environ.get("VIDEO_EDITOR_TIMESTAMP_URL") or DEFAULT_TIMESTAMP_URL)
+    signtool, thumbprint, timestamp = settings
     print("Signing:", path)
-    return subprocess.run(cmd, cwd=ROOT).returncode
+    return subprocess.run(sign_command(signtool, thumbprint, path, timestamp), cwd=ROOT).returncode
 
 
 def find_iscc() -> str | None:
@@ -98,14 +115,17 @@ def build_installer() -> int:
     sys.path.insert(0, ROOT)
     from core import __version__
 
-    cmd = [iscc, f"/DAppVersion={__version__}", os.path.join("installer", "VideoEditor.iss")]
+    cmd = [iscc, f"/DAppVersion={__version__}"]
+    if "--sign" in sys.argv[1:]:
+        settings = signing_settings()
+        if settings is None:
+            return 1
+        cmd += inno_sign_args(*settings)
+    cmd.append(os.path.join("installer", "VideoEditor.iss"))
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT)
     if result.returncode != 0:
         return result.returncode
-    setup = os.path.join(ROOT, "dist", "installer", f"VideoEditor-{__version__}-setup.exe")
-    if "--sign" in sys.argv[1:] and sign(setup) != 0:
-        return 1
     print(f"\nInstaller: dist/installer/VideoEditor-{__version__}-setup.exe")
     return 0
 

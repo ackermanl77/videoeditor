@@ -29,6 +29,12 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist\installer
 OutputBaseFilename=VideoEditor-{#AppVersion}-setup
+; build.py --sign passes /DSign and the "codesign" tool: Inno Setup signs this installer
+; and the uninstaller it writes.
+#ifdef Sign
+SignTool=codesign
+SignedUninstaller=yes
+#endif
 SetupIconFile=..\assets\icons\app_icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2
