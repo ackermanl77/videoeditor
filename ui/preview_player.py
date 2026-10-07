@@ -26,8 +26,8 @@ from __future__ import annotations
 import threading
 from typing import Optional, Tuple
 
-from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -46,6 +46,7 @@ from core.clip import Clip, MediaType
 from core.frame_render import FrameRenderError, render_frame
 from core.project import Project
 from core.timeline_nav import format_timecode
+from core.transform_geometry import clip_box, moved, scaled
 from core.track import Track, TrackType
 from core.waveform import load_waveform, window_levels
 from ui import theme
@@ -66,6 +67,8 @@ class PreviewPlayer(QWidget):
     playing_changed = Signal(bool)
     # (generation, PNG bytes or an error string) from the frame-render thread.
     _frame_ready = Signal(int, object)
+    # On-canvas transform (F15): clip id, transform_x, transform_y, transform_scale after a drag.
+    transform_edited = Signal(str, float, float, float)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -138,6 +141,9 @@ class PreviewPlayer(QWidget):
         layout.addWidget(self.stack, 1)
         self.safe_overlay = _SafeAreaOverlay(self.stack)
         self.safe_overlay.hide()
+        self.transform_overlay = _TransformOverlay(self.stack)
+        self.transform_overlay.edited.connect(self.transform_edited)
+        self.transform_overlay.hide()
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton()
@@ -166,6 +172,14 @@ class PreviewPlayer(QWidget):
         self.safe_checkbox.setToolTip("Show action-safe and title-safe guides over the preview.")
         self.safe_checkbox.toggled.connect(self._on_safe_areas_toggled)
         controls.addWidget(self.safe_checkbox)
+
+        self.transform_checkbox = QCheckBox("Transform")
+        self.transform_checkbox.setToolTip(
+            "Move and scale the selected video/image clip right on the preview: drag inside its box to move it, "
+            "drag a corner to scale it (one undo step per drag)."
+        )
+        self.transform_checkbox.toggled.connect(self._update_transform_overlay)
+        controls.addWidget(self.transform_checkbox)
 
         self.meters = _AudioLevelMeters()
         controls.addWidget(self.meters)
@@ -654,6 +668,25 @@ class PreviewPlayer(QWidget):
         super().resizeEvent(event)
         self.safe_overlay.setGeometry(self.stack.rect())
         self.safe_overlay.raise_()
+        self.transform_overlay.setGeometry(self.stack.rect())
+        self.transform_overlay.raise_()
+
+    # ------------------------------------------------------------------
+    # On-canvas transform (F15)
+    # ------------------------------------------------------------------
+    def set_transform_target(self, target: Optional[dict]) -> None:
+        """The clip the Transform overlay edits: {clip_id, x, y, scale, rotation, source_size,
+        movable} (see MainWindow._transform_target), or None."""
+        canvas = (self.project.settings.width, self.project.settings.height) if self.project else (1920, 1080)
+        self.transform_overlay.set_target(target, canvas)
+        self._update_transform_overlay()
+
+    def _update_transform_overlay(self, *_args) -> None:
+        show = self.transform_checkbox.isChecked() and self.transform_overlay.target is not None
+        self.transform_overlay.setGeometry(self.stack.rect())
+        self.transform_overlay.setVisible(show)
+        if show:
+            self.transform_overlay.raise_()
 
     @staticmethod
     def _is_stepped(clip: Clip, offset_in_clip: float) -> bool:
@@ -719,6 +752,108 @@ class _SafeAreaOverlay(QWidget):
         painter.drawRect(action)
         painter.setPen(QPen(QColor(255, 215, 0, 150), 1, Qt.DashLine))
         painter.drawRect(title)
+
+
+class _TransformOverlay(QWidget):
+    """Draws the target clip's box where the export places it and turns drags into new
+    Transform values: inside the box moves it, a corner handle scales it (uniformly)."""
+
+    edited = Signal(str, float, float, float)
+    HANDLE = 7.0
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setMouseTracking(True)
+        self.target: Optional[dict] = None
+        self.canvas = (1920, 1080)
+        self._drag: Optional[dict] = None
+
+    def set_target(self, target: Optional[dict], canvas: Tuple[int, int]) -> None:
+        if self._drag is not None:
+            return  # a drag in progress keeps its own copy
+        self.target = dict(target) if target else None
+        self.canvas = canvas
+        self.update()
+
+    # -- mapping between widget and canvas pixels (the preview shows the canvas fitted, centred)
+    def _canvas_rect(self) -> QRectF:
+        w, h = self.canvas
+        scale = min(self.width() / max(1, w), self.height() / max(1, h))
+        return QRectF((self.width() - w * scale) / 2, (self.height() - h * scale) / 2, w * scale, h * scale)
+
+    def _to_canvas(self, point) -> Tuple[float, float]:
+        rect = self._canvas_rect()
+        factor = self.canvas[0] / max(1e-6, rect.width())
+        return (point.x() - rect.x()) * factor, (point.y() - rect.y()) * factor
+
+    def _to_widget(self, x: float, y: float) -> QPointF:
+        rect = self._canvas_rect()
+        factor = rect.width() / max(1, self.canvas[0])
+        return QPointF(rect.x() + x * factor, rect.y() + y * factor)
+
+    def _box(self):
+        t = self.target
+        return clip_box(t["x"], t["y"], t["scale"], t["rotation"], t["source_size"], self.canvas)
+
+    def _corner_at(self, pos) -> Optional[int]:
+        for index, (x, y) in enumerate(self._box().corners()):
+            corner = self._to_widget(x, y)
+            if abs(corner.x() - pos.x()) <= self.HANDLE + 2 and abs(corner.y() - pos.y()) <= self.HANDLE + 2:
+                return index
+        return None
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        if self.target is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        corners = [self._to_widget(x, y) for x, y in self._box().corners()]
+        painter.setPen(QPen(QColor(theme.COLOR_ACCENT), 2, Qt.SolidLine if self.target.get("movable", True) else Qt.DashLine))
+        painter.drawPolygon(QPolygonF(corners))
+        painter.setBrush(QColor(theme.COLOR_ACCENT))
+        for corner in corners:
+            painter.drawRect(QRectF(corner.x() - self.HANDLE / 2, corner.y() - self.HANDLE / 2, self.HANDLE, self.HANDLE))
+
+    def mouseMoveEvent(self, event) -> None:
+        pos = event.position()
+        if self._drag is None:
+            if self.target is None:
+                return
+            if self._corner_at(pos) is not None:
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif self.target.get("movable", True) and self._box().contains(*self._to_canvas(pos)):
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.unsetCursor()
+            return
+        drag, start = self._drag, self._drag["start"]
+        now = self._to_canvas(pos)
+        if drag["mode"] == "move":
+            self.target["x"], self.target["y"] = moved(drag["x"], drag["y"], now[0] - start[0], now[1] - start[1], self.canvas)
+        else:
+            self.target["scale"] = scaled(drag["box"], drag["scale"], start, now)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if self.target is None or event.button() != Qt.LeftButton:
+            return
+        pos = event.position()
+        mode = "scale" if self._corner_at(pos) is not None else None
+        if mode is None and self.target.get("movable", True) and self._box().contains(*self._to_canvas(pos)):
+            mode = "move"
+        if mode is None:
+            return
+        self._drag = {"mode": mode, "start": self._to_canvas(pos), "x": self.target["x"], "y": self.target["y"],
+                      "scale": self.target["scale"], "box": self._box()}
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ARG002
+        if self._drag is None:
+            return
+        drag, self._drag = self._drag, None
+        t = self.target
+        if (t["x"], t["y"], t["scale"]) != (drag["x"], drag["y"], drag["scale"]):
+            self.edited.emit(t["clip_id"], t["x"], t["y"], t["scale"])
 
 
 class _AudioLevelMeters(QWidget):

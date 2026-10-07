@@ -27,8 +27,8 @@ from PySide6.QtWidgets import (
 
 from core import __version__
 from core.autosave import AutosaveSession, find_orphaned_autosaves
-from core.clip import Clip
-from core.commands import AddClipCommand, AddTrackCommand
+from core.clip import Clip, MediaType, ReframeMode
+from core.commands import AddClipCommand, AddTrackCommand, UpdateClipPropertyCommand
 from core.ffmpeg_utils import binary_version, encoder_supports_10bit, nvenc_available
 from core.frame_render import FrameRenderError, full_size, render_frame
 from core.history import CompositeCommand, History
@@ -448,6 +448,7 @@ class MainWindow(QMainWindow):
 
         self.preview.time_changed.connect(self._on_preview_time_changed)
         self.preview.playing_changed.connect(self._on_playing_changed)
+        self.preview.transform_edited.connect(self._apply_canvas_transform)
 
     # ------------------------------------------------------------------
     def _load_project_into_panels(self) -> None:
@@ -746,9 +747,47 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self, clip_id) -> None:
         self.properties.set_playhead_time(self.timeline.playhead_time)
         self.properties.set_selected_clip(clip_id)
+        self._refresh_transform_target()
+
+    def _transform_target(self) -> Optional[dict]:
+        """What the preview's on-canvas Transform edits (F15): the selected video/image clip,
+        when it's under the playhead, in Fit mode and its source size is known."""
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        if clip is None or clip.media_type not in (MediaType.VIDEO, MediaType.IMAGE) or clip.reframe_mode != ReframeMode.FIT:
+            return None
+        if not clip.contains_time(self.timeline.playhead_time):
+            return None
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or asset.width <= 0 or asset.height <= 0:
+            return None
+        return {
+            "clip_id": clip.id, "x": clip.transform_x, "y": clip.transform_y, "scale": clip.transform_scale,
+            "rotation": clip.transform_rotation, "source_size": (asset.width, asset.height),
+            # Keyframed position: the static values have no effect, so moving is off (scaling still works).
+            "movable": len(clip.position_keyframes) < 2,
+        }
+
+    def _refresh_transform_target(self) -> None:
+        self.preview.set_transform_target(self._transform_target())
+
+    def _apply_canvas_transform(self, clip_id: str, x: float, y: float, scale: float) -> None:
+        """One drag on the preview = one undo step for the Transform values it changed."""
+        clip = self.project.find_clip(clip_id)
+        if clip is None:
+            return
+        changes = [("transform_x", round(x, 4)), ("transform_y", round(y, 4)), ("transform_scale", round(scale, 4))]
+        commands = [UpdateClipPropertyCommand(self.project, clip_id, name, value, "Transform on Canvas")
+                    for name, value in changes if abs(getattr(clip, name) - value) > 1e-6]
+        if not commands:
+            return
+        self.history.execute(CompositeCommand(commands, "Transform on Canvas"))
+        self.timeline.refresh_clip(clip_id)
+        self.properties.set_selected_clip(clip_id)
+        self._on_project_modified()
 
     def _on_project_modified(self) -> None:
         self._mark_dirty()
+        self._refresh_transform_target()
         # Reseeks only if the clip under the playhead changed in a way the
         # preview shows (not on every colour/opacity slider tick).
         self.preview.refresh_after_edit()
@@ -762,6 +801,7 @@ class MainWindow(QMainWindow):
         self._syncing_playhead = False
         self.properties.set_playhead_time(t)
         self._update_time_status()
+        self._refresh_transform_target()
 
     def _on_preview_time_changed(self, t: float) -> None:
         if self._syncing_playhead:

@@ -622,6 +622,13 @@ just-imported file is ready).
 80 %) rectangles over the preview, to keep titles and captions away from the
 edges.
 
+**Transform** (next to Safe areas) edits the selected video or image clip right
+on the preview while the playhead is over it: its box shows where it sits on
+the frame; drag inside it to move the clip, drag a corner to scale it. Each drag
+is one undo step and updates the Transform sliders in Properties. Rotation is
+shown but set in Properties; a clip with keyframed position can only be scaled
+here (edit its keyframes for the path), and Fill-frame clips have no box.
+
 **The exported file is always the real, fully composited result** — every
 track, transition, text overlay, fade, and opacity setting included.
 

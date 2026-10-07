@@ -311,3 +311,57 @@ class MarkerColourTests(_QtCase):  # F15: marker colours
         timeline.signals.marker_color_requested.emit(marker.id, "#3b82f6")
         self.assertEqual(len(history._undo_stack), before)
         self.assertIsInstance(RecolorMarkerCommand(project, marker.id, "#000000").label, str)
+
+
+class CanvasTransformTests(_QtCase):  # F15: on-canvas transform
+    def test_dragging_the_box_moves_and_a_corner_scales_in_one_undo_step_each(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        window = SubtitleImportTests._window(self)
+        asset = MediaAsset(path="/m/a.mp4", width=1920, height=1080, duration=20.0, has_video=True)
+        window.project.add_media_asset(asset)
+        clip = _video(0.0, 10.0, asset_id=asset.id)
+        window.project.tracks[0].clips.append(clip)
+        window.timeline.rebuild()
+        window.timeline.set_playhead(2.0)
+        window.timeline._on_clip_selected(clip.id)
+        window.preview.resize(640, 480)
+        window.preview.transform_checkbox.setChecked(True)
+        overlay = window.preview.transform_overlay
+        overlay.setGeometry(0, 0, 640, 360)  # a 16:9 view: canvas pixels = 3x widget pixels
+        self.assertTrue(overlay.isVisibleTo(window.preview))
+        self.assertEqual(overlay.target["clip_id"], clip.id)
+
+        QTest.mousePress(overlay, Qt.LeftButton, Qt.NoModifier, QPoint(320, 180))
+        QTest.mouseMove(overlay, QPoint(384, 144))
+        QTest.mouseRelease(overlay, Qt.LeftButton, Qt.NoModifier, QPoint(384, 144))
+        self.assertAlmostEqual(clip.transform_x, 0.6, places=3)
+        self.assertAlmostEqual(clip.transform_y, 0.4, places=3)
+        undo_steps = len(window.history._undo_stack)
+
+        corner = overlay._to_widget(*overlay._box().corners()[2])
+        QTest.mousePress(overlay, Qt.LeftButton, Qt.NoModifier, corner.toPoint())
+        centre = overlay._to_widget(overlay._box().cx, overlay._box().cy)
+        half = QPoint(int((corner.x() + centre.x()) / 2), int((corner.y() + centre.y()) / 2))
+        QTest.mouseMove(overlay, half)
+        QTest.mouseRelease(overlay, Qt.LeftButton, Qt.NoModifier, half)
+        self.assertAlmostEqual(clip.transform_scale, 0.5, delta=0.02)
+        self.assertEqual(len(window.history._undo_stack), undo_steps + 1)
+        window.history.undo()
+        self.assertEqual(clip.transform_scale, 1.0)
+        self.assertAlmostEqual(clip.transform_x, 0.6, places=3)
+
+    def test_no_target_outside_the_clip_or_for_fill_or_unknown_size(self):
+        window = SubtitleImportTests._window(self)
+        asset = MediaAsset(path="/m/b.mp4", width=0, height=0, duration=20.0, has_video=True)
+        window.project.add_media_asset(asset)
+        clip = _video(0.0, 4.0, path="/m/b.mp4", asset_id=asset.id)
+        window.project.tracks[0].clips.append(clip)
+        window.timeline.rebuild()
+        window.timeline._on_clip_selected(clip.id)
+        self.assertIsNone(window._transform_target())  # source size unknown
+        asset.width, asset.height = 1280, 720
+        self.assertIsNotNone(window._transform_target())
+        window.timeline.set_playhead(8.0)
+        self.assertIsNone(window._transform_target())  # not under the playhead
