@@ -244,6 +244,23 @@ def format_eta(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+@dataclass(frozen=True)
+class LoudnessReading:
+    """An EBU R128 measurement of the timeline's mix (FFmpeg loudnorm)."""
+
+    integrated: float  # LUFS; -inf for a silent mix
+    true_peak: float  # dBTP
+    loudness_range: float  # LU
+
+    def describe(self) -> str:
+        if not math.isfinite(self.integrated):
+            return "Silent mix"
+        return (
+            f"{self.integrated:.1f} LUFS integrated, true peak {self.true_peak:.1f} dBTP, "
+            f"range {self.loudness_range:.1f} LU"
+        )
+
+
 class ExportError(RuntimeError):
     """An export failed. ``log_tail`` holds the last FFmpeg log lines, if any
     (already included in ``str(exc)``, kept separately for callers that want
@@ -457,6 +474,34 @@ class Exporter:
         unchanged when the mix measures as silence.
         """
         target = settings.loudness_target
+        measured = self._measure_loudnorm(project_settings, settings, trim_range, on_progress, target)
+        if not math.isfinite(float(measured["input_i"])):
+            return graph  # silent mix: nothing to normalize
+        sample_rate = project_settings.sample_rate or 48000
+        second_pass = (
+            f"{self._loudnorm_filter(target)}"
+            f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}:linear=true"
+            # loudnorm works (and outputs) at 192 kHz internally.
+            f",aresample={sample_rate}"
+        )
+        return dataclasses.replace(
+            graph,
+            filter_complex=f"{graph.filter_complex};[{graph.audio_out_label}]{second_pass}[aloud]",
+            audio_out_label="aloud",
+        )
+
+    def _measure_loudnorm(
+        self,
+        project_settings: ProjectSettings,
+        settings: ExportSettings,
+        trim_range: Optional[Tuple[float, float]],
+        on_progress: Optional[ProgressCallback],
+        target: float,
+    ) -> dict:
+        """loudnorm's first-pass JSON for the mix (``input_i``, ``input_tp``,
+        ``input_lra``, ...), measured on an audio-only build of the graph."""
         measure_graph = build_filter_graph(
             self.project, project_settings, reframe_override=settings.reframe_override,
             trim_range=trim_range, audio_only=True,
@@ -474,26 +519,36 @@ class Exporter:
         finally:
             measure_graph.cleanup()
         measured = self._parse_loudnorm_json(log)
-        if measured is None:
-            raise ExportError("Could not read FFmpeg's loudness measurement.", log_tail=log)
         try:
-            if not math.isfinite(float(measured["input_i"])):
-                return graph  # silent mix: nothing to normalize
+            if measured is None:
+                raise KeyError("input_i")
+            float(measured["input_i"]), float(measured["input_tp"]), float(measured["input_lra"])
         except (KeyError, ValueError):
             raise ExportError("Could not read FFmpeg's loudness measurement.", log_tail=log)
-        sample_rate = project_settings.sample_rate or 48000
-        second_pass = (
-            f"{self._loudnorm_filter(target)}"
-            f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
-            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
-            f":offset={measured['target_offset']}:linear=true"
-            # loudnorm works (and outputs) at 192 kHz internally.
-            f",aresample={sample_rate}"
+        return measured
+
+    def measure_loudness(
+        self, settings: ExportSettings, on_progress: Optional[ProgressCallback] = None
+    ) -> LoudnessReading:
+        """Measure the mix the export would render (same trim window), without
+        rendering any picture -- the Export dialog's loudness meter. Runs
+        FFmpeg synchronously; :meth:`cancel` stops it."""
+        self._cancelled = False
+        project_settings = ProjectSettings(
+            width=settings.width, height=settings.height, fps=settings.fps,
+            sample_rate=self.project.settings.sample_rate,
         )
-        return dataclasses.replace(
-            graph,
-            filter_complex=f"{graph.filter_complex};[{graph.audio_out_label}]{second_pass}[aloud]",
-            audio_out_label="aloud",
+        full_duration = max(self.project.total_duration, 0.01)
+        trim_start = max(0.0, settings.trim_start)
+        trim_end = full_duration if settings.trim_end is None else min(settings.trim_end, full_duration)
+        trim_range = (trim_start, trim_end) if trim_start > 0.0 or trim_end < full_duration else None
+        measured = self._measure_loudnorm(
+            project_settings, settings, trim_range, on_progress, settings.loudness_target or -23.0
+        )
+        return LoudnessReading(
+            integrated=float(measured["input_i"]),
+            true_peak=float(measured["input_tp"]),
+            loudness_range=float(measured["input_lra"]),
         )
 
     @staticmethod

@@ -202,6 +202,17 @@ class ExportOutputTests(unittest.TestCase):
         _, loudness = self._audio_stats(out)
         self.assertAlmostEqual(loudness, -23.0, delta=1.0)
 
+    def test_the_loudness_meter_matches_the_rendered_mix(self):
+        project = self._two_tones()
+        out = self._export(project, "meter.mp4")
+        _, rendered = self._audio_stats(out)
+        with patch("core.exporter.find_binary", return_value=FFMPEG):
+            reading = Exporter(project).measure_loudness(ExportSettings(output_path="", width=320, height=180))
+        self.assertAlmostEqual(reading.integrated, rendered, delta=1.0)
+        self.assertLess(reading.true_peak, 0.5)
+        self.assertGreaterEqual(reading.loudness_range, 0.0)
+        self.assertIn("LUFS integrated", reading.describe())
+
     def test_trimmed_export_has_the_window_duration(self):
         out = self._export(_multi_clip_project(), "trim.mp4", trim_start=2.0, trim_end=5.0)
         duration = float(self._probe(out, "format=duration").split("=")[1])

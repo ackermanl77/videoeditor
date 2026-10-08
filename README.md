@@ -67,6 +67,7 @@ deliberately layered and documented so it is easy to read, test and extend.
   animatable (color correction, vignette) take keyframes
 - **Audio**: equal-power audio crossfades, volume keyframes, ducking with
   adjustable threshold/ratio/attack/release, master limiter, loudness targets
+  and an EBU R128 loudness meter (Export > Measure)
 - **Editing tools**: multi-select (Ctrl+click, rubber band), copy/cut/paste,
   duplicate, paste attributes, insert/overwrite, roll/slip/slide and ripple
   move (also as drags: Ctrl+edge = roll, Alt = slip, Ctrl+Alt = slide,

@@ -41,6 +41,8 @@ Selecting `.gif` disables the Quality and Two-pass controls (a GIF has no CRF/bi
 
 ## Loudness normalization
 
+**Meter.** The Export dialog's **Measure** button runs `Exporter.measure_loudness()` (a `LoudnessWorker` on its own `QThread`): the same audio-only `loudnorm` measurement pass the normalization uses (`_measure_loudnorm()`), over the export's trim window, returned as a `LoudnessReading` (integrated LUFS, true peak dBTP, LRA) and shown under the Loudness row with the distance to the selected target. Closing the dialog cancels a running measurement. `tests/integration/test_real_ffmpeg.py::test_the_loudness_meter_matches_the_rendered_mix` compares it with FFmpeg's `ebur128` on a real export.
+
 With **Loudness** set, `Exporter` runs an extra audio-only measurement pass (`build_filter_graph(audio_only=True)`, so no video is rendered) through `loudnorm=I=<target>:TP=-1:LRA=11:print_format=json`, then renders with `loudnorm=...:measured_I=...:linear=true,aresample=<rate>` appended to the master (a single gain change, not dynamic compression). A silent mix is left alone. Verified with real FFmpeg: a -16 LUFS export measured -16.0 LUFS integrated.
 
 A clip's audio-mapping decision (`_clip_has_audio()`) prefers the matching media-pool asset's probed `has_audio`; if no pool entry matches the clip's source path, it falls back to probing the file directly rather than assuming audio is present — this avoids FFmpeg failing the whole export by mapping a non-existent audio stream.

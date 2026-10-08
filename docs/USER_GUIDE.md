@@ -720,6 +720,10 @@ playhead as a PNG or JPEG still -- composited exactly as the export renders it
    (-14 / -16 / -23 LUFS) to normalise the whole mix to a platform's level
    (this measures the audio first, so the export takes a little longer). A
    limiter always keeps the mix from clipping (peaks stay below -1 dBFS).
+   **Measure** next to it reads the mix this export would render (same trim
+   range) without rendering the picture: integrated loudness (LUFS), true
+   peak (dBTP) and loudness range (LU), and how far it is from the chosen
+   target.
 7. *(Optional)* Set up vertical/Shorts export settings — see
    [above](#shorts--vertical-video-export).
 8. Click **Export**. You'll be asked to confirm if the output file already

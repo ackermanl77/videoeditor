@@ -89,6 +89,21 @@ class ExportDialogP2Tests(_QtCase):
         dialog.container_combo.setCurrentText(".webm")
         self.assertTrue(dialog.subtitle_combo.model().item(embed).isEnabled())
 
+    def test_loudness_reading_is_shown_against_the_target(self):
+        from core.exporter import LoudnessReading
+
+        dialog = self._dialog()
+        dialog.loudness_combo.setCurrentIndex(dialog.loudness_combo.findData(-14.0))
+        dialog._on_loudness_measured(LoudnessReading(integrated=-17.25, true_peak=-2.0, loudness_range=5.5))
+        self.assertEqual(
+            dialog.loudness_reading_label.text(),
+            "-17.2 LUFS integrated, true peak -2.0 dBTP, range 5.5 LU -- -3.2 LU from the -14 LUFS target",
+        )
+        dialog._on_loudness_measured(LoudnessReading(integrated=float("-inf"), true_peak=float("-inf"), loudness_range=0.0))
+        self.assertEqual(dialog.loudness_reading_label.text(), "Silent mix")
+        settings = dialog._measure_settings()
+        self.assertEqual((settings.trim_end, settings.loudness_target), (None, -14.0))
+
     def test_builtin_preset_and_ntsc_rate(self):
         dialog = self._dialog()
         with patch("ui.export_dialog.load_user_presets", return_value={}):

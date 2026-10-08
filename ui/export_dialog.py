@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -145,6 +146,31 @@ class ExportWorker(QObject):
         self.exporter.cancel()
 
 
+class LoudnessWorker(QObject):
+    """Runs Exporter.measure_loudness() on a QThread for the dialog's meter."""
+
+    finished = Signal(object)  # LoudnessReading
+    failed = Signal(str)
+
+    def __init__(self, project: Project, settings: ExportSettings):
+        super().__init__()
+        self.exporter = Exporter(copy.deepcopy(project))
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(self.exporter.measure_loudness(self.settings))
+        except ExportCancelled:
+            self.failed.emit("Measurement cancelled.")
+        except ExportError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface any unexpected failure to the user
+            self.failed.emit(f"Unexpected error: {exc}")
+
+    def cancel(self) -> None:
+        self.exporter.cancel()
+
+
 def color_modes_for(codec_key: str, ext: str, hdr_choice: Optional[str], ten_bit_ok) -> list:
     """Colour modes (core.output_color keys) the dialog offers for a codec choice, 8-bit SDR first.
 
@@ -196,6 +222,8 @@ class ExportDialog(QDialog):
         self.setWindowTitle("Export Video")
         self.setMinimumWidth(440)
         self._thread: Optional[QThread] = None
+        self._loudness_thread: Optional[QThread] = None
+        self._loudness_worker: Optional[LoudnessWorker] = None
         self._worker: Optional[ExportWorker] = None
         self.warnings = []
         self.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -350,7 +378,20 @@ class ExportDialog(QDialog):
             "Normalize the mix to a platform's loudness (two-pass EBU R128 loudnorm, true peak -1 dBTP). "
             "Peaks are always limited to -1 dBFS."
         )
-        form.addRow("Loudness", self.loudness_combo)
+        self.measure_btn = QPushButton("Measure")
+        self.measure_btn.setToolTip(
+            "Measure the mix this export would render (EBU R128: integrated loudness, true peak, "
+            "loudness range), without rendering the picture."
+        )
+        self.measure_btn.clicked.connect(self.measure_loudness)
+        loudness_row = QHBoxLayout()
+        loudness_row.addWidget(self.loudness_combo, 1)
+        loudness_row.addWidget(self.measure_btn)
+        form.addRow("Loudness", loudness_row)
+        self.loudness_reading_label = QLabel("")
+        self.loudness_reading_label.setWordWrap(True)
+        self.loudness_reading_label.setAccessibleName("Loudness measurement")
+        form.addRow("", self.loudness_reading_label)
 
         self.subtitle_combo = QComboBox()
         for label, mode in SUBTITLE_MODE_LABELS:
@@ -899,8 +940,60 @@ class ExportDialog(QDialog):
         else:
             self.reject()
 
+    # -- loudness meter -------------------------------------------------------
+    def _measure_settings(self) -> ExportSettings:
+        trim_enabled = self.trim_checkbox.isChecked()
+        return ExportSettings(
+            output_path="",
+            width=self.width_spin.value(),
+            height=self.height_spin.value(),
+            fps=FPS_VALUES.get(self.fps_combo.currentText(), 30.0),
+            reframe_override=ReframeMode.FILL if self.autofill_checkbox.isChecked() else None,
+            trim_start=self.trim_start_spin.value() if trim_enabled else 0.0,
+            trim_end=self.trim_end_spin.value() if trim_enabled else None,
+            loudness_target=self.loudness_combo.currentData(),
+        )
+
+    def measure_loudness(self) -> None:
+        if self._loudness_thread is not None:
+            return
+        self.measure_btn.setEnabled(False)
+        self.loudness_reading_label.setText("Measuring loudness...")
+        self._loudness_thread = QThread(self)
+        self._loudness_worker = LoudnessWorker(self.project, self._measure_settings())
+        self._loudness_worker.moveToThread(self._loudness_thread)
+        self._loudness_thread.started.connect(self._loudness_worker.run)
+        self._loudness_worker.finished.connect(self._on_loudness_measured)
+        self._loudness_worker.failed.connect(self._on_loudness_failed)
+        self._loudness_worker.finished.connect(self._loudness_thread.quit, Qt.DirectConnection)
+        self._loudness_worker.failed.connect(self._loudness_thread.quit, Qt.DirectConnection)
+        self._loudness_thread.finished.connect(self._clear_loudness_worker)
+        self._loudness_thread.start()
+
+    def _on_loudness_measured(self, reading) -> None:
+        text = reading.describe()
+        target = self.loudness_combo.currentData()
+        if target is not None and math.isfinite(reading.integrated):
+            text += f" -- {reading.integrated - target:+.1f} LU from the {target:.0f} LUFS target"
+        self.loudness_reading_label.setText(text)
+
+    def _on_loudness_failed(self, message: str) -> None:
+        self.loudness_reading_label.setText(message)
+
+    def _clear_loudness_worker(self) -> None:
+        if self._loudness_thread is not None:
+            self._loudness_thread.deleteLater()
+        if self._loudness_worker is not None:
+            self._loudness_worker.deleteLater()
+        self._loudness_thread = None
+        self._loudness_worker = None
+        self.measure_btn.setEnabled(True)
+
     def cancel_and_wait(self, timeout_ms: int = 5000) -> bool:
         """Cancel a running export and wait for it; True when nothing is running any more."""
+        if self._loudness_thread is not None:
+            self._loudness_worker.cancel()
+            self._loudness_thread.wait(timeout_ms)
         if not self.is_running():
             return True
         self._worker.cancel()  # terminates the ffmpeg process immediately (core/exporter.py)
