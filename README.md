@@ -30,9 +30,10 @@ deliberately layered and documented so it is easy to read, test and extend.
   normal → slow-motion → normal) via speed keyframes
 - **Reverse and freeze frame**: play a clip (picture and sound) backwards,
   and/or hold its last frame for a set time at its end
-- **Subtitles**: File > Import Subtitles (or drop a file) turns an SRT or
-  WebVTT file into editable, burned-in caption text clips on a "Subtitles"
-  track
+- **Subtitles**: File > Import Subtitles (or drop a file) turns an SRT,
+  WebVTT or ASS/SSA file into editable caption text clips on a "Subtitles"
+  track; the export burns them in, embeds them as a soft subtitle track
+  (MP4/MOV/MKV/WebM) or saves them as a `.srt` next to the video
 - **Audio level meters** (peak and RMS) next to the preview controls, and
   title/action-safe guides over the preview
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
@@ -113,7 +114,7 @@ video_editor/
 │   ├── exporter.py, export_presets.py  # Runs FFmpeg with progress; export presets
 │   ├── render_queue.py                 # Render queue model (project snapshots)
 │   ├── frame_render.py, proxy.py       # Accurate preview frames; preview proxies
-│   ├── subtitles.py, fonts.py          # SRT/WebVTT import; font files for drawtext
+│   ├── subtitles.py, fonts.py          # SRT/WebVTT/ASS import, SRT export; font files for drawtext
 │   ├── autosave.py, relink.py          # Per-session autosave; Relink Media matching
 │   └── selftest.py                     # `--self-test`
 ├── ui/                      # PySide6 UI layer (imports from core, never the reverse)

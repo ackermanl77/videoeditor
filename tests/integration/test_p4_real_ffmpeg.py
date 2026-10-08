@@ -214,6 +214,54 @@ class SubtitleExportTests(unittest.TestCase):
         leftovers = [n for n in os.listdir(tempfile.gettempdir()) if n.startswith("ve_graph_")]
         self.assertEqual(leftovers, [])
 
+    SOFT_SRT = "1\n00:00:00,500 --> 00:00:01,500\nHELLO\n\n2\n00:00:02,000 --> 00:00:02,500\nWORLD\n"
+
+    def _subtitle_streams(self, path):
+        out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "s", "-show_entries",
+                              "stream=codec_name", "-of", "json", path], capture_output=True, text=True, check=True).stdout
+        return [s["codec_name"] for s in json.loads(out).get("streams", [])]
+
+    def _extracted_srt(self, path):
+        return subprocess.run([FFMPEG, "-v", "error", "-i", path, "-map", "0:s:0", "-f", "srt", "-"],
+                              capture_output=True, text=True, check=True).stdout
+
+    def test_embedded_subtitles_are_a_stream_not_pixels(self):
+        band = f"{SW}:{SH // 4}:0:{SH - SH // 4}"
+        for name, codec in (("soft.mp4", "mov_text"), ("soft.mkv", "subrip"), ("soft.webm", "webvtt")):
+            with self.subTest(container=name):
+                out = _export(self._project_with_subtitles(self.SOFT_SRT, 3.0), name, size=(SW, SH),
+                              subtitle_mode="embed")
+                self.assertEqual(self._subtitle_streams(out), [codec])
+                self.assertLess(_max_luma(out, 1.0, band), 40)  # not burned in
+                text = self._extracted_srt(out)
+                self.assertIn("00:00:00,500 --> 00:00:01,500", text)
+                self.assertIn("WORLD", text)
+        leftovers = [n for n in os.listdir(tempfile.gettempdir()) if n.startswith("ve_subtitles_")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_trimmed_embed_re_times_the_cues(self):
+        out = _export(self._project_with_subtitles(self.SOFT_SRT, 3.0), "soft_trim.mkv", size=(SW, SH),
+                      subtitle_mode="embed", trim_start=1.0, trim_end=3.0)
+        text = self._extracted_srt(out)
+        self.assertIn("00:00:00,000 --> 00:00:00,500\nHELLO", text)
+        self.assertIn("00:00:01,000 --> 00:00:01,500\nWORLD", text)
+
+    def test_sidecar_mode_writes_an_srt_next_to_the_video(self):
+        out = _export(self._project_with_subtitles(self.SOFT_SRT, 3.0), "sidecar.mp4", size=(SW, SH),
+                      subtitle_mode="sidecar")
+        band = f"{SW}:{SH // 4}:0:{SH - SH // 4}"
+        self.assertEqual(self._subtitle_streams(out), [])
+        self.assertLess(_max_luma(out, 1.0, band), 40)
+        with open(os.path.splitext(out)[0] + ".srt", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "1\n00:00:00,500 --> 00:00:01,500\nHELLO\n\n2\n00:00:02,000 --> 00:00:02,500\nWORLD\n")
+
+    def test_embedding_into_a_container_without_subtitle_support_fails_clearly(self):
+        from core.exporter import ExportError
+
+        with self.assertRaisesRegex(ExportError, "carry a subtitle track"):
+            _export(self._project_with_subtitles(self.SOFT_SRT, 3.0), "soft.avi", size=(SW, SH),
+                    subtitle_mode="embed")
+
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/FFprobe not found")
 class HardwareDecodeFallbackTests(unittest.TestCase):

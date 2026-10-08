@@ -43,7 +43,7 @@ from core.subtitles import (
     parse_subtitle_file,
     parse_subtitle_text,
 )
-from core.track import TrackType
+from core.track import Track, TrackType
 from core.waveform import _pcm_bytes_to_levels, load_waveform, window_levels
 
 
@@ -341,7 +341,38 @@ class SubtitleTests(unittest.TestCase):
         with open(path16, "wb") as f:
             f.write("WEBVTT\n\n00:01.000 --> 00:02.000\nÜber\n".encode("utf-16"))
         self.assertEqual(parse_subtitle_file(path16)[0].text, "Über")
-        self.assertTrue(is_subtitle_path("A.SRT") and is_subtitle_path("b.vtt") and not is_subtitle_path("c.ass"))
+        self.assertTrue(is_subtitle_path("A.SRT") and is_subtitle_path("b.vtt") and not is_subtitle_path("c.txt"))
+
+    def test_ass_dialogue_lines_become_cues(self):
+        ass = (
+            "[Script Info]\nTitle: t\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Comment: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,not shown\n"
+            "Dialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,{\\an8}Hello, world\\Nsecond\\hline\n"
+            "Dialogue: 0,0:00:00.20,0:00:01.00,Default,,0,0,0,,First\n"
+        )
+        cues = parse_subtitle_text(ass)
+        self.assertEqual([(c.start, c.end) for c in cues], [(0.2, 1.0), (1.5, 3.0)])
+        self.assertEqual(cues[1].text, "Hello, world\nsecond line")
+        self.assertTrue(is_subtitle_path("episode.ASS") and is_subtitle_path("old.ssa"))
+        with self.assertRaises(SubtitleParseError):
+            parse_subtitle_text("[Script Info]\nTitle: no events\n")
+
+    def test_subtitle_tracks_round_trip_to_srt(self):
+        from core.subtitles import format_srt, sidecar_subtitle_path, subtitle_cues_for_export
+
+        project = Project()
+        track = Track(track_type=TrackType.VIDEO, name="Subtitles")
+        track.clips.extend(cues_to_text_clips(parse_subtitle_text(SRT)))
+        project.tracks.append(track)
+        cues = subtitle_cues_for_export(project)
+        self.assertEqual(parse_subtitle_text(format_srt(cues)), cues)
+        # A trim window clips and re-anchors the cues; a hidden track is left out.
+        trimmed = subtitle_cues_for_export(project, trim_start=cues[0].start + 0.1, trim_end=cues[-1].end - 0.1)
+        self.assertAlmostEqual(trimmed[0].start, 0.0)
+        track.hidden = True
+        self.assertEqual(subtitle_cues_for_export(project), [])
+        self.assertEqual(sidecar_subtitle_path(r"C:\out\clip.final.mp4"), r"C:\out\clip.final.srt")
 
     def test_cues_become_non_overlapping_text_clips(self):
         cues = parse_subtitle_text(

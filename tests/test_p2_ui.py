@@ -74,6 +74,21 @@ class ExportDialogP2Tests(_QtCase):
         self.assertFalse(dialog.two_pass_checkbox.isEnabled())  # no target size for intermediates
         self.assertFalse(dialog.quality_combo.isEnabled())
 
+    def test_subtitle_mode_follows_the_container_and_reaches_the_settings(self):
+        dialog = self._dialog()
+        embed = dialog.subtitle_combo.findData("embed")
+        self.assertEqual(dialog.subtitle_combo.currentData(), "burn")
+        dialog.container_combo.setCurrentText(".mkv")
+        dialog.subtitle_combo.setCurrentIndex(embed)
+        self.assertEqual(dialog.current_settings_dict()["subtitles"], "embed")
+        dialog.container_combo.setCurrentText(".avi")  # no text subtitle stream in AVI
+        self.assertFalse(dialog.subtitle_combo.model().item(embed).isEnabled())
+        self.assertEqual(dialog.subtitle_combo.currentData(), "burn")
+        dialog.apply_settings({"subtitles": "sidecar"})
+        self.assertEqual(dialog.subtitle_combo.currentData(), "sidecar")
+        dialog.container_combo.setCurrentText(".webm")
+        self.assertTrue(dialog.subtitle_combo.model().item(embed).isEnabled())
+
     def test_builtin_preset_and_ntsc_rate(self):
         dialog = self._dialog()
         with patch("ui.export_dialog.load_user_presets", return_value={}):

@@ -542,7 +542,7 @@ class MainWindow(QMainWindow):
             self,
             "Import Subtitles",
             "",
-            "Subtitle Files (*.srt *.vtt);;All Files (*)",
+            "Subtitle Files (*.srt *.vtt *.ass *.ssa);;All Files (*)",
         )
         if path:
             self.import_subtitle_file(path)

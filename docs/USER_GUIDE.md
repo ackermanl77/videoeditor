@@ -419,19 +419,26 @@ once saved, they need this version (or newer) to open.
 rather than composited over your video; pause with **Accurate frame** ticked
 to see it exactly as exported.*
 
-### Subtitles (SRT / WebVTT)
+### Subtitles (SRT / WebVTT / ASS)
 
-**File > Import Subtitles...** (or drop an `.srt`/`.vtt` file on the window
+**File > Import Subtitles...** (or drop an `.srt`/`.vtt`/`.ass`/`.ssa` file on the window
 or pick it in Import Media) turns every cue into a text clip at its own time,
 centred near the bottom of the frame on a translucent box, on a video track
 named **Subtitles** (a second import that would overlap goes to
 **Subtitles 2**, and so on). The whole import is one undo step.
 
 - They are ordinary text clips: restyle, retime, edit or delete them like any
-  other, and they are saved in the project file. They are burned into the
-  exported picture; there are no separate (soft) subtitle tracks in the
-  exported file.
-- Accepted: SRT and WebVTT, UTF-8 or UTF-16 with a byte-order mark, or
+  other, and they are saved in the project file.
+- **On export**, the Export dialog's **Subtitles** setting decides what happens
+  to every track named "Subtitles...": **Burn into the picture** (the
+  default: drawn like any title), **Embed as a subtitle track** (a soft
+  subtitle stream viewers switch on and off -- MP4, MOV, MKV and WebM only;
+  the captions are left out of the picture), or **Save as .srt next to the
+  video** (`clip.mp4` gets `clip.srt`; also left out of the picture). An
+  export trimmed to a range shifts the captions to match. Embedded and `.srt`
+  captions carry the text and timing only, not the clip's font or box.
+- Accepted: SRT, WebVTT and ASS/SSA (its dialogue lines; ASS styles,
+  positions and effects are not kept), UTF-8 or UTF-16 with a byte-order mark, or
   Windows-1252 (common for older SRT files). Formatting tags (`<i>`, `{\an8}`
   and similar) are removed. Cues that overlap are shortened so each ends when
   the next starts (cues starting at the same moment are merged into one

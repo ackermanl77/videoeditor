@@ -55,6 +55,7 @@ from core.exporter import (
 from core.ffmpeg_utils import encoder_supports_10bit, nvenc_available
 from core.output_color import COLOR_MODE_LABELS
 from core.project import Project
+from core.subtitles import SUBTITLE_CODECS, SUBTITLE_MODE_LABELS
 
 RESOLUTION_PRESETS = {
     "3840 x 2160 (4K UHD)": (3840, 2160),
@@ -351,6 +352,15 @@ class ExportDialog(QDialog):
         )
         form.addRow("Loudness", self.loudness_combo)
 
+        self.subtitle_combo = QComboBox()
+        for label, mode in SUBTITLE_MODE_LABELS:
+            self.subtitle_combo.addItem(label, mode)
+        self.subtitle_combo.setToolTip(
+            "What happens to the \"Subtitles\" tracks: burned into the picture, embedded as a subtitle "
+            "track viewers can switch on and off (MP4/MOV/MKV/WebM), or saved as a .srt file next to the video."
+        )
+        form.addRow("Subtitles", self.subtitle_combo)
+
         self.gif_note_label = QLabel("Animated GIF: no audio track; quality comes from palette dithering, not the setting above.")
         self.gif_note_label.setWordWrap(True)
         self.gif_note_label.setStyleSheet("color: #9aa1ad; font-size: 11px;")
@@ -557,6 +567,7 @@ class ExportDialog(QDialog):
         self.two_pass_checkbox.setEnabled(not is_gif)
         self.audio_bitrate_combo.setEnabled(not is_gif)
         self.loudness_combo.setEnabled(not is_gif)
+        self._refresh_subtitle_modes(text)
         self.gif_note_label.setVisible(is_gif)
         self._refresh_codec_combo()
         self._refresh_gpu_checkbox_enabled()
@@ -564,6 +575,15 @@ class ExportDialog(QDialog):
         path = self.path_edit.text().strip()
         if path and container_of(path) != text:
             self.path_edit.setText(apply_container_extension(path, text))
+
+    def _refresh_subtitle_modes(self, container: str) -> None:
+        """"Embed" only for containers that carry a text subtitle stream; a
+        selected embed falls back to burning in for the others."""
+        embed_index = self.subtitle_combo.findData("embed")
+        can_embed = container in SUBTITLE_CODECS
+        self.subtitle_combo.model().item(embed_index).setEnabled(can_embed)
+        if not can_embed and self.subtitle_combo.currentData() == "embed":
+            self.subtitle_combo.setCurrentIndex(self.subtitle_combo.findData("burn"))
 
     def _on_path_edited(self) -> None:
         """Typing a different known extension selects that format."""
@@ -638,6 +658,7 @@ class ExportDialog(QDialog):
             "gpu_target_size": self.gpu_target_checkbox.isChecked(),
             "audio_bitrate": self.audio_bitrate_combo.currentData(),
             "loudness": self.loudness_combo.currentData(),
+            "subtitles": self.subtitle_combo.currentData(),
             "color_mode": self.current_color_mode(),
             "output_dir": os.path.dirname(self.path_edit.text().strip()),
         }
@@ -665,6 +686,10 @@ class ExportDialog(QDialog):
             index = self.loudness_combo.findData(data["loudness"])
             if index >= 0:
                 self.loudness_combo.setCurrentIndex(index)
+        if "subtitles" in data:
+            index = self.subtitle_combo.findData(data["subtitles"])
+            if index >= 0 and self.subtitle_combo.model().item(index).isEnabled():
+                self.subtitle_combo.setCurrentIndex(index)
         if "color_mode" in data:
             index = self.color_combo.findData(data["color_mode"])  # absent (unsupported here): left as is
             if index >= 0:
@@ -820,6 +845,7 @@ class ExportDialog(QDialog):
             video_codec=self.current_codec(),
             gpu_target_size=self.gpu_target_checkbox.isChecked() and self.gpu_target_checkbox.isEnabled(),
             color_mode=self.current_color_mode(),
+            subtitle_mode=self.subtitle_combo.currentData(),
         )
         return settings
 

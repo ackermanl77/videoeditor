@@ -32,6 +32,14 @@ from core.filter_graph import GraphResult, build_filter_graph, fps_expr
 from core.output_color import SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
 from core.stabilize import StabilizeJob, detect_args, partial_path, pending_jobs
+from core.subtitles import (
+    SUBTITLE_CODECS,
+    SUBTITLE_MODES,
+    format_srt,
+    is_subtitle_track,
+    sidecar_subtitle_path,
+    subtitle_cues_for_export,
+)
 
 ProgressCallback = Callable[[float, str], None]
 """Called with (fraction_complete 0..1, status_message)."""
@@ -203,6 +211,12 @@ class ExportSettings:
     # default, 8-bit SDR BT.709), "sdr10" (10-bit SDR), or "pq"/"hlg" (10-bit
     # HDR passthrough for HDR sources). 10-bit needs HEVC, AV1, ProRes or DNxHR.
     color_mode: str = "sdr8"
+    # What happens to the "Subtitles" tracks (core.subtitles.SUBTITLE_MODES):
+    # "burn" draws them into the picture like any text clip (the default);
+    # "embed" muxes them as a soft subtitle stream (MP4/MOV mov_text, MKV srt,
+    # WebM webvtt) and "sidecar" writes <output>.srt next to the video -- in
+    # both, they are left out of the picture.
+    subtitle_mode: str = "burn"
 
 
 def resolve_codecs(ext: str, choice: str = "auto") -> Tuple[str, str]:
@@ -261,6 +275,9 @@ class Exporter:
         # (set per export; defaults for callers building arguments directly).
         self._color: OutputColor = SDR_8BIT
         self._hdr_metadata: Tuple[str, str] = ("", "")
+        # Output arguments that map the soft subtitle stream, when the export
+        # embeds one (set per export by _render).
+        self._subtitle_output_args: List[str] = []
 
     def cancel(self) -> None:
         """Request cancellation. Safe to call from another thread.
@@ -301,9 +318,17 @@ class Exporter:
         is_trimmed = trim_start > 0.0 or trim_end < full_duration
         trim_range = (trim_start, trim_end) if is_trimmed else None
 
+        if settings.subtitle_mode not in SUBTITLE_MODES:
+            raise ExportError(f"Unknown subtitle mode: {settings.subtitle_mode!r}")
+        if settings.subtitle_mode == "embed" and ext not in SUBTITLE_CODECS and self._has_subtitles():
+            raise ExportError(
+                "Only MP4, MOV, MKV and WebM can carry a subtitle track; choose one of them, "
+                "or burn the subtitles in or save them as a .srt file."
+            )
+
         graph = build_filter_graph(
-            self.project, project_settings, reframe_override=settings.reframe_override, trim_range=trim_range,
-            output_color=self._color,
+            self._project_for_picture(settings), project_settings, reframe_override=settings.reframe_override,
+            trim_range=trim_range, output_color=self._color,
         )
         self.warnings = list(graph.warnings)
         try:
@@ -321,6 +346,8 @@ class Exporter:
                 if not os.path.isfile(partial_path):
                     raise ExportError("FFmpeg reported success but did not produce an output file.")
                 os.replace(partial_path, final_path)
+                if settings.subtitle_mode == "sidecar":
+                    self._write_sidecar_subtitles(final_path, trim_start, trim_end if is_trimmed else None)
             except BaseException:
                 # Failure or cancellation: never leave a truncated file
                 # behind, and never touch an existing file at the real
@@ -369,6 +396,50 @@ class Exporter:
                 os.replace(tmp, job.result_path)
             finally:
                 self._remove_quietly(tmp)
+
+    def _has_subtitles(self) -> bool:
+        return any(is_subtitle_track(track) and not track.hidden for track in self.project.tracks)
+
+    def _project_for_picture(self, settings: ExportSettings) -> Project:
+        """The project the picture is built from: as is when subtitles are
+        burned in, otherwise with the subtitle tracks hidden (they go out as
+        a subtitle stream or a sidecar file instead)."""
+        if settings.subtitle_mode == "burn" or not self._has_subtitles():
+            return self.project
+        tracks = [
+            dataclasses.replace(track, hidden=True) if is_subtitle_track(track) else track
+            for track in self.project.tracks
+        ]
+        return dataclasses.replace(self.project, tracks=tracks)
+
+    def _write_sidecar_subtitles(self, output_path: str, trim_start: float, trim_end: Optional[float]) -> None:
+        cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
+        if not cues:
+            return
+        try:
+            with open(sidecar_subtitle_path(output_path), "w", encoding="utf-8", newline="\n") as f:
+                f.write(format_srt(cues))
+        except OSError as exc:
+            self.warnings.append(f"Could not write the subtitle file: {exc}")
+
+    def _subtitle_input(
+        self, ext: str, input_index: int, trim_start: float, trim_end: Optional[float]
+    ) -> Tuple[List[str], Optional[str]]:
+        """(extra -i args, temp .srt path) for an embedded subtitle stream at
+        input ``input_index``, setting the output's mapping args; ``([], None)``
+        when nothing is embedded."""
+        self._subtitle_output_args = []
+        cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
+        if not cues or ext not in SUBTITLE_CODECS:
+            return [], None
+        fd, path = tempfile.mkstemp(suffix=".srt", prefix="ve_subtitles_")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(format_srt(cues))
+        self._subtitle_output_args = [
+            "-map", f"{input_index}:s", "-c:s", SUBTITLE_CODECS[ext],
+            "-metadata:s:s:0", "title=Subtitles",
+        ]
+        return ["-f", "srt", "-i", path], path
 
     def _with_loudness_normalization(
         self,
@@ -525,6 +596,16 @@ class Exporter:
             chapters_args, chapters_index, chapters_path = self._build_chapters_args(
                 graph, full_duration, trim_start, trim_end if is_trimmed else None
             )
+            subtitles_path = None
+            self._subtitle_output_args = []
+            if settings.subtitle_mode == "embed":
+                # Another pseudo-input after the chapters one (extra inputs
+                # don't shift the [N:v]/[N:a] indexes the graph references).
+                subtitle_args, subtitles_path = self._subtitle_input(
+                    ext, len(graph.input_specs) + (1 if chapters_args else 0),
+                    trim_start, trim_end if is_trimmed else None,
+                )
+                chapters_args = chapters_args + subtitle_args
             try:
                 if use_two_pass:
                     video_kbps = self._target_video_bitrate_kbps(
@@ -547,11 +628,13 @@ class Exporter:
                         chapters_args, chapters_index,
                     )
             finally:
-                if chapters_path is not None:
-                    try:
-                        os.remove(chapters_path)
-                    except OSError:
-                        pass
+                for temp_path in (chapters_path, subtitles_path):
+                    if temp_path is not None:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                self._subtitle_output_args = []
         return output_path
 
     @staticmethod
@@ -770,6 +853,7 @@ class Exporter:
                 args += ["-b:a", f"{settings.audio_bitrate_kbps}k"]
         if chapters_index is not None:
             args += ["-map_metadata", str(chapters_index)]
+        args += self._subtitle_output_args
         args += ["-r", fps_expr(settings.fps)]
         args += ["-movflags", "+faststart"] if ext in (".mp4", ".mov") else []
         args += ["-progress", "pipe:1", "-nostats", settings.output_path]
