@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 from core.clip import Clip, MediaType
 from core.project import MARKER_COLORS
 from core.timeline_nav import clip_keyframe_points, format_timecode
+from core.track import TRACK_HEIGHT_PRESETS
 from core.waveform import display_gains
 from ui import theme
 
@@ -111,12 +112,63 @@ def drag_mode_for(x: float, width: float, modifiers) -> str:
     return "toggle_select" if ctrl else "move"
 
 
-def row_at_scene_y(scene_y: float) -> int:
+class RowLayout:
+    """Top y and height of every track row: rows can have different heights
+    (``Track.height``). Rows past the last one continue at ``TRACK_HEIGHT``,
+    so a drop or drag below the tracks still lands on "the next row" (a new
+    track). Shared by the timeline with its clip and header items, which
+    read their geometry from it."""
+
+    def __init__(self, heights=()):
+        self.set_heights(heights)
+
+    def set_heights(self, heights) -> None:
+        self._heights = [int(h) for h in heights]
+        self._tops = []
+        y = float(RULER_HEIGHT)
+        for h in self._heights:
+            self._tops.append(y)
+            y += h + TRACK_GAP
+        self._end = y  # first y below the last row
+
+    @property
+    def heights(self) -> Tuple[int, ...]:
+        return tuple(self._heights)
+
+    def height(self, row: int) -> int:
+        return self._heights[row] if 0 <= row < len(self._heights) else TRACK_HEIGHT
+
+    def top(self, row: int) -> float:
+        if 0 <= row < len(self._tops):
+            return self._tops[row]
+        return self._end + (row - len(self._tops)) * (TRACK_HEIGHT + TRACK_GAP)
+
+    def total_height(self) -> float:
+        return self._end
+
+    def row_at(self, scene_y: float) -> int:
+        """The row under ``scene_y`` (``floor``-like: anywhere on a row or the gap below it)."""
+        if scene_y >= self._end:  # below the last row: extrapolate
+            return len(self._tops) + int(math.floor((scene_y - self._end) / (TRACK_HEIGHT + TRACK_GAP)))
+        for row in range(len(self._tops) - 1, -1, -1):
+            if scene_y >= self._tops[row]:
+                return row
+        return 0
+
+    def nearest_row(self, top_y: float) -> int:
+        """The row whose top is nearest ``top_y`` (where a dragged clip's top edge settles)."""
+        candidates = range(len(self._tops) + 1)  # one past the end: drag onto a new track
+        return min(candidates, key=lambda row: abs(self.top(row) - top_y))
+
+
+def row_at_scene_y(scene_y: float, layout: Optional[RowLayout] = None) -> int:
     """Track row under a scene y coordinate (e.g. the mouse position of a drop).
 
-    ``floor``, not ``round``: rows are ``TRACK_HEIGHT + TRACK_GAP`` px apart,
-    and rounding sent a drop on the lower half of a track to the next one.
+    ``floor``, not ``round``: rounding sent a drop on the lower half of a
+    track to the next one. Without ``layout`` every row is ``TRACK_HEIGHT``.
     """
+    if layout is not None and layout.heights:
+        return max(0, layout.row_at(scene_y))
     return max(0, int(math.floor((scene_y - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP))))
 
 
@@ -170,6 +222,7 @@ class TimelineSignals(QObject):
     track_selected = Signal(int)  # row -> header clicked (Delete Track acts on it)
     track_rename_requested = Signal(int)  # row -> header menu "Rename Track..."
     track_move_requested = Signal(int, int)  # row, -1 (up) / +1 (down) -> header menu "Move Track Up/Down"
+    track_height_requested = Signal(int, int)  # row, pixels -> header menu "Track Height"
     snap_guide_show = Signal(float)  # timeline seconds where the guide should be drawn
     snap_guide_hide = Signal()
     marker_clicked = Signal(str)  # marker_id -> seek the playhead there
@@ -194,8 +247,10 @@ class ClipItem(QGraphicsObject):
         track_name: str = "",
         fps: float = 30.0,
         offline: bool = False,
+        layout: Optional[RowLayout] = None,
     ):
         super().__init__()
+        self.layout = layout if layout is not None else RowLayout()
         self.clip_id = clip.id
         self.track_name = track_name
         self.fps = fps
@@ -297,6 +352,7 @@ class ClipItem(QGraphicsObject):
 
     def set_row(self, row: int) -> None:
         if row != self.row:
+            self.prepareGeometryChange()  # rows can differ in height
             self.row = row
             self._sync_position()
 
@@ -305,14 +361,13 @@ class ClipItem(QGraphicsObject):
         return [letter for letter, _color in self._effect_badges]
 
     def _sync_position(self) -> None:
-        y = RULER_HEIGHT + self.row * (TRACK_HEIGHT + TRACK_GAP)
-        self.setPos(HEADER_WIDTH + self._start * self.pixels_per_second, y)
+        self.setPos(HEADER_WIDTH + self._start * self.pixels_per_second, self.layout.top(self.row))
 
     def width_px(self) -> float:
         return max(MIN_CLIP_PIXELS, self._duration * self.pixels_per_second)
 
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, self.width_px(), TRACK_HEIGHT)
+        return QRectF(0, 0, self.width_px(), self.layout.height(self.row))
 
     def set_locked(self, locked: bool) -> None:
         self._locked = locked
@@ -755,7 +810,7 @@ class ClipItem(QGraphicsObject):
             new_row = self.row
             if self.scene() is not None:
                 y = self.pos().y()
-                new_row = max(0, round((y - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP)))
+                new_row = self.layout.nearest_row(y)
             new_start = max(0.0, (self.pos().x() - HEADER_WIDTH) / self.pixels_per_second)
             self._drag_mode = None
             self.signals.clip_moved.emit(self.clip_id, new_start, new_row)
@@ -846,7 +901,8 @@ class TrackHeaderItem(QGraphicsObject):
     otherwise entirely invisible per-track setting visible at a glance.
     """
 
-    def __init__(self, track_id: str, row: int, name: str, track_kind: str, signals: TimelineSignals):
+    def __init__(self, track_id: str, row: int, name: str, track_kind: str, signals: TimelineSignals,
+                 layout: Optional[RowLayout] = None):
         super().__init__()
         self.track_id = track_id
         self.row = row
@@ -854,10 +910,11 @@ class TrackHeaderItem(QGraphicsObject):
         self.track_kind = track_kind
         self.signals = signals
         self.selected = False
+        layout = layout if layout is not None else RowLayout()
+        self.row_height = layout.height(row)
         self.setZValue(60)  # above clips, ruler and the playhead
-
-        y = RULER_HEIGHT + row * (TRACK_HEIGHT + TRACK_GAP)
-        self.setPos(0, y)
+        self.setPos(0, layout.top(row))
+        buttons_y = self.row_height - 24
 
         # Letters stay compact; every toggle has a tooltip naming it and its state
         # ("H" was easily read as headphones or help).
@@ -865,10 +922,10 @@ class TrackHeaderItem(QGraphicsObject):
         self.lock_btn = ToggleButtonItem("L", parent=self, description="Lock track against edits")
         self.hide_btn = ToggleButtonItem("H", parent=self, description="Hide track picture (audio still plays)")
         self.duck_btn = ToggleButtonItem("D", parent=self, description="Duck audio under another track (click to set)")
-        self.mute_btn.setPos(HEADER_WIDTH - 92, TRACK_HEIGHT - 24)
-        self.lock_btn.setPos(HEADER_WIDTH - 70, TRACK_HEIGHT - 24)
-        self.hide_btn.setPos(HEADER_WIDTH - 48, TRACK_HEIGHT - 24)
-        self.duck_btn.setPos(HEADER_WIDTH - 26, TRACK_HEIGHT - 24)
+        self.mute_btn.setPos(HEADER_WIDTH - 92, buttons_y)
+        self.lock_btn.setPos(HEADER_WIDTH - 70, buttons_y)
+        self.hide_btn.setPos(HEADER_WIDTH - 48, buttons_y)
+        self.duck_btn.setPos(HEADER_WIDTH - 26, buttons_y)
 
         self.mute_btn.clicked.connect(lambda: self.signals.track_mute_toggled.emit(self.row))
         self.lock_btn.clicked.connect(lambda: self.signals.track_lock_toggled.emit(self.row))
@@ -879,16 +936,16 @@ class TrackHeaderItem(QGraphicsObject):
         self.duck_btn.clicked.connect(lambda: self.signals.track_duck_config_requested.emit(self.row))
 
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, HEADER_WIDTH, TRACK_HEIGHT)
+        return QRectF(0, 0, HEADER_WIDTH, self.row_height)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.Antialiasing, True)
         bg = QColor(theme.COLOR_BG_DARK)
         painter.fillRect(self.boundingRect(), bg)
         accent = QColor(theme.CLIP_COLOR_VIDEO if self.track_kind == "video" else theme.CLIP_COLOR_AUDIO)
-        painter.fillRect(QRectF(0, 0, 4, TRACK_HEIGHT), accent)
+        painter.fillRect(QRectF(0, 0, 4, self.row_height), accent)
         painter.setPen(QColor(theme.COLOR_BORDER))
-        painter.drawLine(0, TRACK_HEIGHT, HEADER_WIDTH, TRACK_HEIGHT)
+        painter.drawLine(0, self.row_height, HEADER_WIDTH, self.row_height)
 
         if self.selected:
             pen = QPen(QColor(theme.COLOR_ACCENT))
@@ -920,9 +977,18 @@ class TrackHeaderItem(QGraphicsObject):
         rename_action = menu.addAction("Rename Track...")
         up_action = menu.addAction("Move Track Up")
         down_action = menu.addAction("Move Track Down")
+        height_menu = menu.addMenu("Track Height")
+        height_actions = {}
+        for label, pixels in TRACK_HEIGHT_PRESETS.items():
+            action = height_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(pixels == self.row_height)
+            height_actions[action] = pixels
         menu.addSeparator()
         duck_action = menu.addAction("Duck Audio Under / Ducking Settings...")
         chosen = menu.exec(event.screenPos())
+        if chosen in height_actions:
+            self.signals.track_height_requested.emit(self.row, height_actions[chosen])
         if chosen == rename_action:
             self.signals.track_rename_requested.emit(self.row)
         elif chosen == up_action:

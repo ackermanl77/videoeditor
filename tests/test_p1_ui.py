@@ -236,6 +236,55 @@ class TrackRenameAndMoveTests(_QtCase):
         self.assertEqual(self._row_names(), ["Video 2", "Video 1", "Audio 1", "Audio 2"])
 
 
+class TrackHeightTests(_QtCase):
+    """F8 leftovers: per-track row height presets."""
+
+    def setUp(self):
+        self.project = Project()  # rows: Video 1, Audio 1
+        self.project.tracks[0].clips.append(_video(0.0))
+        self.history = History()
+        self.timeline = TimelineWidget()
+        self.timeline.set_project(self.project, self.history)
+
+    def test_row_layout_with_mixed_heights(self):
+        from ui.widgets.timeline_items import RowLayout
+
+        layout = RowLayout([96, 48])
+        self.assertEqual((layout.top(0), layout.top(1)), (RULER_HEIGHT, RULER_HEIGHT + 96 + TRACK_GAP))
+        self.assertEqual(layout.row_at(RULER_HEIGHT + 95), 0)
+        self.assertEqual(layout.row_at(RULER_HEIGHT + 96 + TRACK_GAP + 1), 1)
+        below = layout.total_height()
+        self.assertEqual(layout.row_at(below + 1), 2)  # past the last row: the next (new) one
+        self.assertEqual(layout.nearest_row(RULER_HEIGHT + 90), 1)  # top edge nearer row 1's top
+        self.assertEqual(row_at_scene_y(RULER_HEIGHT + 95, layout), 0)
+
+    def test_a_height_preset_resizes_the_row_and_moves_the_rows_below(self):
+        header, audio_header = self.timeline._header_items
+        clip_item = next(iter(self.timeline._clip_items.values()))
+        self.assertEqual(header.boundingRect().height(), 64)
+        self.timeline.signals.track_height_requested.emit(0, 96)
+        self.assertEqual(self.project.tracks[0].height, 96)
+        header, audio_header = self.timeline._header_items
+        clip_item = next(iter(self.timeline._clip_items.values()))
+        self.assertEqual(header.boundingRect().height(), 96)
+        self.assertEqual(clip_item.boundingRect().height(), 96)
+        self.assertEqual(audio_header.pos().y(), RULER_HEIGHT + 96 + TRACK_GAP)
+        self.timeline.set_track_height(0, 80)  # not a preset: ignored
+        self.assertEqual(self.project.tracks[0].height, 96)
+        self.history.undo()
+        self.timeline.rebuild()
+        self.assertEqual(self.timeline._header_items[1].pos().y(), RULER_HEIGHT + 64 + TRACK_GAP)
+
+    def test_heights_are_saved_and_unknown_values_load_as_medium(self):
+        from core.track import Track, normalize_track_height
+
+        self.project.tracks[0].height = 48
+        data = self.project.tracks[0].to_dict()
+        self.assertEqual(Track.from_dict(data).height, 48)
+        self.assertEqual(Track.from_dict(dict(data, height=80)).height, 64)  # older files saved an unused 80
+        self.assertEqual(normalize_track_height(None), 64)
+
+
 class TimelineTransportTests(_QtCase):
     def setUp(self):
         self.project = Project()

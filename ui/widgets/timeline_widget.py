@@ -79,19 +79,19 @@ from core.timeline_nav import (
     snap_to_frame,
     step_frames,
 )
-from core.track import Track, TrackType
+from core.track import TRACK_HEIGHT_PRESETS, Track, TrackType, normalize_track_height
 from ui import theme
 from ui.media_bin import MEDIA_MIME_TYPE
 from ui.widgets import timeline_accessibility
 from ui.widgets.timeline_items import (
     HEADER_WIDTH,
     RULER_HEIGHT,
-    TRACK_GAP,
     TRACK_HEIGHT,
     ClipItem,
     CornerItem,
     MarkerItem,
     PlayheadItem,
+    RowLayout,
     RulerItem,
     TimelineSignals,
     TrackHeaderItem,
@@ -331,7 +331,7 @@ class TimelineView(QGraphicsView):
             asset_id = bytes(event.mimeData().data(MEDIA_MIME_TYPE)).decode("utf-8")
             scene_pos = self.mapToScene(event.position().toPoint() if hasattr(event, "position") else event.pos())
             seconds = max(0.0, (scene_pos.x() - HEADER_WIDTH) / self._timeline_widget.pixels_per_second)
-            row = row_at_scene_y(scene_pos.y())
+            row = row_at_scene_y(scene_pos.y(), self._timeline_widget.row_layout)
             self._timeline_widget.handle_media_drop(asset_id, seconds, row)
             event.acceptProposedAction()
         else:
@@ -371,6 +371,7 @@ class TimelineWidget(QWidget):
         self.out_point: Optional[float] = None
 
         self._row_tracks: List[Track] = []
+        self.row_layout = RowLayout()  # row tops/heights, shared with the clip and header items
         self._marker_items: List[MarkerItem] = []
         self._clip_items: Dict[str, ClipItem] = {}
         self._header_items: List[TrackHeaderItem] = []
@@ -505,6 +506,7 @@ class TimelineWidget(QWidget):
         self.signals.track_duck_config_requested.connect(self._on_track_duck_config_requested)
         self.signals.track_rename_requested.connect(self.rename_track)
         self.signals.track_move_requested.connect(self.move_track)
+        self.signals.track_height_requested.connect(self.set_track_height)
         self.signals.track_selected.connect(self._on_track_selected)
         self.signals.snap_guide_show.connect(self._on_snap_guide_show)
         self.signals.snap_guide_hide.connect(self._on_snap_guide_hide)
@@ -537,7 +539,7 @@ class TimelineWidget(QWidget):
         audio_tracks = [t for t in self.project.tracks if t.track_type == TrackType.AUDIO]
         rows = list(reversed(video_tracks)) + audio_tracks
         return (
-            tuple((t.id, t.name, t.muted, t.locked, t.hidden, bool(t.duck_trigger_track_id)) for t in rows),
+            tuple((t.id, t.name, t.muted, t.locked, t.hidden, bool(t.duck_trigger_track_id), t.height) for t in rows),
             tuple((m.id, m.time, m.name, m.color) for m in self.project.markers),
             self.selected_track_id,
             self.project.settings.fps,
@@ -606,6 +608,7 @@ class TimelineWidget(QWidget):
         # Higher-index video tracks are drawn on top in compositing, so show
         # them higher in the panel too (matches conventional NLE layout).
         self._row_tracks = list(reversed(video_tracks)) + audio_tracks
+        self.row_layout.set_heights([normalize_track_height(t.height) for t in self._row_tracks])
         offline_cache: Dict[str, bool] = {}
 
         total_seconds = max(self.project.total_duration, 60.0)
@@ -623,7 +626,7 @@ class TimelineWidget(QWidget):
         self.scene.addItem(self.corner_item)
 
         for row, track in enumerate(self._row_tracks):
-            header = TrackHeaderItem(track.id, row, track.name, track.track_type.value, self.signals)
+            header = TrackHeaderItem(track.id, row, track.name, track.track_type.value, self.signals, self.row_layout)
             header.mute_btn.set_active(track.muted)
             header.lock_btn.set_active(track.locked)
             header.hide_btn.set_active(track.hidden)
@@ -656,7 +659,7 @@ class TimelineWidget(QWidget):
         self._update_empty_hint()
 
     def _scene_height(self) -> float:
-        return RULER_HEIGHT + len(self._row_tracks) * (TRACK_HEIGHT + TRACK_GAP) + 40
+        return self.row_layout.total_height() + 40
 
     def _scene_width(self) -> float:
         total_seconds = max(self.project.total_duration if self.project else 0.0, 60.0)
@@ -772,6 +775,7 @@ class TimelineWidget(QWidget):
             track_name=track.name if track is not None else "",
             fps=self._fps(),
             offline=self._is_offline(clip, offline_cache if offline_cache is not None else {}),
+            layout=self.row_layout,
         )
         item.razor_mode = self.razor_mode
         if track is not None and track.locked:
@@ -1705,6 +1709,17 @@ class TimelineWidget(QWidget):
         label = "Move Track Up" if direction < 0 else "Move Track Down"
         self.history.execute(MoveTrackCommand(self.project, track.id, new_index, label))
         self.selected_track_id = track.id
+        self.rebuild()
+        self._emit_modified()
+
+    def set_track_height(self, row: int, pixels: int) -> None:
+        """Header menu "Track Height": one of TRACK_HEIGHT_PRESETS, undoably."""
+        if self.project is None or self.history is None or not 0 <= row < len(self._row_tracks):
+            return
+        track = self._row_tracks[row]
+        if pixels not in TRACK_HEIGHT_PRESETS.values() or track.height == pixels:
+            return
+        self.history.execute(UpdateTrackPropertyCommand(self.project, track.id, "height", pixels, "Set Track Height"))
         self.rebuild()
         self._emit_modified()
 

@@ -185,6 +185,10 @@ The timeline is where you arrange your edit.
   **Move Track Down** moves it among tracks of its own kind. Video tracks
   higher in the list are drawn on top, so moving one up brings its picture
   in front of the tracks below. Both are undoable.
+- **Track height**: right-click a track's header > **Track Height** >
+  **Small** / **Medium** / **Large** to make its row shorter or taller (a
+  taller row shows more of a clip's waveform or filmstrip). Saved with the
+  project and undoable.
 - **Mute / Lock / Hide a track**: click a track header's **M** / **L** /
   **H** buttons. A locked track's clips can't be dragged or trimmed; a
   hidden video track's picture is left out of the preview and the export,

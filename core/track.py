@@ -15,6 +15,16 @@ class TrackType(str, Enum):
     AUDIO = "audio"
 
 
+#: Timeline row heights (pixels) offered by a track header's "Track Height" menu.
+TRACK_HEIGHT_PRESETS = {"Small": 48, "Medium": 64, "Large": 96}
+DEFAULT_TRACK_HEIGHT = TRACK_HEIGHT_PRESETS["Medium"]
+
+
+def normalize_track_height(value: Any) -> int:
+    """A preset height; anything else (older files saved an unused 80) is Medium."""
+    return value if isinstance(value, int) and value in TRACK_HEIGHT_PRESETS.values() else DEFAULT_TRACK_HEIGHT
+
+
 @dataclass
 class Track:
     """A single track (video or audio) holding a list of non-overlapping clips."""
@@ -26,7 +36,7 @@ class Track:
     muted: bool = False
     locked: bool = False
     hidden: bool = False
-    height: int = 80  # UI row height in pixels
+    height: int = DEFAULT_TRACK_HEIGHT  # timeline row height in pixels, one of TRACK_HEIGHT_PRESETS
 
     # Audio ducking (sidechain compression). When set, this track's own
     # audio is a "duck under" target: its mixed audio is routed through
@@ -131,7 +141,7 @@ class Track:
             muted=data.get("muted", False),
             locked=data.get("locked", False),
             hidden=data.get("hidden", False),
-            height=data.get("height", 80),
+            height=normalize_track_height(data.get("height")),
             duck_trigger_track_id=data.get("duck_trigger_track_id"),
             duck_threshold=data.get("duck_threshold", 0.05),
             duck_ratio=data.get("duck_ratio", 8.0),
