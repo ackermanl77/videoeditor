@@ -37,6 +37,7 @@ from core.commands import (
     AddMarkerCommand,
     AddTrackCommand,
     MoveClipCommand,
+    MoveTrackCommand,
     RemoveClipCommand,
     RemoveMarkerCommand,
     RemoveTrackCommand,
@@ -502,6 +503,8 @@ class TimelineWidget(QWidget):
         self.signals.track_lock_toggled.connect(self._on_track_lock_toggled)
         self.signals.track_hidden_toggled.connect(self._on_track_hidden_toggled)
         self.signals.track_duck_config_requested.connect(self._on_track_duck_config_requested)
+        self.signals.track_rename_requested.connect(self.rename_track)
+        self.signals.track_move_requested.connect(self.move_track)
         self.signals.track_selected.connect(self._on_track_selected)
         self.signals.snap_guide_show.connect(self._on_snap_guide_show)
         self.signals.snap_guide_hide.connect(self._on_snap_guide_hide)
@@ -1665,6 +1668,43 @@ class TimelineWidget(QWidget):
         # Rebuild so the header's duck-toggle indicator (active/inactive)
         # reflects the new value immediately, the same way mute/lock/hide's
         # own handlers rebuild right after mutating their track field.
+        self.rebuild()
+        self._emit_modified()
+
+    def ask_track_name(self, track: Track) -> Optional[str]:
+        """The new name typed for ``track``, or None when cancelled (a seam for tests)."""
+        name, ok = QInputDialog.getText(self, "Rename Track", "Track name:", text=track.name)
+        return name if ok else None
+
+    def rename_track(self, row: int) -> None:
+        """Rename the track in ``row`` (header double-click or menu), undoably."""
+        if self.project is None or self.history is None or not 0 <= row < len(self._row_tracks):
+            return
+        track = self._row_tracks[row]
+        name = self.ask_track_name(track)
+        name = (name or "").strip()
+        if not name or name == track.name:
+            return
+        self.history.execute(UpdateTrackPropertyCommand(self.project, track.id, "name", name, "Rename Track"))
+        self.rebuild()
+        self._emit_modified()
+
+    def move_track(self, row: int, direction: int) -> None:
+        """Move the track in ``row`` one row up (-1) or down (+1) among tracks of
+        its own kind. Video rows are drawn top layer first, so moving a video
+        track up raises it in the stacking order."""
+        if self.project is None or self.history is None or not 0 <= row < len(self._row_tracks):
+            return
+        target_row = row + direction
+        if not 0 <= target_row < len(self._row_tracks):
+            return
+        track, neighbour = self._row_tracks[row], self._row_tracks[target_row]
+        if neighbour.track_type != track.track_type:
+            return  # video rows stay above audio rows
+        new_index = self.project.tracks.index(neighbour)
+        label = "Move Track Up" if direction < 0 else "Move Track Down"
+        self.history.execute(MoveTrackCommand(self.project, track.id, new_index, label))
+        self.selected_track_id = track.id
         self.rebuild()
         self._emit_modified()
 

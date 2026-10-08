@@ -168,6 +168,8 @@ class TimelineSignals(QObject):
     track_hidden_toggled = Signal(int)
     track_duck_config_requested = Signal(int)  # row -> right-clicked "Duck Audio Under..."
     track_selected = Signal(int)  # row -> header clicked (Delete Track acts on it)
+    track_rename_requested = Signal(int)  # row -> header menu "Rename Track..."
+    track_move_requested = Signal(int, int)  # row, -1 (up) / +1 (down) -> header menu "Move Track Up/Down"
     snap_guide_show = Signal(float)  # timeline seconds where the guide should be drawn
     snap_guide_hide = Signal()
     marker_clicked = Signal(str)  # marker_id -> seek the playhead there
@@ -915,10 +917,25 @@ class TrackHeaderItem(QGraphicsObject):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu()
+        rename_action = menu.addAction("Rename Track...")
+        up_action = menu.addAction("Move Track Up")
+        down_action = menu.addAction("Move Track Down")
+        menu.addSeparator()
         duck_action = menu.addAction("Duck Audio Under / Ducking Settings...")
         chosen = menu.exec(event.screenPos())
-        if chosen == duck_action:
+        if chosen == rename_action:
+            self.signals.track_rename_requested.emit(self.row)
+        elif chosen == up_action:
+            self.signals.track_move_requested.emit(self.row, -1)
+        elif chosen == down_action:
+            self.signals.track_move_requested.emit(self.row, 1)
+        elif chosen == duck_action:
             self.signals.track_duck_config_requested.emit(self.row)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.signals.track_rename_requested.emit(self.row)
         event.accept()
 
 

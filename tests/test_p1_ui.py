@@ -193,6 +193,49 @@ class TimelineDropAndTrackTests(_QtCase):
         self.assertEqual(len(self.project.tracks), count - 1)
 
 
+class TrackRenameAndMoveTests(_QtCase):
+    """F8 leftovers: rename and reorder tracks from the header, undoably."""
+
+    def setUp(self):
+        self.project = Project()  # Video 1, Audio 1
+        self.history = History()
+        self.timeline = TimelineWidget()
+        self.timeline.set_project(self.project, self.history)
+        self.timeline.add_track(TrackType.VIDEO)  # Video 2: drawn above Video 1
+        self.timeline.add_track(TrackType.AUDIO)
+
+    def _row_names(self):
+        return [t.name for t in self.timeline._row_tracks]
+
+    def test_rename_goes_through_history(self):
+        self.timeline.ask_track_name = lambda track: "  Interviews  "
+        self.timeline.signals.track_rename_requested.emit(0)
+        self.assertEqual(self._row_names()[0], "Interviews")
+        self.assertEqual(self.timeline._header_items[0].name, "Interviews")
+        self.history.undo()
+        self.assertEqual(self._row_names()[0], "Video 2")
+        self.timeline.ask_track_name = lambda track: None  # cancelled
+        self.timeline.rename_track(0)
+        self.timeline.ask_track_name = lambda track: "   "  # blank: ignored
+        self.timeline.rename_track(0)
+        self.assertEqual(self._row_names()[0], "Video 2")
+
+    def test_moving_a_video_track_down_lowers_it_in_the_stack(self):
+        self.assertEqual(self._row_names(), ["Video 2", "Video 1", "Audio 1", "Audio 2"])
+        self.timeline.signals.track_move_requested.emit(0, 1)
+        self.assertEqual(self._row_names(), ["Video 1", "Video 2", "Audio 1", "Audio 2"])
+        video = [t.name for t in self.project.tracks if t.track_type == TrackType.VIDEO]
+        self.assertEqual(video, ["Video 2", "Video 1"])  # later = drawn on top
+        self.timeline.move_track(1, 1)  # a video row never crosses into the audio rows
+        self.timeline.move_track(3, -1)
+        self.assertEqual(self._row_names(), ["Video 1", "Video 2", "Audio 2", "Audio 1"])
+        self.timeline.move_track(0, -1)  # already at the top
+        self.history.undo()
+        self.history.undo()
+        self.timeline.rebuild()  # MainWindow rebuilds after Undo
+        self.assertEqual(self._row_names(), ["Video 2", "Video 1", "Audio 1", "Audio 2"])
+
+
 class TimelineTransportTests(_QtCase):
     def setUp(self):
         self.project = Project()

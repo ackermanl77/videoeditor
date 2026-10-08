@@ -440,6 +440,35 @@ class RemoveTrackCommand(Command):
             self.project.tracks.insert(min(index, len(self.project.tracks)), copy.deepcopy(self._snapshot))
 
 
+class MoveTrackCommand(Command):
+    """Move a track to another index in ``project.tracks``.
+
+    For video tracks the index is the stacking order (a later track is drawn
+    on top), so this is how a layer is raised or lowered.
+    """
+
+    def __init__(self, project: Project, track_id: str, new_index: int, label: str = "Move Track"):
+        self.project = project
+        self.track_id = track_id
+        track = project.find_track(track_id)
+        self.old_index = project.tracks.index(track) if track is not None else None
+        self.new_index = max(0, min(new_index, len(project.tracks) - 1))
+        self.label = label
+
+    def _move_to(self, index: Optional[int]) -> None:
+        track = self.project.find_track(self.track_id)
+        if track is None or index is None:
+            return
+        self.project.tracks.remove(track)
+        self.project.tracks.insert(min(index, len(self.project.tracks)), track)
+
+    def do(self) -> None:
+        self._move_to(self.new_index)
+
+    def undo(self) -> None:
+        self._move_to(self.old_index)
+
+
 class UpdateTextClipCommand(Command):
     """Replace a text clip's :class:`~core.clip.TextStyle` wholesale."""
 

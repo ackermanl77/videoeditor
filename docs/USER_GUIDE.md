@@ -180,6 +180,11 @@ The timeline is where you arrange your edit.
 - **Add/remove tracks**: **+ Video Track** / **+ Audio Track** in the
   timeline toolbar (or the **Timeline** menu); click a track's header (or
   select one of its clips) and click **Delete Track** to remove it.
+- **Rename / reorder tracks**: double-click a track's header (or right-click
+  it > **Rename Track...**) to rename it; right-click > **Move Track Up** /
+  **Move Track Down** moves it among tracks of its own kind. Video tracks
+  higher in the list are drawn on top, so moving one up brings its picture
+  in front of the tracks below. Both are undoable.
 - **Mute / Lock / Hide a track**: click a track header's **M** / **L** /
   **H** buttons. A locked track's clips can't be dragged or trimmed; a
   hidden video track's picture is left out of the preview and the export,
