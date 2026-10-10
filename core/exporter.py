@@ -38,6 +38,7 @@ from core.subtitles import (
     format_srt,
     is_subtitle_track,
     sidecar_subtitle_path,
+    styled_script_for_export,
     subtitle_cues_for_export,
 )
 
@@ -430,12 +431,19 @@ class Exporter:
         return dataclasses.replace(self.project, tracks=tracks)
 
     def _write_sidecar_subtitles(self, output_path: str, trim_start: float, trim_end: Optional[float]) -> None:
-        cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
-        if not cues:
-            return
+        """A sidecar next to the video: the styled ASS script (as ``.ass``) when the subtitles are
+        styled lines of one script, else plain SRT."""
+        styled = styled_script_for_export(self.project, trim_start, trim_end)
+        if styled is not None:
+            path, content = os.path.splitext(output_path)[0] + ".ass", styled
+        else:
+            cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
+            if not cues:
+                return
+            path, content = sidecar_subtitle_path(output_path), format_srt(cues)
         try:
-            with open(sidecar_subtitle_path(output_path), "w", encoding="utf-8", newline="\n") as f:
-                f.write(format_srt(cues))
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
         except OSError as exc:
             self.warnings.append(f"Could not write the subtitle file: {exc}")
 
@@ -446,17 +454,26 @@ class Exporter:
         input ``input_index``, setting the output's mapping args; ``([], None)``
         when nothing is embedded."""
         self._subtitle_output_args = []
-        cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
-        if not cues or ext not in SUBTITLE_CODECS:
+        if ext not in SUBTITLE_CODECS:
             return [], None
-        fd, path = tempfile.mkstemp(suffix=".srt", prefix="ve_subtitles_")
+        # MKV carries styled subtitles as a real ASS stream; elsewhere (and for
+        # plain or mixed subtitles) the text goes out as SRT-based cues.
+        styled = styled_script_for_export(self.project, trim_start, trim_end) if ext == ".mkv" else None
+        if styled is not None:
+            suffix, input_format, codec, content = ".ass", "ass", "ass", styled
+        else:
+            cues = subtitle_cues_for_export(self.project, trim_start, trim_end)
+            if not cues:
+                return [], None
+            suffix, input_format, codec, content = ".srt", "srt", SUBTITLE_CODECS[ext], format_srt(cues)
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="ve_subtitles_")
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(format_srt(cues))
+            f.write(content)
         self._subtitle_output_args = [
-            "-map", f"{input_index}:s", "-c:s", SUBTITLE_CODECS[ext],
+            "-map", f"{input_index}:s", "-c:s", codec,
             "-metadata:s:s:0", "title=Subtitles",
         ]
-        return ["-f", "srt", "-i", path], path
+        return ["-f", input_format, "-i", path], path
 
     def _with_loudness_normalization(
         self,

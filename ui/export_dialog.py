@@ -398,7 +398,9 @@ class ExportDialog(QDialog):
             self.subtitle_combo.addItem(label, mode)
         self.subtitle_combo.setToolTip(
             "What happens to the \"Subtitles\" tracks: burned into the picture, embedded as a subtitle "
-            "track viewers can switch on and off (MP4/MOV/MKV/WebM), or saved as a .srt file next to the video."
+            "track viewers can switch on and off (MP4/MOV/MKV/WebM), or saved as a file next to the video. "
+            "Styled subtitles (an ASS/SSA file imported with its styling) keep their look when burned in, "
+            "embedded in MKV or saved next to the video (.ass); MP4, MOV and WebM carry their text only."
         )
         form.addRow("Subtitles", self.subtitle_combo)
 

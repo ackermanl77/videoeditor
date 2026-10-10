@@ -446,8 +446,21 @@ named **Subtitles** (a second import that would overlap goes to
   video** (`clip.mp4` gets `clip.srt`; also left out of the picture). An
   export trimmed to a range shifts the captions to match. Embedded and `.srt`
   captions carry the text and timing only, not the clip's font or box.
-- Accepted: SRT, WebVTT and ASS/SSA (its dialogue lines; ASS styles,
-  positions and effects are not kept), UTF-8 or UTF-16 with a byte-order mark, or
+- **Styled ASS/SSA subtitles.** Importing an `.ass`/`.ssa` file asks whether
+  to **Keep Styling** or import **Plain Text**. With Keep Styling, every line
+  becomes a text clip that remembers its original line, and the export draws
+  them with the file's own fonts, colours, outlines, positions and effects
+  (libass), exactly as the subtitle file was made. Lines that overlap in time
+  (a sign at the top while someone speaks at the bottom) go on extra tracks
+  (**Subtitles 2**...) instead of being merged. You can still move, trim,
+  split and delete them; editing a line's text keeps its style but drops that
+  line's inline effects. The editor's own preview shows them as plain
+  captions -- tick **Accurate frame** to see the styled result while paused.
+  Burned in, embedded in an **MKV** (as a real ASS track) or saved next to the
+  video (as `.ass`) they keep their look; MP4, MOV and WebM can only carry
+  their text. In an HDR export they'd look much too bright (the export warns).
+- Accepted: SRT, WebVTT and ASS/SSA (as plain text: its dialogue lines, without
+  styles, positions or effects), UTF-8 or UTF-16 with a byte-order mark, or
   Windows-1252 (common for older SRT files). Formatting tags (`<i>`, `{\an8}`
   and similar) are removed. Cues that overlap are shortened so each ends when
   the next starts (cues starting at the same moment are merged into one

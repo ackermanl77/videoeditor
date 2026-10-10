@@ -127,6 +127,43 @@ class TextStyle:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True)
+class AssEvent:
+    """A styled subtitle line imported from an ASS/SSA script (core.subtitles).
+
+    The text clip carrying it keeps its timing on the timeline; this keeps
+    everything else of the original ``Dialogue:`` line, so the export can
+    render it with libass exactly as authored: the script it came from
+    (``Project.subtitle_scripts[script_id]`` holds that script's styles), its
+    style, layer, margins, effect and the raw text with its override tags.
+    ``plain`` is the clip text the import produced from ``text``: while the
+    clip's text still equals it the raw text is used, otherwise the edited
+    text replaces it (keeping the style, dropping the inline overrides).
+    """
+
+    script_id: str
+    text: str
+    plain: str
+    style: str = "Default"
+    layer: int = 0
+    name: str = ""
+    margin_l: int = 0
+    margin_r: int = 0
+    margin_v: int = 0
+    effect: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "script_id": self.script_id, "text": self.text, "plain": self.plain, "style": self.style,
+            "layer": self.layer, "name": self.name, "margin_l": self.margin_l, "margin_r": self.margin_r,
+            "margin_v": self.margin_v, "effect": self.effect,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AssEvent":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
 def interpolate_keyframes(keyframes, t: float) -> Tuple[float, ...]:
     """Value(s) at ``t`` under the export's piecewise-linear, hold-at-ends semantics."""
     kfs = sorted(keyframes, key=lambda k: k[0])
@@ -287,6 +324,9 @@ class Clip:
     # vignette, denoise, stabilization), applied in list order -- see
     # core/effects.py. Effect parameters can carry their own keyframes.
     effects: List[EffectInstance] = field(default_factory=list)
+    # A styled subtitle line (text clips imported from an ASS/SSA script with
+    # "Keep styling"): rendered by libass instead of drawtext. None otherwise.
+    ass_event: Optional[AssEvent] = None
 
     # Pre-format-3 colour correction / RGB chroma key fields. They are no
     # longer stored on the clip: given to the constructor they become
@@ -667,6 +707,7 @@ class Clip:
             "link_group": self.link_group,
             "volume_keyframes": [list(kf) for kf in self.volume_keyframes],
             "effects": [e.to_dict() for e in self.effects],
+            **({"ass_event": self.ass_event.to_dict()} if self.ass_event else {}),
         }
 
     @classmethod
@@ -729,6 +770,8 @@ class Clip:
             link_group=data.get("link_group"),
             volume_keyframes=[tuple(kf) for kf in data.get("volume_keyframes", [])],
             effects=[EffectInstance.from_dict(e) for e in data.get("effects", []) if isinstance(e, dict)],
+            # Added without a format bump: absent = a plain text clip.
+            ass_event=AssEvent.from_dict(data["ass_event"]) if isinstance(data.get("ass_event"), dict) else None,
             # Old-style colour/key keys (pre-format-3 data that skipped the
             # project migration, e.g. a hand-made dict) still become effects.
             **{name: data[name] for name in LEGACY_FIELDS if name in data},

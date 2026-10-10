@@ -471,6 +471,18 @@ class PropertiesPanel(QWidget):
         self.text_group = QGroupBox("Text")
         text_form = QFormLayout(self.text_group)
 
+        # A styled subtitle line (imported from an ASS/SSA script with its
+        # styling): libass renders it from the script's own style, so the
+        # look controls below only affect this editor's preview.
+        self.styled_note = QLabel(
+            "Styled subtitle line: the export draws it with the subtitle file's own style "
+            "(font, colour, outline, position). The settings below only change this editor's preview. "
+            "Editing the text keeps the style but drops the line's inline effects."
+        )
+        self.styled_note.setWordWrap(True)
+        self.styled_note.setVisible(False)
+        text_form.addRow(self.styled_note)
+
         self.text_content = _PlainTextEdit()
         self.text_content.setFixedHeight(60)
         text_form.addRow("Content", self.text_content)
@@ -723,6 +735,7 @@ class PropertiesPanel(QWidget):
             self.chroma_blend_slider.setValue(int(clip.chroma_key_blend * 100))
             self._refresh_effects_list(clip)
 
+        self.styled_note.setVisible(is_text and clip.ass_event is not None)
         if is_text and clip.text_style is not None:
             style = clip.text_style
             self.text_content.blockSignals(True)

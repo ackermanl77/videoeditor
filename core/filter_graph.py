@@ -30,6 +30,7 @@ from core.media_asset import MediaAsset
 from core.output_color import REFERENCE_WHITE_NITS, SDR_8BIT, OutputColor
 from core.project import Project, ProjectSettings
 from core.stabilize import StabilizeJob, make_job
+from core.subtitles import build_ass_script, styled_clips_by_script
 from core.track import Track, TrackType
 
 # Minimum overlap FFmpeg's xfade is allowed to use for a crossfade — below
@@ -321,7 +322,7 @@ def _escape_filter_value(value: str) -> str:
     return "".join("\\" + ch if ch in "\\'[],;" else ch for ch in level1)
 
 
-def _write_text_file(content: str) -> str:
+def _write_text_file(content: str, suffix: str = ".txt") -> str:
     """Write a text overlay's content to a temp UTF-8 file for ``drawtext=textfile=``.
 
     Passing the text through a file (with ``expansion=none``) instead of
@@ -335,7 +336,7 @@ def _write_text_file(content: str) -> str:
     plain LF (a Windows CRLF would render the CR as a glyph). The caller
     owns the returned file's lifetime -- see :meth:`GraphResult.cleanup`.
     """
-    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ve_text_")
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="ve_text_")
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(content)
     return path
@@ -1370,15 +1371,41 @@ def build_filter_graph(
         current = out_label
 
     # ---- Text overlays (drawn on top of the composited video) ----
+    # Styled subtitle lines (imported from an ASS/SSA script with its
+    # styling) are drawn by libass after them, one `ass` pass per script;
+    # a line whose script is gone falls back to drawtext.
+    styled_by_script = styled_clips_by_script(project, text_clips)
+    styled_ids = {clip.id for clips in styled_by_script.values() for clip in clips}
     for i, clip in enumerate(text_clips):
         style = clip.text_style
-        if style is None:
+        if style is None or clip.id in styled_ids:
             continue
         out_label = f"text{i}"
         text_path = _write_text_file(style.content)
         temp_files.append(text_path)
         filter_lines.append(
             f"[{current}]{_drawtext_filter(style, text_path, clip, window, height, output_color)}[{out_label}]"
+        )
+        current = out_label
+
+    styled_warnings: List[str] = []
+    if styled_by_script and output_color.is_hdr:
+        # libass writes SDR colour values; in a PQ/HLG frame they mean far brighter light than
+        # drawtext's captions, which are mapped to the 203 cd/m2 reference white.
+        styled_warnings.append(
+            "Styled subtitles are drawn with SDR colour values in this HDR export, so they will look much "
+            "brighter than the rest of the picture; export them in SDR, embed them in an MKV, or import them "
+            "as plain text."
+        )
+    for i, (script_id, clips) in enumerate(styled_by_script.items()):
+        script = build_ass_script(
+            project.subtitle_scripts[script_id], clips, window.start, None if math.isinf(window.end) else window.end
+        )
+        ass_path = _write_text_file(script, suffix=".ass")
+        temp_files.append(ass_path)
+        out_label = f"ass{i}"
+        filter_lines.append(
+            f"[{current}]ass=filename={_escape_filter_value(ass_path.replace(os.sep, '/'))}[{out_label}]"
         )
         current = out_label
 
@@ -1470,7 +1497,7 @@ def build_filter_graph(
         has_audio=has_audio,
         temp_files=temp_files,
         has_audible_clips=has_audible_clips,
-        warnings=list(probe_cache.warnings),
+        warnings=list(probe_cache.warnings) + styled_warnings,
         stabilize_jobs=list(ctx.stabilize_jobs),
     )
 

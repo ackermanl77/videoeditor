@@ -27,6 +27,7 @@ REQUIRED_FILTERS = (
     "drawtext", "xfade", "overlay", "amix", "alimiter", "loudnorm", "sidechaincompress", "afftdn",
     "colorkey", "chromakey", "despill", "zscale", "tonemap", "lut3d", "unsharp", "gblur", "vignette", "hqdn3d",
     "eq", "setparams", "vidstabdetect", "vidstabtransform", "reverse", "areverse", "tpad",
+    "ass",  # libass: styled ASS/SSA subtitles (core.subtitles)
 )
 REPORT_NAME = "VideoEditor-selftest.txt"
 

@@ -43,7 +43,16 @@ from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.project import Project, write_backup_copy
 from core.proxy import generate_proxy, needs_proxy
-from core.subtitles import SubtitleParseError, cues_to_text_clips, is_subtitle_path, parse_subtitle_file
+from core.subtitles import (
+    SubtitleParseError,
+    cues_to_text_clips,
+    is_subtitle_path,
+    new_script_id,
+    parse_subtitle_file,
+    read_subtitle_file,
+    split_ass_script,
+    styled_subtitle_tracks,
+)
 from core.timeline_nav import format_timecode
 from core.track import TrackType
 from core.waveform import WaveformData, load_waveform
@@ -547,15 +556,25 @@ class MainWindow(QMainWindow):
         if path:
             self.import_subtitle_file(path)
 
-    def import_subtitle_file(self, path: str) -> int:
+    def import_subtitle_file(self, path: str, keep_styling: Optional[bool] = None) -> int:
         """Add an SRT/WebVTT file's cues as text clips on a "Subtitles" video track (one undo step).
 
         Reuses the existing "Subtitles" track when the new cues fit on it
         (no overlap, not locked); otherwise adds "Subtitles 2", "Subtitles 3"...
+        An ASS/SSA file asks first (``keep_styling`` answers for tests):
+        keep its styling -- styled lines rendered by libass, see
+        :meth:`_import_styled_subtitles` -- or import its text and timing only.
         Returns the number of clips added (0 on an empty or unreadable file).
         """
         if self.history is None:
             return 0
+        if os.path.splitext(path)[1].lower() in (".ass", ".ssa"):
+            if keep_styling is None:
+                keep_styling = self._ask_keep_subtitle_styling()
+                if keep_styling is None:
+                    return 0
+            if keep_styling:
+                return self._import_styled_subtitles(path)
         try:
             cues = parse_subtitle_file(path)
         except (OSError, SubtitleParseError) as exc:
@@ -582,6 +601,61 @@ class MainWindow(QMainWindow):
         self._on_project_modified()
         self.status_bar.showMessage(f"Imported {len(clips)} subtitle cue(s).", 4000)
         return len(clips)
+
+    def _ask_keep_subtitle_styling(self) -> Optional[bool]:
+        """True = keep the ASS/SSA styling, False = plain text, None = cancel."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Import Subtitles")
+        box.setText("This subtitle file has its own styling (fonts, colours, positions).")
+        box.setInformativeText(
+            "Keep the styling: the export draws the subtitles exactly as styled (with libass).\n"
+            "Plain text: import only the text and timing, as editable captions."
+        )
+        keep = box.addButton("Keep Styling", QMessageBox.ButtonRole.AcceptRole)
+        plain = box.addButton("Plain Text", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        return True if clicked is keep else False if clicked is plain else None
+
+    def _import_styled_subtitles(self, path: str) -> int:
+        """An ASS/SSA script as styled subtitle lines (one undo step): its header goes into
+        ``project.subtitle_scripts``; its lines become text clips spread over as many
+        "Subtitles" tracks as keep overlapping lines apart (the first may reuse an existing one)."""
+        try:
+            script = split_ass_script(read_subtitle_file(path))
+        except (OSError, SubtitleParseError) as exc:
+            QMessageBox.warning(self, "Import Subtitles", f"Could not read subtitles from\n{path}\n\n{exc}")
+            return 0
+        script_id = new_script_id()
+        track_clips = styled_subtitle_tracks(script, script_id)
+        if not track_clips:
+            self.status_bar.showMessage("No subtitle lines were found in that file.", 4000)
+            return 0
+        self.project.subtitle_scripts[script_id] = script.header
+        commands = []
+        existing = sum(1 for t in self.project.tracks if t.name.startswith("Subtitles"))
+        for index, clips in enumerate(track_clips):
+            track = self._subtitle_track_for(clips) if index == 0 else None
+            if track is None:
+                existing += 1
+                add_track = AddTrackCommand(
+                    self.project, TrackType.VIDEO, name="Subtitles" if existing == 1 else f"Subtitles {existing}"
+                )
+                commands.append(add_track)
+                track_id = add_track.track_id
+            else:
+                track_id = track.id
+            commands.extend(AddClipCommand(self.project, track_id, clip) for clip in clips)
+        self.history.execute(CompositeCommand(commands, "Import Styled Subtitles"))
+        self.timeline.rebuild()
+        self._on_project_modified()
+        count = sum(len(clips) for clips in track_clips)
+        self.status_bar.showMessage(
+            f"Imported {count} styled subtitle line(s) on {len(track_clips)} track(s).", 4000
+        )
+        return count
 
     def _subtitle_track_for(self, clips) -> Optional["Track"]:
         """An existing unlocked "Subtitles..." video track all of ``clips`` fit on, else None."""

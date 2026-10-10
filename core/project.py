@@ -225,6 +225,10 @@ class Project:
     tracks: List[Track] = field(default_factory=list)
     media_pool: List[MediaAsset] = field(default_factory=list)
     markers: List[Marker] = field(default_factory=list)
+    # Imported ASS/SSA scripts' headers (everything but [Events]: script
+    # info, styles, embedded fonts) by id; styled subtitle clips refer to one
+    # through Clip.ass_event.script_id (see core.subtitles).
+    subtitle_scripts: Dict[str, str] = field(default_factory=dict)
     file_path: Optional[str] = None
     # Problems found while loading (unknown values replaced by defaults,
     # unreadable clips skipped), shown to the user once after opening.
@@ -343,6 +347,12 @@ class Project:
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
+    def _used_subtitle_scripts(self) -> Dict[str, str]:
+        """The subtitle script headers some clip still refers to (an undone or deleted import's
+        header stays in memory for redo, but isn't saved)."""
+        used = {c.ass_event.script_id for t in self.tracks for c in t.clips if c.ass_event is not None}
+        return {sid: header for sid, header in self.subtitle_scripts.items() if sid in used}
+
     def to_dict(self, base_dir: Optional[str] = None) -> Dict[str, Any]:
         """Serialize. With ``base_dir`` (the project file's folder), media paths are also
         stored relative to it, so a project folder moved together with its media still loads."""
@@ -365,6 +375,7 @@ class Project:
             "tracks": tracks,
             "media_pool": media_pool,
             "markers": [m.to_dict() for m in self.markers],
+            **({"subtitle_scripts": scripts} if (scripts := self._used_subtitle_scripts()) else {}),
         }
 
     @classmethod
@@ -407,6 +418,9 @@ class Project:
             tracks.append(track)
         project.tracks = tracks or project.tracks
         project.markers = [Marker.from_dict(m) for m in data.get("markers", [])]
+        scripts = data.get("subtitle_scripts")  # added without a format bump
+        if isinstance(scripts, dict):
+            project.subtitle_scripts = {str(k): v for k, v in scripts.items() if isinstance(v, str)}
         project.load_warnings = warnings
         return project
 

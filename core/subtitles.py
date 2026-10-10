@@ -6,8 +6,17 @@ project file like any other clip. By default they are burned into the
 picture by the same ``drawtext`` path every text overlay uses; the export's
 subtitle mode can instead mux them as a soft subtitle stream or write a
 sidecar ``.srt`` (:func:`subtitle_cues_for_export`, :func:`format_srt`).
-ASS/SSA files are read for their text and timing only -- their styles are
-not kept (no libass). Stdlib only, like the rest of ``core``.
+
+ASS/SSA files can be imported two ways. As plain cues (text and timing),
+like SRT. Or styled (:func:`split_ass_script`, :func:`styled_subtitle_tracks`):
+the script's header -- info, styles, embedded fonts -- is stored once in
+``Project.subtitle_scripts`` and every ``Dialogue`` line becomes a text clip
+carrying its original line (:class:`core.clip.AssEvent`); the export writes
+those clips back into an ASS script at their current timeline times
+(:func:`build_ass_script`) and renders it with libass (FFmpeg's ``ass``
+filter), so fonts, colours, outlines, positions and effects come out as
+authored. Overlapping lines go on extra "Subtitles" tracks instead of being
+merged. Stdlib only, like the rest of ``core``.
 """
 
 from __future__ import annotations
@@ -16,9 +25,10 @@ import html
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+import uuid
+from typing import Dict, Iterable, List, Optional, Tuple
 
-from core.clip import Clip, MediaType, TextStyle
+from core.clip import AssEvent, Clip, MediaType, TextStyle
 
 #: Subtitle file extensions the importer accepts.
 SUBTITLE_EXTENSIONS = frozenset({".srt", ".vtt", ".ass", ".ssa"})
@@ -32,7 +42,7 @@ SUBTITLE_MODES = ("burn", "embed", "sidecar")
 SUBTITLE_MODE_LABELS = (
     ("Burn into the picture", "burn"),
     ("Embed as a subtitle track", "embed"),
-    ("Save as .srt next to the video", "sidecar"),
+    ("Save as a subtitle file next to the video (.srt, or .ass when styled)", "sidecar"),
 )
 
 #: Soft-subtitle codec per container (``-c:s``); a container missing here
@@ -310,3 +320,240 @@ def format_srt(cues: Iterable[SubtitleCue]) -> str:
 def sidecar_subtitle_path(output_path: str) -> str:
     """Where a sidecar subtitle file for ``output_path`` goes: same name, ``.srt``."""
     return os.path.splitext(output_path)[0] + ".srt"
+
+
+# ---------------------------------------------------------------------------
+# Styled ASS/SSA (rendered with libass)
+# ---------------------------------------------------------------------------
+
+#: The Events format every exported script uses (libass reads fields by name,
+#: so a v4/SSA header with this v4+ line still works).
+ASS_EVENTS_FORMAT = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+
+# ASS colour &HAABBGGRR (alpha first, 00 = opaque) or &HBBGGRR.
+_ASS_COLOUR_RE = re.compile(r"&H([0-9A-Fa-f]{6,8})&?")
+_ALIGNMENT_OVERRIDE_RE = re.compile(r"\\an([1-9])")
+# Legacy SSA \a / style alignment values -> numpad (1-3 bottom, 5-7 top, 9-11 middle).
+_LEGACY_ALIGNMENT = {1: 1, 2: 2, 3: 3, 5: 7, 6: 8, 7: 9, 9: 4, 10: 5, 11: 6}
+
+
+@dataclass(frozen=True)
+class AssDialogue:
+    start: float
+    end: float
+    text: str  # the raw Text field, override tags included
+    style: str = "Default"
+    layer: int = 0
+    name: str = ""
+    margin_l: int = 0
+    margin_r: int = 0
+    margin_v: int = 0
+    effect: str = ""
+
+
+@dataclass(frozen=True)
+class AssScript:
+    header: str  # every section but [Events], ending with a newline
+    dialogues: List[AssDialogue]
+    styles: Dict[str, Dict[str, str]]  # style name -> its fields (lower-case keys)
+    play_res_y: int
+
+
+def _int(value: str, default: int = 0) -> int:
+    try:
+        return int(float(value.strip()))
+    except (ValueError, AttributeError):
+        return default
+
+
+def split_ass_script(text: str) -> AssScript:
+    """An ASS/SSA script's header (kept verbatim for libass), its ``Dialogue`` lines with every
+    field, and its styles. Raises :class:`SubtitleParseError` without an ``[Events]`` Format line."""
+    header_lines: List[str] = []
+    dialogues: List[AssDialogue] = []
+    styles: Dict[str, Dict[str, str]] = {}
+    section = ""
+    event_fields: List[str] = []
+    style_fields: List[str] = []
+    play_res_y = 0
+    for line in text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped.lower()
+            if section != "[events]":
+                header_lines.append(stripped)
+            continue
+        if section != "[events]":
+            header_lines.append(line.rstrip())
+            if ":" not in stripped:
+                continue
+            key, value = (part.strip() for part in stripped.split(":", 1))
+            if section == "[script info]" and key.lower() == "playresy":
+                play_res_y = _int(value)
+            elif section in ("[v4+ styles]", "[v4 styles]"):
+                if key.lower() == "format":
+                    style_fields = [f.strip().lower() for f in value.split(",")]
+                elif key.lower() == "style" and style_fields:
+                    row = dict(zip(style_fields, (p.strip() for p in value.split(",", len(style_fields) - 1))))
+                    styles[row.get("name", "Default")] = row
+            continue
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip().lower()
+        if key == "format":
+            event_fields = [f.strip().lower() for f in value.split(",")]
+        elif key == "dialogue" and event_fields:
+            parts = value.split(",", len(event_fields) - 1)
+            if len(parts) < len(event_fields):
+                continue
+            row = dict(zip(event_fields, (p.strip() if f != "text" else p for f, p in zip(event_fields, parts))))
+            try:
+                start, end = _parse_timestamp(row["start"]), _parse_timestamp(row["end"])
+            except KeyError:
+                raise SubtitleParseError("ASS Format line has no Start/End field")
+            if end <= start:
+                continue
+            dialogues.append(AssDialogue(
+                start=start, end=end, text=row.get("text", ""), style=row.get("style", "Default") or "Default",
+                layer=_int(row.get("layer", "0")), name=row.get("name", ""),
+                margin_l=_int(row.get("marginl", "0")), margin_r=_int(row.get("marginr", "0")),
+                margin_v=_int(row.get("marginv", "0")), effect=row.get("effect", ""),
+            ))
+    if not event_fields:
+        raise SubtitleParseError("No [Events] Format line found in the ASS/SSA file")
+    header = "\n".join(header_lines).strip() + "\n"
+    dialogues.sort(key=lambda d: d.start)
+    # libass's default when the script doesn't say (the classic SSA canvas).
+    return AssScript(header=header, dialogues=dialogues, styles=styles, play_res_y=play_res_y or 288)
+
+
+def _preview_style(dialogue: AssDialogue, script: AssScript, plain: str) -> TextStyle:
+    """An approximation of the line's look as a TextStyle -- what the editor's own preview and the
+    timeline show (the export renders the real thing with libass)."""
+    style = script.styles.get(dialogue.style) or script.styles.get("Default") or {}
+    scale = 1080.0 / script.play_res_y
+    alignment = _int(style.get("alignment", "2"), 2)
+    if "marginl" in style and style.get("alignment") and "[v4 styles]" in script.header.lower():
+        alignment = _LEGACY_ALIGNMENT.get(alignment, 2)
+    override = _ALIGNMENT_OVERRIDE_RE.search(dialogue.text)
+    if override:
+        alignment = int(override.group(1))
+    row, column = (alignment - 1) // 3, (alignment - 1) % 3  # row 0 = bottom, 2 = top
+    colour = "#FFFFFF"
+    match = _ASS_COLOUR_RE.fullmatch(style.get("primarycolour", "").strip())
+    if match:
+        bgr = match.group(1)[-6:]
+        colour = f"#{bgr[4:6]}{bgr[2:4]}{bgr[0:2]}".upper()
+    return TextStyle(
+        content=plain,
+        font_family=style.get("fontname", "Arial") or "Arial",
+        font_size=max(8, int(round(_int(style.get("fontsize", "20"), 20) * scale))),
+        color=colour,
+        outline_width=max(0, int(round(_int(style.get("outline", "2"), 2) * scale))),
+        bold=style.get("bold", "0").strip() not in ("0", ""),
+        italic=style.get("italic", "0").strip() not in ("0", ""),
+        position_x=(0.2, 0.5, 0.8)[column],
+        position_y=(0.88, 0.5, 0.12)[row],
+        alignment=("left", "center", "right")[column],
+    )
+
+
+def styled_subtitle_tracks(script: AssScript, script_id: str) -> List[List[Clip]]:
+    """The script's lines as styled text clips, spread over as few tracks as keep them from
+    overlapping (a sign at the top while someone speaks at the bottom needs two). One list of
+    clips per track, the first being the main "Subtitles" track."""
+    tracks: List[List[Clip]] = []
+    track_ends: List[float] = []
+    for index, dialogue in enumerate(script.dialogues, start=1):
+        plain = _ass_text(dialogue.text) or "(styled subtitle)"
+        clip = Clip(
+            media_type=MediaType.TEXT,
+            source_in=0.0,
+            source_out=max(MIN_CUE_SECONDS, dialogue.end - dialogue.start),
+            timeline_start=max(0.0, dialogue.start),
+            name=f"Subtitle {index}",
+            text_style=_preview_style(dialogue, script, plain),
+            ass_event=AssEvent(
+                script_id=script_id, text=dialogue.text, plain=plain, style=dialogue.style, layer=dialogue.layer,
+                name=dialogue.name, margin_l=dialogue.margin_l, margin_r=dialogue.margin_r,
+                margin_v=dialogue.margin_v, effect=dialogue.effect,
+            ),
+        )
+        slot = next((i for i, end in enumerate(track_ends) if end <= clip.timeline_start + 1e-6), None)
+        if slot is None:
+            tracks.append([])
+            track_ends.append(0.0)
+            slot = len(tracks) - 1
+        tracks[slot].append(clip)
+        track_ends[slot] = clip.timeline_end
+    return tracks
+
+
+def new_script_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def format_ass_timestamp(seconds: float) -> str:
+    """H:MM:SS.cc, ASS's own time format (centiseconds)."""
+    total_cs = max(0, int(round(seconds * 100)))
+    hours, rest = divmod(total_cs, 360_000)
+    minutes, rest = divmod(rest, 6000)
+    secs, cs = divmod(rest, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
+def _ass_line_text(clip: Clip) -> str:
+    """The Text field to write for a styled clip: its original raw text while the clip text is
+    unedited, else the edited text (line breaks as \\N; braces, which would start override
+    blocks, as parentheses)."""
+    event = clip.ass_event
+    content = clip.text_style.content if clip.text_style else ""
+    if event is not None and content == event.plain:
+        return event.text
+    return content.replace("{", "(").replace("}", ")").replace("\n", "\\N")
+
+
+def build_ass_script(header: str, clips: Iterable[Clip], offset: float = 0.0, end: Optional[float] = None) -> str:
+    """An ASS script: ``header`` plus one Dialogue line per styled clip at its current timeline
+    time, clipped to ``offset``..``end`` and shifted so ``offset`` is 0 (a trimmed export)."""
+    end_limit = float("inf") if end is None else end
+    lines = [header.rstrip("\n"), "", "[Events]", ASS_EVENTS_FORMAT]
+    rows: List[Tuple[float, str]] = []
+    for clip in clips:
+        event = clip.ass_event
+        if event is None:
+            continue
+        start = max(clip.timeline_start, offset)
+        stop = min(clip.timeline_end, end_limit)
+        if stop - start < 0.01:
+            continue
+        fields = [
+            str(event.layer), format_ass_timestamp(start - offset), format_ass_timestamp(stop - offset), event.style,
+            event.name, str(event.margin_l), str(event.margin_r), str(event.margin_v), event.effect,
+        ]
+        rows.append((start, "Dialogue: " + ",".join(f.replace(",", " ") for f in fields) + "," + _ass_line_text(clip)))
+    lines.extend(row for _start, row in sorted(rows, key=lambda r: r[0]))
+    return "\n".join(lines) + "\n"
+
+
+def styled_clips_by_script(project, clips: Iterable[Clip]) -> Dict[str, List[Clip]]:
+    """``clips``' styled ones whose script the project still has, grouped by script id (in first-seen order)."""
+    grouped: Dict[str, List[Clip]] = {}
+    for clip in clips:
+        event = clip.ass_event
+        if event is not None and event.script_id in project.subtitle_scripts:
+            grouped.setdefault(event.script_id, []).append(clip)
+    return grouped
+
+
+def styled_script_for_export(project, trim_start: float = 0.0, trim_end: Optional[float] = None) -> Optional[str]:
+    """The visible subtitle tracks as one styled ASS script, for an embedded ASS stream or a
+    sidecar ``.ass``: only when every subtitle clip is a styled line of the same script (a mix
+    can't share one header -- those exports fall back to plain SRT)."""
+    clips = [c for t in project.tracks if not t.hidden and is_subtitle_track(t) for c in t.clips]
+    grouped = styled_clips_by_script(project, clips)
+    if len(grouped) != 1 or sum(len(v) for v in grouped.values()) != len(clips):
+        return None
+    script_id, styled = next(iter(grouped.items()))
+    return build_ass_script(project.subtitle_scripts[script_id], styled, trim_start, trim_end)
