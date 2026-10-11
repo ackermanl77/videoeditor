@@ -9,7 +9,7 @@ import re
 import subprocess
 from typing import Optional
 
-from core.ffmpeg_utils import apply_decode_hwaccel, decode_hwaccel_modes, find_binary, run
+from core.ffmpeg_utils import decode_attempts, find_binary, run
 from core.media_asset import MediaAsset
 
 # Extensions ffprobe would otherwise report as a single-frame "video" stream
@@ -219,9 +219,9 @@ def _run_image_job(args, out_path: str, timeout: float) -> Optional[str]:
     A failed attempt's (possibly truncated) image is deleted, so a later
     call can't find it in the cache and hand back a broken picture.
     """
-    for mode in decode_hwaccel_modes():
+    for _mode, attempt in decode_attempts(args):
         try:
-            result = run(apply_decode_hwaccel(args, mode), timeout=timeout)
+            result = run(attempt, timeout=timeout)
         except subprocess.TimeoutExpired:
             result = None
         if result is not None and result.returncode == 0 and os.path.exists(out_path):

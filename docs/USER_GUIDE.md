@@ -647,6 +647,25 @@ clip's volume into account, and drops to zero for silence, a muted clip or
 track, a freeze frame, or media without sound (and until the waveform of a
 just-imported file is ready).
 
+**Loudness**: after the level meters, `M`, `S` and `I` show the loudness of
+the clip under the playhead in LUFS (EBU R128, what streaming services
+normalise to): **M** over the last 0.4 s, **S** over the last 3 s, and **I**
+for everything that has played since you pressed Play. They include the clip's
+volume (and its volume keyframes). Each file is measured once in the
+background the first time you play it, so the meter fills in after a moment.
+Like the level bars it follows the active clip, not the mix of every track;
+**Export > Measure** gives the exact figure for the whole mix.
+
+**Render Preview**: for a stretch that's too heavy to play live (several
+tracks, transitions, text, effects), set In/Out points and pick **Playback >
+Render Preview (In/Out)** (`Ctrl+Return`; without In/Out it renders the whole
+timeline). It renders in the background, small and fast, with the export
+engine; when it's done a **green bar** on the ruler marks the range, and the
+preview plays the render there -- exactly what the export will look and sound
+like. Edit anything in that range and the bar turns **red**: the preview goes
+back to the simplified view until you render again (undoing the edit makes the
+old render valid again). **Cancel Preview Render** stops one in progress.
+
 **Safe areas** draws the action-safe (outer, 90 %) and title-safe (inner,
 80 %) rectangles over the preview, to keep titles and captions away from the
 edges.
@@ -791,6 +810,7 @@ disabled and explained when GIF is selected.
 | Previous / next edit point | Up / Down |
 | Previous / next marker | Shift+M / Ctrl+Shift+M |
 | Set In / Out point, clear both | I / O, Alt+X |
+| Render Preview of In/Out | Ctrl+Return |
 | Split clip at playhead | S |
 | Delete selected clip | Delete |
 | Add text clip | T |
@@ -854,6 +874,10 @@ the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
   footage on a slower CPU; on a fast CPU it can even be slower (each frame
   has to be copied back from the GPU), which is why it is off by default.
   `python main.py --self-test` shows the current setting.
+  **Per source** decides for each file instead: the first time a video file
+  is imported (or a project opens) it is decoded briefly both ways in the
+  background, and only files the GPU decodes clearly faster use it. The
+  result is remembered per file.
 
 ## Troubleshooting
 

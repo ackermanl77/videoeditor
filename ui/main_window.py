@@ -30,10 +30,13 @@ from core import __version__
 from core.autosave import AutosaveSession, find_orphaned_autosaves
 from core.clip import Clip, MediaType, ReframeMode
 from core.commands import AddClipCommand, AddTrackCommand, UpdateClipPropertyCommand
+from core.decode_choice import is_measured, measure_and_remember
 from core.ffmpeg_utils import (
     DECODE_HWACCEL_CHOICES,
     LAUNCH_DECODE_HWACCEL,
+    PER_SOURCE,
     binary_version,
+    decode_hwaccel_modes,
     encoder_supports_10bit,
     nvenc_available,
     set_decode_hwaccel,
@@ -41,6 +44,8 @@ from core.ffmpeg_utils import (
 from core.frame_render import FrameRenderError, full_size, render_frame
 from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
+from core.exporter import ExportCancelled, Exporter
+from core.preview_render import cached_render, render_preview
 from core.project import Project, write_backup_copy
 from core.proxy import generate_proxy, needs_proxy
 from core.subtitles import (
@@ -130,6 +135,10 @@ def _save_recent_projects(paths: List[str]) -> None:
 class MainWindow(QMainWindow):
     # (asset id, proxy path or None) from a proxy-encoding thread.
     _proxy_finished = Signal(str, object)
+    # (files measured, of which decode on the GPU) from the decoder-timing thread (PG2).
+    _decoders_measured = Signal(int, int)
+    # A preview render finished: (RenderedRange or None, error text).
+    _preview_rendered = Signal(object, str)
 
     def __init__(self):
         super().__init__()
@@ -150,6 +159,12 @@ class MainWindow(QMainWindow):
         self._import_worker: Optional[ImportWorker] = None
         self._import_errors: List[str] = []
         self._proxy_finished.connect(self._on_proxy_finished)
+        self._decoders_measured.connect(self._on_decoders_measured)
+        self._preview_rendered.connect(self._on_preview_rendered)
+        self._preview_render_exporter = None
+        self._preview_render_thread: Optional[threading.Thread] = None
+        self._decoder_queue: list = []
+        self._decoder_thread: Optional[threading.Thread] = None
 
         icon_path = os.path.join(self._icons_dir, "app_icon.png")
         if os.path.exists(icon_path):
@@ -372,6 +387,9 @@ class MainWindow(QMainWindow):
         self._add_action(menu, "Set Out Point", self.timeline.set_out_point, "O")
         self._add_action(menu, "Clear In/Out", self.timeline.clear_in_out, "Alt+X")
         menu.addSeparator()
+        self._add_action(menu, "Render Preview (In/Out)", self.render_preview_range, "Ctrl+Return")
+        self._add_action(menu, "Cancel Preview Render", self.cancel_preview_render)
+        menu.addSeparator()
         self._build_gpu_decoding_menu(menu.addMenu("GPU Decoding"))
 
     def _build_gpu_decoding_menu(self, menu) -> None:
@@ -410,6 +428,96 @@ class MainWindow(QMainWindow):
         if mode in self.gpu_decoding_actions:
             self.gpu_decoding_actions[mode].setChecked(True)
         self.status_bar.showMessage(f"GPU decoding: {DECODE_HWACCEL_CHOICES[mode]}", 4000)
+        self.measure_decoders_for([a.path for a in self.project.media_pool if a.has_video and not a.is_image])
+
+    # -- background preview renders (F10c) -----------------------------------------
+    def render_preview_range(self) -> bool:
+        """Render the In/Out range (the whole timeline without one) in the background at
+        preview size; the preview then plays it over that range. False if nothing to do."""
+        if self.project.total_duration <= 0:
+            self.status_bar.showMessage("Nothing to render.", 3000)
+            return False
+        start, end = self.timeline.in_out_range() or (0.0, self.project.total_duration)
+        existing = cached_render(self.project, start, end)
+        if existing is not None:
+            self.preview.add_rendered_range(existing)
+            self.status_bar.showMessage("Preview render already up to date.", 3000)
+            return True
+        self.cancel_preview_render()
+        # A snapshot: edits made while it renders don't leak into the render (they make it stale instead).
+        exporter = Exporter(Project.from_dict(self.project.to_dict()))
+        self._preview_render_exporter = exporter
+        self.status_bar.showMessage(f"Rendering preview {format_timecode(start, self.project.settings.fps)} - "
+                                    f"{format_timecode(end, self.project.settings.fps)}...")
+
+        def work() -> None:
+            def progress(fraction: float, _label: str = "") -> None:
+                self._preview_rendered.emit(None, f"progress:{fraction:.3f}")
+
+            try:
+                render = render_preview(exporter.project, start, end, on_progress=progress, exporter=exporter)
+                self._preview_rendered.emit(render, "")
+            except ExportCancelled:
+                self._preview_rendered.emit(None, "cancelled")
+            except Exception as exc:  # noqa: BLE001 -- shown in the status bar
+                self._preview_rendered.emit(None, str(exc) or type(exc).__name__)
+
+        self._preview_render_thread = threading.Thread(target=work, name="preview-render", daemon=True)
+        self._preview_render_thread.start()
+        return True
+
+    def cancel_preview_render(self) -> None:
+        if self._preview_render_exporter is not None:
+            self._preview_render_exporter.cancel()
+            self._preview_render_exporter = None
+
+    def _on_preview_rendered(self, render, message: str) -> None:
+        if message.startswith("progress:"):
+            if self._preview_render_exporter is not None:
+                self.status_bar.showMessage(f"Rendering preview... {float(message[9:]) * 100:.0f}%")
+            return
+        self._preview_render_exporter = None
+        if render is not None:
+            self.preview.add_rendered_range(render)
+            self.status_bar.showMessage("Preview render ready: the preview plays it until the range is edited.", 5000)
+        elif message == "cancelled":
+            self.status_bar.showMessage("Preview render cancelled.", 3000)
+        else:
+            self.status_bar.showMessage(f"Preview render failed: {message}", 8000)
+
+    # -- per-source GPU decoding (PG2) -------------------------------------------
+    def measure_decoders_for(self, paths) -> bool:
+        """In "Per source" GPU decoding, time the decoders on each not-yet-measured
+        video file in the background (core/decode_choice.py); a no-op otherwise.
+        True if a measurement was queued."""
+        if decode_hwaccel_modes()[0] != PER_SOURCE:
+            return False
+        new = [p for p in paths if p and os.path.isfile(p) and not is_measured(p) and p not in self._decoder_queue]
+        if not new:
+            return False
+        self._decoder_queue.extend(new)
+        if self._decoder_thread is None or not self._decoder_thread.is_alive():
+            self.status_bar.showMessage(f"Timing GPU and software decoding for {len(self._decoder_queue)} file(s)...")
+            self._decoder_thread = threading.Thread(target=self._measure_decoder_queue, name="decoders", daemon=True)
+            self._decoder_thread.start()
+        return True
+
+    def _measure_decoder_queue(self) -> None:
+        measured = on_gpu = 0
+        while self._decoder_queue:
+            path = self._decoder_queue[0]
+            try:
+                winner = measure_and_remember(path)
+            except Exception:  # noqa: BLE001 -- that file just keeps software decoding
+                winner = None
+            measured += 1
+            on_gpu += winner is not None
+            self._decoder_queue.pop(0)
+        self._decoders_measured.emit(measured, on_gpu)
+
+    def _on_decoders_measured(self, measured: int, on_gpu: int) -> None:
+        self.status_bar.showMessage(
+            f"Decoders timed for {measured} file(s): {on_gpu} decode faster on the GPU, the rest in software.", 6000)
 
     def _icon(self, name: str) -> QIcon:
         path = os.path.join(self._icons_dir, "toolbar", f"{name}.png")
@@ -506,6 +614,7 @@ class MainWindow(QMainWindow):
         self.preview.time_changed.connect(self._on_preview_time_changed)
         self.preview.playing_changed.connect(self._on_playing_changed)
         self.preview.transform_edited.connect(self._apply_canvas_transform)
+        self.preview.render_ranges_changed.connect(self.timeline.set_render_ranges)
 
     # ------------------------------------------------------------------
     def _load_project_into_panels(self) -> None:
@@ -518,6 +627,7 @@ class MainWindow(QMainWindow):
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
         self.history.clear()
         self.history.mark_clean()
+        self.measure_decoders_for([a.path for a in self.project.media_pool if a.has_video and not a.is_image])
         self._media_dirty = False
         self._update_title()
 
@@ -719,6 +829,8 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         if self._auto_proxies_enabled() and needs_proxy(asset):
             self.generate_proxy_for(asset.id)
+        if asset.has_video and not asset.is_image:
+            self.measure_decoders_for([asset.path])
 
     def _on_asset_details(self, asset_id: str, thumbnail_path, filmstrip_path, waveform_path) -> None:
         """Second import stage: a thumbnail/waveform arrived for an already-listed asset."""

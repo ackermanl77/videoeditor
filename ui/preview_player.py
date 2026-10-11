@@ -23,11 +23,12 @@ Three additions narrow the gap:
 
 from __future__ import annotations
 
+import os
 import threading
-from typing import Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFontDatabase, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -44,10 +45,19 @@ from PySide6.QtWidgets import (
 
 from core.clip import Clip, MediaType
 from core.frame_render import FrameRenderError, render_frame
+from core.preview_render import RenderedRange, range_key
 from core.project import Project
 from core.timeline_nav import format_timecode
 from core.transform_geometry import clip_box, moved, scaled
 from core.track import Track, TrackType
+from core.loudness import (
+    IntegratedLoudness,
+    format_lufs,
+    generate_loudness,
+    load_loudness,
+    loudness_at,
+    loudness_cache_path,
+)
 from core.waveform import load_waveform, window_levels
 from ui import theme
 
@@ -60,6 +70,10 @@ ACCURATE_FRAME_DEBOUNCE_MS = 150
 SHUTTLE_RATES = (1.0, 2.0, 4.0)
 
 
+def default_loudness_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".video_editor", "loudness")
+
+
 class PreviewPlayer(QWidget):
     """Video/audio preview synced to the project timeline."""
 
@@ -69,6 +83,10 @@ class PreviewPlayer(QWidget):
     _frame_ready = Signal(int, object)
     # On-canvas transform (F15): clip id, transform_x, transform_y, transform_scale after a drag.
     transform_edited = Signal(str, float, float, float)
+    # A source file's loudness measurement finished (path, cache file or None), from a worker thread.
+    _loudness_ready = Signal(str, object)
+    # Background preview renders (F10c) were added or went stale/valid: [(start, end, valid)].
+    render_ranges_changed = Signal(list)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -85,6 +103,14 @@ class PreviewPlayer(QWidget):
         # What the player was last loaded for (see refresh_after_edit).
         self._loaded_signature = None
         self._waveform_cache = {}
+        # Live loudness (core/loudness.py): measurements by source path, the
+        # ones being measured, and the integrated value since Play.
+        self.loudness_cache_dir = default_loudness_cache_dir()
+        self._loudness_cache: Dict[str, object] = {}
+        self._loudness_jobs: Set[str] = set()
+        self._integrated = IntegratedLoudness()
+        # Preview renders of In/Out ranges (core/preview_render.py), newest last.
+        self._renders: list = []
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -184,6 +210,18 @@ class PreviewPlayer(QWidget):
         self.meters = _AudioLevelMeters()
         controls.addWidget(self.meters)
 
+        self.loudness_label = QLabel()
+        self.loudness_label.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.loudness_label.setStyleSheet(f"color: {theme.COLOR_TEXT_DIM};")
+        self.loudness_label.setToolTip(
+            "EBU R128 loudness of the clip under the playhead, with its volume: M = momentary (0.4 s), "
+            "S = short-term (3 s), I = integrated since you pressed Play (gated like R128). Each source "
+            "file is measured once in the background; the Export dialog measures the real mix."
+        )
+        self.loudness_label.setAccessibleName("Loudness meter")
+        controls.addWidget(self.loudness_label)
+        self._show_loudness(None, None)
+
         layout.addLayout(controls)
 
         self.note_label = QLabel(
@@ -196,6 +234,7 @@ class PreviewPlayer(QWidget):
         layout.addWidget(self.note_label)
 
     def _connect_signals(self) -> None:
+        self._loudness_ready.connect(self._on_loudness_ready)
         self.play_btn.clicked.connect(self.toggle_play)
         self.seek_slider.sliderPressed.connect(self._pause_for_scrub)
         self.seek_slider.sliderMoved.connect(self._on_slider_moved)
@@ -205,6 +244,8 @@ class PreviewPlayer(QWidget):
     # ------------------------------------------------------------------
     def set_project(self, project: Project) -> None:
         self.project = project
+        self._renders = []
+        self.render_ranges_changed.emit([])
         self._current_source = None
         self._preloaded_source = None
         self._active_clip = None
@@ -225,7 +266,49 @@ class PreviewPlayer(QWidget):
     # ------------------------------------------------------------------
     # Clip resolution
     # ------------------------------------------------------------------
+    # -- preview renders (F10c) -------------------------------------------------------
+    def add_rendered_range(self, render: RenderedRange) -> None:
+        """Play ``render``'s file over its range from now on (while it stays valid);
+        it replaces older renders it overlaps."""
+        self._renders = [r for r in self._renders if r.end <= render.start or r.start >= render.end] + [render]
+        self._update_render_validity(force_signal=True)
+        self.seek_to(self._current_time)
+
+    def render_ranges(self) -> list:
+        return [(r.start, r.end, r.valid) for r in self._renders]
+
+    def _update_render_validity(self, force_signal: bool = False) -> None:
+        changed = force_signal
+        for render in self._renders:
+            valid = (self.project is not None and os.path.isfile(render.path)
+                     and range_key(self.project, render.start, render.end) == render.key)
+            if valid != render.valid:
+                render.valid = valid
+                changed = True
+        if changed:
+            self.render_ranges_changed.emit(self.render_ranges())
+
+    def _rendered_clip_at(self, t: float) -> Optional[Clip]:
+        """A stand-in clip playing the valid render that covers ``t``, if any: the rest
+        of the preview (seeking, polling, cuts) then treats it like any video clip."""
+        for render in reversed(self._renders):
+            if render.valid and render.start <= t < render.end - 0.02:
+                clip = Clip(
+                    media_type=MediaType.VIDEO,
+                    source_path=render.path,
+                    source_in=0.0,
+                    source_out=render.end - render.start,
+                    timeline_start=render.start,
+                    name="Rendered preview",
+                )
+                clip.id = f"render-{render.key[:12]}"
+                return clip
+        return None
+
     def _resolve_active_clip(self, t: float) -> Tuple[Optional[Clip], Optional[Track]]:
+        rendered = self._rendered_clip_at(t)
+        if rendered is not None:
+            return rendered, None
         if self.project is None:
             return None, None
         video_tracks = [tr for tr in self.project.tracks if tr.track_type == TrackType.VIDEO]
@@ -287,6 +370,7 @@ class PreviewPlayer(QWidget):
             self._current_time = 0.0
         self._load_for_time(self._current_time, autoplay=True)
         self._is_playing = True
+        self._integrated.reset()
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
         self._poll_timer.start()
         self.playing_changed.emit(True)
@@ -328,6 +412,8 @@ class PreviewPlayer(QWidget):
         preview at all. Volume/mute are applied without a seek.
         """
         self.request_accurate_frame()  # any edit can change the composite
+        if self._renders:
+            self._update_render_validity()
         if self._signature(self._current_time) != self._loaded_signature:
             self.seek_to(self._current_time)
             return
@@ -726,14 +812,82 @@ class PreviewPlayer(QWidget):
             or clip.in_freeze_frame(offset)
         ):
             self.meters.set_levels(0.0, 0.0)
+            self._update_loudness(None, 0.0, 0.0)
             return
+        gain = self._clip_gain_at(clip, offset)
+        self._update_loudness(clip, clip.source_time_at(offset), gain)
         waveform = self._waveform_for_active_clip()
         if waveform is None:
             self.meters.set_levels(0.0, 0.0)
             return
         peak, rms = window_levels(waveform, clip.source_time_at(offset))
-        gain = max(0.0, clip.volume)
         self.meters.set_levels(peak * gain, rms * gain)
+
+    @staticmethod
+    def _clip_gain_at(clip: Clip, offset: float) -> float:
+        """The clip's gain at ``offset`` seconds into it: its volume automation
+        envelope when it has one (what the export applies), else its volume."""
+        if clip.has_volume_automation:
+            from core.clip import interpolate_keyframes
+
+            return max(0.0, interpolate_keyframes(clip.volume_keyframes, offset)[0])
+        return max(0.0, clip.volume)
+
+    # -- live loudness (F15) ---------------------------------------------------
+    def _loudness_for_clip(self, clip: Clip):
+        """The cached measurement of ``clip``'s source, or None; starts measuring it
+        in the background the first time (the meter fills in when it's done)."""
+        if self.project is None:
+            return None
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or not asset.path or not asset.has_audio or not os.path.isfile(asset.path):
+            return None
+        path = asset.path
+        if path in self._loudness_cache:
+            return self._loudness_cache[path]
+        cache_file = loudness_cache_path(path, self.loudness_cache_dir)
+        if os.path.exists(cache_file):
+            self._loudness_cache[path] = load_loudness(cache_file)
+            return self._loudness_cache[path]
+        if path not in self._loudness_jobs:
+            self._loudness_jobs.add(path)
+            duration = getattr(asset, "duration", 0.0) or 0.0
+            threading.Thread(
+                target=self._measure_loudness, args=(path, duration), name="loudness", daemon=True
+            ).start()
+        return None
+
+    def _measure_loudness(self, path: str, duration: float) -> None:
+        try:
+            result = generate_loudness(path, self.loudness_cache_dir, duration)
+        except Exception:  # noqa: BLE001 -- no meter for this file, never a crash
+            result = None
+        self._loudness_ready.emit(path, result)
+
+    def _on_loudness_ready(self, path: str, cache_file) -> None:
+        self._loudness_jobs.discard(path)
+        self._loudness_cache[path] = load_loudness(cache_file) if cache_file else None
+        self._update_audio_meters()
+
+    def _update_loudness(self, clip: Optional[Clip], source_time: float, gain: float) -> None:
+        momentary = short_term = None
+        data = self._loudness_for_clip(clip) if clip is not None else None
+        if data is not None:
+            momentary, short_term = loudness_at(data, source_time, gain)
+        if self._is_playing:
+            self._integrated.add(self._current_time, momentary)
+        self._show_loudness(momentary, short_term)
+
+    def _show_loudness(self, momentary: Optional[float], short_term: Optional[float]) -> None:
+        integrated = self._integrated.value()
+        self._last_loudness = (momentary, short_term, integrated)
+        self.loudness_label.setText(
+            f"M {format_lufs(momentary)}  S {format_lufs(short_term)}  I {format_lufs(integrated)} LUFS"
+        )
+
+    def loudness_reading(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """``(momentary, short_term, integrated)`` as last shown (tests, accessibility)."""
+        return self._last_loudness
 
 
 class _SafeAreaOverlay(QWidget):

@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 #: forever. Callers with legitimately longer work pass their own ``timeout``.
 DEFAULT_TIMEOUT_S = 60.0
 DECODE_HWACCEL_ENV = "VIDEO_EDITOR_HWACCEL"
+PER_SOURCE = "per-source"
 
 # When PyInstaller bundles the app, sys._MEIPASS points at the extracted
 # runtime directory. We look there first so a bundled ffmpeg/ffprobe binary
@@ -199,7 +200,9 @@ def decode_hwaccel_modes() -> List[Optional[str]]:
     Opt-in through the ``VIDEO_EDITOR_HWACCEL`` environment variable:
     unset/``off`` (the default) = software only; ``auto``/``on`` = D3D11VA
     then CUDA on Windows (CUDA elsewhere); ``d3d11va`` or ``cuda`` = just
-    that one. The last entry is always ``None``: plain software decoding,
+    that one; ``per-source`` = each input with the decoder measured fastest
+    for that file (core/decode_choice.py), software where the GPU doesn't
+    win or nothing was measured. The last entry is always ``None``: plain software decoding,
     exactly what runs with the setting off, so a failing GPU decoder can
     never make a job fail that would have worked without it. An
     unrecognised value means off.
@@ -209,6 +212,8 @@ def decode_hwaccel_modes() -> List[Optional[str]]:
         return ["d3d11va", None]
     if raw == "cuda":
         return ["cuda", None]
+    if raw == PER_SOURCE:
+        return [PER_SOURCE, None]
     if raw in ("1", "on", "true", "auto"):
         modes: List[Optional[str]] = ["d3d11va", "cuda"] if sys.platform.startswith("win") else ["cuda"]
         return modes + [None]
@@ -216,7 +221,13 @@ def decode_hwaccel_modes() -> List[Optional[str]]:
 
 
 #: The GPU decoding choices the UI offers (PG2): value of DECODE_HWACCEL_ENV -> label.
-DECODE_HWACCEL_CHOICES = {"off": "Off (software)", "auto": "Auto (try the GPU, then software)", "d3d11va": "D3D11VA", "cuda": "CUDA (NVDEC)"}
+DECODE_HWACCEL_CHOICES = {
+    "off": "Off (software)",
+    "auto": "Auto (try the GPU, then software)",
+    "per-source": "Per source (time each file, use the faster decoder)",
+    "d3d11va": "D3D11VA",
+    "cuda": "CUDA (NVDEC)",
+}
 # The value DECODE_HWACCEL_ENV had when the process started (None: unset), so a setting
 # chosen outside the app keeps priority over the app's own remembered choice.
 LAUNCH_DECODE_HWACCEL = os.environ.get(DECODE_HWACCEL_ENV)
@@ -234,6 +245,10 @@ def decode_hwaccel_setting() -> str:
     modes = decode_hwaccel_modes()
     if modes == [None]:
         return "software (Playback > GPU Decoding, or VIDEO_EDITOR_HWACCEL=auto, tries GPU decoding)"
+    if modes[0] == PER_SOURCE:
+        from core.decode_choice import measured_summary
+
+        return f"per source ({measured_summary()}), then software"
     return "GPU first: " + ", ".join(m or "software" for m in modes)
 
 
@@ -251,9 +266,27 @@ def apply_decode_hwaccel(args: List[str], mode: Optional[str]) -> List[str]:
     out: List[str] = []
     for i, arg in enumerate(args):
         if arg == "-i" and i > 0 and not _is_lavfi_input(args, i):
-            out += ["-hwaccel", mode]
+            input_mode = mode
+            if mode == PER_SOURCE:
+                from core.decode_choice import chosen_decoder
+
+                input_mode = chosen_decoder(args[i + 1]) if i + 1 < len(args) else None
+            if input_mode:
+                out += ["-hwaccel", input_mode]
         out.append(arg)
     return out
+
+
+def decode_attempts(args: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+    """``(mode, args)`` for each decode attempt in order (see :func:`decode_hwaccel_modes`),
+    skipping an attempt whose command is the same as an earlier one -- in ``per-source``
+    mode with no input measured faster on the GPU the first attempt is already software."""
+    attempts: List[Tuple[Optional[str], List[str]]] = []
+    for mode in decode_hwaccel_modes():
+        attempt = apply_decode_hwaccel(args, mode)
+        if all(attempt != earlier for _m, earlier in attempts):
+            attempts.append((mode, attempt))
+    return attempts
 
 
 def _is_lavfi_input(args: List[str], i_index: int) -> bool:

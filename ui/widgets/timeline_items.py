@@ -1146,6 +1146,9 @@ class RulerItem(QGraphicsObject):
         # In/Out points (seconds or None), shaded on the ruler.
         self.in_point: Optional[float] = None
         self.out_point: Optional[float] = None
+        # Preview renders (F10c): (start, end, valid) -- a bar along the top, green while
+        # the preview plays the render, red once an edit made it stale.
+        self.render_ranges: list = []
         self.setZValue(40)
         # Makes option.exposedRect the actually-exposed area, so paint()
         # can skip the ticks outside it.
@@ -1153,6 +1156,10 @@ class RulerItem(QGraphicsObject):
 
     def set_in_out(self, in_point: Optional[float], out_point: Optional[float]) -> None:
         self.in_point, self.out_point = in_point, out_point
+        self.update()
+
+    def set_render_ranges(self, ranges: list) -> None:
+        self.render_ranges = list(ranges)
         self.update()
 
     def set_scale(self, pixels_per_second: float, total_seconds: float) -> None:
@@ -1175,6 +1182,11 @@ class RulerItem(QGraphicsObject):
                 shade = QColor(theme.COLOR_ACCENT)
                 shade.setAlpha(70)
                 painter.fillRect(QRectF(start, 0, end - start, RULER_HEIGHT - 1), shade)
+
+        for start_s, end_s, valid in self.render_ranges:
+            color = QColor("#22c55e" if valid else "#ef4444")
+            painter.fillRect(QRectF(start_s * self.pixels_per_second, 0,
+                                    (end_s - start_s) * self.pixels_per_second, 3), color)
 
         interval = self._pick_interval()
         painter.setPen(QColor(theme.COLOR_TEXT_DIM))

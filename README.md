@@ -34,8 +34,11 @@ deliberately layered and documented so it is easy to read, test and extend.
   WebVTT or ASS/SSA file into editable caption text clips on a "Subtitles"
   track; the export burns them in, embeds them as a soft subtitle track
   (MP4/MOV/MKV/WebM) or saves them as a `.srt` next to the video
-- **Audio level meters** (peak and RMS) next to the preview controls, and
-  title/action-safe guides over the preview
+- **Audio level meters** (peak and RMS) and a **live EBU R128 loudness
+  meter** (momentary / short-term / integrated LUFS) next to the preview
+  controls, and title/action-safe guides over the preview
+- **Render Preview (In/Out)**: renders a heavy stretch in the background at
+  540p and plays it exactly as it will export, until that range is edited
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
   split-screen, off-center framing
 - **Shorts / vertical video export**: crop-to-fill reframing (with a manual
@@ -89,7 +92,8 @@ deliberately layered and documented so it is easy to read, test and extend.
   `VIDEO_EDITOR_HWACCEL=auto` / `d3d11va` / `cuda`) decodes video on the GPU for exports, preview frames, proxies and
   thumbnails; anything the GPU decoder can't handle falls back to normal
   software decoding automatically. Off by default (see the User Guide for when
-  it helps)
+  it helps); **Per source** times each file once and uses the GPU only where
+  it is faster
 
 ## Project layout
 

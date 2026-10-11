@@ -18,8 +18,7 @@ import subprocess
 from typing import List, Optional, Tuple
 
 from core.ffmpeg_utils import (
-    apply_decode_hwaccel,
-    decode_hwaccel_modes,
+    decode_attempts,
     externalize_filter_graph,
     find_binary,
     remove_quietly,
@@ -88,8 +87,8 @@ def render_frame(
         # GPU decode modes first when enabled, always ending in software
         # decoding (see core.ffmpeg_utils.decode_hwaccel_modes).
         result = None
-        for mode in decode_hwaccel_modes():
-            result = run_binary(apply_decode_hwaccel(args, mode), timeout=timeout)
+        for _mode, attempt in decode_attempts(args):
+            result = run_binary(attempt, timeout=timeout)
             if result.returncode == 0 and result.stdout.startswith(b"\x89PNG"):
                 break
     except subprocess.TimeoutExpired as exc:

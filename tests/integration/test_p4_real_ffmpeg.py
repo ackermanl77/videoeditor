@@ -275,7 +275,7 @@ class HardwareDecodeFallbackTests(unittest.TestCase):
         messages = []
         out = os.path.join(_TMP, "hw_fallback.mp4")
         with patch("core.exporter.find_binary", return_value=FFMPEG), \
-                patch("core.exporter.decode_hwaccel_modes", return_value=self.BOGUS):
+                patch("core.ffmpeg_utils.decode_hwaccel_modes", return_value=self.BOGUS):
             Exporter(project).export(ExportSettings(output_path=out, width=W, height=H, fps=30.0, use_gpu=False),
                                      on_progress=lambda f, m: messages.append(m))
         self.assertAlmostEqual(_duration(out), 2.0, delta=0.1)
@@ -289,13 +289,13 @@ class HardwareDecodeFallbackTests(unittest.TestCase):
         asset = _asset("ramp", 2.0)
         project = _project(asset, _clip(asset))
         cache = tempfile.mkdtemp(prefix="ve_p4_cache_", dir=_TMP)
-        with patch("core.frame_render.decode_hwaccel_modes", return_value=self.BOGUS), \
+        with patch("core.ffmpeg_utils.decode_hwaccel_modes", return_value=self.BOGUS), \
                 patch("core.frame_render.find_binary", return_value=FFMPEG):
             self.assertTrue(render_frame(project, 0.5, (W, H)).startswith(b"\x89PNG"))
-        with patch("core.media_probe.decode_hwaccel_modes", return_value=self.BOGUS), \
+        with patch("core.ffmpeg_utils.decode_hwaccel_modes", return_value=self.BOGUS), \
                 patch("core.media_probe.find_binary", return_value=FFMPEG):
             self.assertTrue(os.path.isfile(generate_thumbnail(asset.path, cache, 0.5)))
-        with patch("core.proxy.decode_hwaccel_modes", return_value=self.BOGUS), \
+        with patch("core.ffmpeg_utils.decode_hwaccel_modes", return_value=self.BOGUS), \
                 patch("core.proxy.find_binary", return_value=FFMPEG):
             proxy = generate_proxy(asset, cache, use_gpu=False)
         self.assertTrue(proxy and os.path.isfile(proxy))

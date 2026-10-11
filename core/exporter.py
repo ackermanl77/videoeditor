@@ -17,8 +17,7 @@ from typing import Callable, List, Optional, Tuple
 from core.clip import MediaType, ReframeMode
 from core.effects import effect_files
 from core.ffmpeg_utils import (
-    apply_decode_hwaccel,
-    decode_hwaccel_modes,
+    decode_attempts,
     encoder_supports_10bit,
     externalize_filter_graph,
     find_binary,
@@ -1161,17 +1160,17 @@ class Exporter:
         range's start, so nothing is counted twice; the exporter only renames
         the ``.partial`` file into place after a successful attempt.
         """
-        modes = decode_hwaccel_modes()
         run_args, graph_file = externalize_filter_graph(args)
+        attempts = decode_attempts(run_args)
         try:
-            for attempt, mode in enumerate(modes):
+            for attempt, (mode, attempt_args) in enumerate(attempts):
                 if self._cancelled:
                     raise ExportCancelled()
                 if attempt and on_progress:
                     on_progress(progress_range[0], f"{label}: GPU decoding failed -- retrying with "
                                                    f"{mode or 'software'} decoding...")
                 returncode, log_tail, encoded_seconds = self._run_ffmpeg_once(
-                    apply_decode_hwaccel(run_args, mode), total_duration, on_progress, progress_range, label
+                    attempt_args, total_duration, on_progress, progress_range, label
                 )
                 if returncode == 0:
                     return log_tail
@@ -1181,7 +1180,7 @@ class Exporter:
                     encoded_seconds=encoded_seconds,
                 )
                 retry = mode is not None and (encoded_seconds <= 0.0 or is_hw_decode_failure(log_tail))
-                if not retry or attempt == len(modes) - 1:
+                if not retry or attempt == len(attempts) - 1:
                     raise error
         finally:
             remove_quietly(graph_file)

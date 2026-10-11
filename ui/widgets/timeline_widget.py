@@ -369,6 +369,8 @@ class TimelineWidget(QWidget):
         # as the Export dialog's Trim Range. View state, not project data.
         self.in_point: Optional[float] = None
         self.out_point: Optional[float] = None
+        # Preview renders shown on the ruler (F10c): (start, end, valid).
+        self.render_ranges: list = []
 
         self._row_tracks: List[Track] = []
         self.row_layout = RowLayout()  # row tops/heights, shared with the clip and header items
@@ -614,6 +616,7 @@ class TimelineWidget(QWidget):
         total_seconds = max(self.project.total_duration, 60.0)
         self.ruler_item = RulerItem(self.pixels_per_second, total_seconds, self.project.settings.fps)
         self.ruler_item.set_in_out(self.in_point, self.out_point)
+        self.ruler_item.set_render_ranges(self.render_ranges)
         self.ruler_item.setPos(HEADER_WIDTH, 0)
         self.scene.addItem(self.ruler_item)
 
@@ -977,6 +980,11 @@ class TimelineWidget(QWidget):
         if self.in_point is not None and self.in_point >= self.out_point:
             self.in_point = None
         self.ruler_item.set_in_out(self.in_point, self.out_point)
+
+    def set_render_ranges(self, ranges: list) -> None:
+        """Preview renders to mark on the ruler (kept across rebuilds, like In/Out)."""
+        self.render_ranges = list(ranges)
+        self.ruler_item.set_render_ranges(self.render_ranges)
 
     def clear_in_out(self) -> None:
         self.in_point = self.out_point = None
