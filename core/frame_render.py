@@ -77,6 +77,9 @@ def render_frame(
     Works on a deep copy, so the UI may keep editing while a worker renders.
     """
     snapshot = copy.deepcopy(project)
+    from core.nesting import ensure_nested_renders
+
+    ensure_nested_renders(snapshot, render_missing=False)  # compound clips (F20): their current render
     width, height = size or preview_size(snapshot)
     try:
         args, graph = build_frame_args(snapshot, t, width, height)

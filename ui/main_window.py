@@ -321,6 +321,9 @@ class MainWindow(QMainWindow):
         timeline_menu = menu_bar.addMenu("&Timeline")
         self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
         timeline_menu.addSeparator()
+        self._add_action(timeline_menu, "Nest Selected Clips", self.nest_selected_clips, "Ctrl+G")
+        self._add_action(timeline_menu, "Expand Compound Clip", self.expand_compound_clip, "Ctrl+Shift+G")
+        timeline_menu.addSeparator()
         self._add_action(timeline_menu, "Add Video Track", lambda: self.timeline.add_track(TrackType.VIDEO))
         self._add_action(timeline_menu, "Add Audio Track", lambda: self.timeline.add_track(TrackType.AUDIO))
         self._add_action(timeline_menu, "Zoom In", self.timeline.zoom_in, "Ctrl+=")
@@ -1171,6 +1174,7 @@ class MainWindow(QMainWindow):
         self._load_project_into_panels()
         self._report_load_problems()
         self._warn_about_missing_media()
+        self._render_compound_clips()
         self._add_recent_project(path)
 
     def _report_load_problems(self) -> None:
@@ -1507,6 +1511,81 @@ class MainWindow(QMainWindow):
         ok = self.timeline._execute_and_select(build_scene_cut_command(self.project, clip.id, cuts, choice), False)
         self.statusBar().showMessage(
             f"Split the clip at {len(cuts)} scene cuts." if choice == "split" else f"Added {len(cuts)} scene-cut markers.", 5000)
+        return ok
+
+    # -- compound clips (F20) ---------------------------------------------------------
+    def _render_compound_clips(self) -> bool:
+        """Render the compound clips whose intermediate is missing or out of date, on a background
+        thread with a progress dialog. False (with a message) if a render failed."""
+        from PySide6.QtWidgets import QProgressDialog
+
+        from core.nesting import ensure_nested_renders, missing_renders
+
+        missing = missing_renders(self.project)
+        if not missing:
+            ensure_nested_renders(self.project, render_missing=False)
+            return True
+        progress = QProgressDialog(f"Rendering {len(missing)} compound clip{'s' if len(missing) != 1 else ''}…",
+                                   None, 0, 0, self)
+        progress.setWindowTitle("Compound Clips")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+        project = self.project
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    ensure_nested_renders(project)
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if "error" in result:
+            QMessageBox.warning(self, "Compound Clips", f"A compound clip couldn't be rendered:\n{result['error']}")
+            return False
+        self.timeline.rebuild()
+        self.preview.refresh_after_edit()
+        return True
+
+    def nest_selected_clips(self) -> bool:
+        """Timeline > Nest Selected Clips (F20): the selected clips become one compound clip."""
+        from core.nesting import NestClipsCommand, NestingError
+
+        ids = list(self.timeline.selected_clip_ids)
+        try:
+            command = NestClipsCommand(self.project, ids)
+        except NestingError as exc:
+            QMessageBox.information(self, "Nest Clips", str(exc))
+            return False
+        self.timeline._execute_and_select(command, False)
+        if not self._render_compound_clips():
+            self.history.undo()
+            self.timeline.rebuild()
+            return False
+        self.timeline.select_clips([command.compound.id])
+        self.statusBar().showMessage(f"Nested {len(command.originals)} clips into “{command.compound.name}”.", 5000)
+        return True
+
+    def expand_compound_clip(self) -> bool:
+        """Timeline > Expand Compound Clip (F20): put a compound clip's clips back on the timeline."""
+        from core.nesting import NestingError, UnnestClipCommand
+
+        clip_id = self.timeline.selected_clip_id
+        try:
+            command = UnnestClipCommand(self.project, clip_id) if clip_id else None
+        except NestingError as exc:
+            QMessageBox.information(self, "Expand Compound Clip", str(exc))
+            return False
+        if command is None:
+            QMessageBox.information(self, "Expand Compound Clip", "Select a compound clip first.")
+            return False
+        ok = self.timeline._execute_and_select(command, False)
+        self.timeline.select_clips([clip.id for _track, clip in command.placements])
         return ok
 
     # -- motion tracking (F18) -------------------------------------------------------

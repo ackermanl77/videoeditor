@@ -254,6 +254,10 @@ class PreviewPlayer(QWidget):
 
     def media_path_for(self, clip: Clip) -> str:
         """The file the preview plays for ``clip``: its asset's proxy when one exists, else the source."""
+        if self.project is not None and clip.nested:
+            from core.nesting import render_path
+
+            return render_path(clip.nested, self.project.settings)  # a compound clip's render (F20)
         if self.project is not None:
             asset = self.project.asset_for_clip(clip)
             if asset is not None and asset.path == clip.source_path:

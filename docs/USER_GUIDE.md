@@ -20,18 +20,21 @@ building it.
 10. [Transform: position, scale, rotation](#transform-position-scale-rotation)
 11. [Keyframing (animating opacity and position)](#keyframing-animating-opacity-and-position)
 12. [Speed ramps](#speed-ramps)
-13. [Crossfade transitions](#crossfade-transitions)
-14. [Color correction](#color-correction)
-15. [Chroma key (green screen)](#chroma-key-green-screen)
-16. [Text overlays](#text-overlays)
-17. [Shorts / vertical video export](#shorts--vertical-video-export)
-18. [Effects, audio automation and editing tools](#effects-audio-automation-and-editing-tools)
-19. [The preview player — what it does and doesn't show](#the-preview-player--what-it-does-and-doesnt-show)
-20. [Project files, autosave, and Recent Projects](#project-files-autosave-and-recent-projects)
-21. [Exporting your video](#exporting-your-video)
-22. [Keyboard shortcuts](#keyboard-shortcuts)
-23. [Tips, limits, and things to know](#tips-limits-and-things-to-know)
-24. [Troubleshooting](#troubleshooting)
+13. [Motion tracking](#motion-tracking)
+14. [Compound clips (nesting)](#compound-clips-nesting)
+15. [Detecting scene cuts](#detecting-scene-cuts)
+16. [Crossfade transitions](#crossfade-transitions)
+17. [Color correction](#color-correction)
+18. [Chroma key (green screen)](#chroma-key-green-screen)
+19. [Text overlays](#text-overlays)
+20. [Shorts / vertical video export](#shorts--vertical-video-export)
+21. [Effects, audio automation and editing tools](#effects-audio-automation-and-editing-tools)
+22. [The preview player — what it does and doesn't show](#the-preview-player--what-it-does-and-doesnt-show)
+23. [Project files, autosave, and Recent Projects](#project-files-autosave-and-recent-projects)
+24. [Exporting your video](#exporting-your-video)
+25. [Keyboard shortcuts](#keyboard-shortcuts)
+26. [Tips, limits, and things to know](#tips-limits-and-things-to-know)
+27. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -347,14 +350,60 @@ e.g. normal speed, then slow-motion, then back to normal:
    and click **+ Add**.
 3. Repeat for each speed change.
 
-Speed changes happen as a **step** at each keyframe (an instant change,
-not a gradually accelerating ramp) — for a normal→slow-mo→normal beat,
-this reads as a deliberate cut in pace rather than a smooth blend.
+By default the speed changes as a **step** at each keyframe (an instant
+change) — for a normal→slow-mo→normal beat this reads as a deliberate cut
+in pace. Tick **Smooth ramp** under the keyframe table to make the speed
+**glide** from each keyframe's value to the next instead (it holds after
+the last keyframe); the clip's length on the timeline changes to match.
 
 Chroma key, color correction, and fades/opacity all still work normally
 on a speed-ramped clip. Transform's scale/rotation and crossfade
 transitions do **not** currently combine with a speed ramp on the same
 clip.
+
+## Motion tracking
+
+To make a clip — a logo, a sticker, a label, a small picture-in-picture —
+**move with something in the video** underneath it:
+
+1. Put the clip that should follow on a video track **above** the video.
+2. Move the playhead to a frame where the object is clearly visible and
+   select the clip that should follow.
+3. Choose **Edit > Track Motion...** and drag a box around the object in
+   the frame that appears. Pick something with clear detail rather than a
+   flat colour.
+4. Leave **Keep the clip's current offset from the object** on to keep the
+   clip where you placed it relative to the object, or turn it off to
+   centre the clip on the object. Click **Track**.
+
+The clip gets position keyframes that follow the object (one undo step;
+they show in its Keyframes table and can be edited). Tracking follows the
+object's position only: if the object turns, grows or is covered, those
+frames are skipped and the clip glides straight across them. The video
+being tracked can't be in Fill Frame mode or rotated.
+
+## Compound clips (nesting)
+
+Select several clips — on one track or several — and choose **Timeline >
+Nest Selected Clips** (**Ctrl+G**) to turn them into one **compound
+clip**: a single video clip with their picture and sound, which you can
+move, trim, split, fade, key, speed up or nest again like any other clip.
+The editor renders the compound clip's contents in the background (a
+progress window appears), and renders it again by itself when needed —
+for example after you change the project's resolution, or when you open
+the project on another computer.
+
+**Timeline > Expand Compound Clip** (**Ctrl+Shift+G**) puts the clips back
+on the timeline, as they were, for editing. That works only while the
+compound clip is untrimmed and at normal speed, and when the clips have
+room to go back; otherwise the editor says why. Undo also takes a nest
+back.
+
+## Detecting scene cuts
+
+**Edit > Detect Scene Cuts...** finds the shot changes in the selected
+video clip and offers to split the clip at each one, or to add a marker
+there — a single undo step either way.
 
 ## Crossfade transitions
 
@@ -825,6 +874,7 @@ disabled and explained when GIF is selected.
 | Nudge selection one frame (timeline) | Alt+Left / Alt+Right |
 | Insert / Overwrite selected media at playhead | , / . |
 | Detach audio | Ctrl+Shift+D |
+| Nest selected clips / expand a compound clip | Ctrl+G / Ctrl+Shift+G |
 | Roll edit to playhead | Ctrl+R |
 | Roll / slip / slide / ripple move by dragging | Ctrl+drag an edge / Alt+drag / Ctrl+Alt+drag / Shift+drag |
 | Razor tool on/off | C |

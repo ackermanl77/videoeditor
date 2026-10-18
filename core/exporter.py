@@ -319,6 +319,10 @@ class Exporter:
         failure or :class:`ExportCancelled` if :meth:`cancel` was called.
         """
         self._cancelled = False
+        # Compound clips (F20) play their sub-project's render: make any that are missing first.
+        from core.nesting import ensure_nested_renders
+
+        ensure_nested_renders(self.project)
         ext = os.path.splitext(settings.output_path)[1].lower()
         self._color = SDR_8BIT if ext == GIF_EXTENSION else OutputColor.from_mode(settings.color_mode)
         self._hdr_metadata = self._source_hdr_metadata(self._color)

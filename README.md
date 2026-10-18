@@ -36,6 +36,9 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Motion tracking**: Edit > Track Motion follows an object you box on a
   frame of a video clip (FFmpeg `find_rect`) and gives the selected clip
   above it position keyframes, so a logo or sticker moves with the object
+- **Compound clips**: Timeline > Nest Selected Clips turns a selection
+  (on any tracks) into one clip, rendered in the background and editable
+  again with Expand Compound Clip
 - **Markers/chapters**: bookmark points on the timeline, click to seek,
   snap clips to them, and have them embedded as real player-navigable
   chapters on export
@@ -213,7 +216,7 @@ python -m pytest -q                       # or: python -m unittest discover -s t
 ```
 
 Current result (2026-10-18, Windows, in `.venv` with FFmpeg in `bin/` and PySide6):
-**599 passed plus 92 subtests**, none skipped.
+**604 passed plus 92 subtests**, none skipped.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
 

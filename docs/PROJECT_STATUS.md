@@ -116,6 +116,24 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
   on a background thread with a progress dialog. Tests: `tests/integration/test_scene_detect.py`
   (real FFmpeg, three 2 s shots: cuts at exactly 2.0/4.0 s; the window flow end to end).
 
+- **Compound clips / nested sequences (2026-10-18, F20).** `core/nesting.py`: Timeline > Nest
+  Selected Clips (Ctrl+G) moves the selection (any tracks; the lowest selected video track gets the
+  compound clip, refused if an unselected clip is in the way or a track is locked) into a sub-project
+  stored on the compound clip (`Clip.nested` = `Project.to_dict()`, project format unchanged: absent =
+  none). The compound clip is a normal video clip whose `source_path` is a render of the sub-project
+  (`~/.video_editor/nested/nested_<hash>.mp4`, CRF 18, hash of the sub-project + resolution/fps/sample
+  rate), so trims, speed, effects, export, preview and nesting again need nothing special.
+  `ensure_nested_renders()` renders missing/out-of-date ones: the exporter calls it first (so a nested
+  compound renders its own first), the frame renderer points at existing renders, the editor renders
+  on Nest and on opening a project (background thread, progress dialog); the preview plays
+  `render_path()`. Expand Compound Clip (Ctrl+Shift+G) restores the clips (video tracks onto the
+  compound's track and up, audio tracks in order, adding tracks as needed) when the compound clip is
+  untrimmed, at normal speed and unfrozen and nothing is in the way. Limits: no editing inside a
+  compound clip without expanding it; the sub-project's media paths are stored absolute. Tests:
+  `tests/integration/test_nesting.py` (real FFmpeg: an export with the compound clip matches the
+  export before nesting frame by frame; expand/undo; refusals; save/load; re-render when missing or
+  when the resolution changes; the menu commands).
+
 - **Motion tracking (2026-10-18, F18).** `core/motion_track.py`: the user boxes the object on the
   frame under the playhead (`ui/motion_track_dialog.py`); FFmpeg's `find_rect` searches each frame
   of a 480 px, 15 fps decode of the tracked clip's source range for that template (score above 0.3 =

@@ -363,6 +363,9 @@ class Clip:
     # A styled subtitle line (text clips imported from an ASS/SSA script with
     # "Keep styling"): rendered by libass instead of drawtext. None otherwise.
     ass_event: Optional[AssEvent] = None
+    # A compound clip (F20): the sub-project (Project.to_dict()) of the clips nested into it.
+    # source_path then points at its render (see core/nesting.py).
+    nested: Optional[Dict[str, Any]] = None
 
     # Pre-format-3 colour correction / RGB chroma key fields. They are no
     # longer stored on the clip: given to the constructor they become
@@ -750,6 +753,7 @@ class Clip:
             "volume_keyframes": [list(kf) for kf in self.volume_keyframes],
             "effects": [e.to_dict() for e in self.effects],
             **({"ass_event": self.ass_event.to_dict()} if self.ass_event else {}),
+            **({"nested": self.nested} if self.nested else {}),
         }
 
     @classmethod
@@ -815,6 +819,7 @@ class Clip:
             effects=[EffectInstance.from_dict(e) for e in data.get("effects", []) if isinstance(e, dict)],
             # Added without a format bump: absent = a plain text clip.
             ass_event=AssEvent.from_dict(data["ass_event"]) if isinstance(data.get("ass_event"), dict) else None,
+            nested=data["nested"] if isinstance(data.get("nested"), dict) else None,
             # Old-style colour/key keys (pre-format-3 data that skipped the
             # project migration, e.g. a hand-made dict) still become effects.
             **{name: data[name] for name in LEGACY_FIELDS if name in data},
