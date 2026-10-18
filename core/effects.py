@@ -290,6 +290,8 @@ class EffectInstance:
     enabled: bool = True
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     keyframes: Dict[str, Keyframes] = field(default_factory=dict)
+    #: Limit the effect to an area (core/effect_masks.py, F16); None = the whole frame.
+    mask: Optional[Dict[str, Any]] = None
 
     @classmethod
     def create(cls, kind: str, **params: Any) -> "EffectInstance":
@@ -358,6 +360,8 @@ class EffectInstance:
         out = {"id": self.id, "kind": self.kind, "params": dict(self.params), "enabled": self.enabled}
         if self.keyframes:
             out["keyframes"] = {name: [list(k) for k in keys] for name, keys in self.keyframes.items()}
+        if self.mask is not None:
+            out["mask"] = dict(self.mask)
         return out
 
     @classmethod
@@ -378,21 +382,36 @@ class EffectInstance:
             enabled=bool(data.get("enabled", True)),
             id=str(data.get("id") or uuid.uuid4().hex[:12]),
             keyframes=keyframes,
+            mask=_clean_mask(data.get("mask")),
         )
 
 
-def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 0.0) -> str:
+def _clean_mask(mask: Any) -> Optional[Dict[str, Any]]:
+    from core.effect_masks import clean_mask
+
+    return clean_mask(mask)
+
+
+def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 0.0, aspect: float = 16 / 9) -> str:
     """Comma-prefixed filter text for every renderable effect of ``stage``, in list order.
 
     ``t_offset`` is the clip-local time of the stream's first frame where
     the stream's own clock doesn't start at the clip's start (a speed ramp's
     later segments), so animated parameters still follow clip-local time.
+    A masked effect (F16) is wrapped to apply only inside its mask; ``aspect``
+    is the frame's width/height at this stage, so the mask isn't stretched.
     """
     t_var = "t" if abs(t_offset) < 1e-9 else f"(t+{t_offset:.6f})"
     out = ""
     for effect in effects:
         if effect.is_renderable() and effect.spec.stage == stage:
-            out += "," + effect.filter(t_var)
+            mask = _clean_mask(effect.mask)
+            if mask is not None and effect.spec.stage != "source":
+                from core.effect_masks import masked_filter
+
+                out += masked_filter(effect.filter(t_var), mask, aspect)
+            else:
+                out += "," + effect.filter(t_var)
     return out
 
 

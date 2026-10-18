@@ -257,7 +257,7 @@ def _fit_or_fill(
     here, before the frame gains its alpha channel.
     """
     matrix = _scale_matrix(asset, color)
-    pre = effect_filters(clip.effects, "pre", t_offset)
+    pre = effect_filters(clip.effects, "pre", t_offset, aspect=_source_aspect(asset, width, height))
     if clip.reframe_mode == ReframeMode.FILL:
         return (
             f",scale={width}:{height}:force_original_aspect_ratio=increase{matrix}{pre},format=yuva420p"
@@ -270,13 +270,28 @@ def _fit_or_fill(
     return out
 
 
-def _color_filters(clip: Clip, t_offset: float = 0.0) -> str:
+def _source_aspect(asset: Optional[MediaAsset], width: int, height: int) -> float:
+    """The width/height of a clip's frame before it's fitted to the canvas (masks, F16)."""
+    if asset is not None and asset.width and asset.height:
+        return asset.width / asset.height
+    return width / height if height else 16 / 9
+
+
+def _color_filters(clip: Clip, t_offset: float = 0.0, aspect: float = 16 / 9) -> str:
     """Comma-prefixed per-pixel colour work: the clip's "post" effects (keys, colour correction, looks).
 
     Runs on a stream whose clock is clip-local time (minus ``t_offset`` for
     a speed ramp's later segments), so animated parameters follow the clip.
+    ``aspect`` is the frame's width/height there (for masked effects).
     """
-    return effect_filters(clip.effects, "post", t_offset)
+    return effect_filters(clip.effects, "post", t_offset, aspect=aspect)
+
+
+def _post_aspect(clip: Clip, width: int, height: int, pad: bool, asset: Optional[MediaAsset]) -> float:
+    """The frame's aspect after _fit_or_fill: the canvas when filled or padded, else the source's."""
+    if clip.reframe_mode == ReframeMode.FILL or pad:
+        return width / height if height else 16 / 9
+    return _source_aspect(asset, width, height)
 
 
 def _afade(kind: str, start: float, duration: float, curve: str = "") -> str:
@@ -693,7 +708,7 @@ def _build_video_clip_chain(
     # exists for every later step (keying, fades, rotate).
     chain += _source_color_filters(asset, ctx.color)
     chain += _fit_or_fill(clip, width, height, pad=not apply_transform, asset=asset, color=ctx.color)
-    chain += _color_filters(clip)
+    chain += _color_filters(clip, aspect=_post_aspect(clip, width, height, not apply_transform, asset))
 
     if apply_transform and clip.reframe_mode != ReframeMode.FILL:
         if abs(clip.transform_scale - 1.0) > 1e-6:
@@ -805,7 +820,7 @@ def _build_speed_ramp_video_chain(
             seg_chain += f",setpts=PTS/{seg_speed:.6f}"
         seg_chain += _source_color_filters(asset, ctx.color)
         seg_chain += _fit_or_fill(clip, width, height, pad=True, asset=asset, color=ctx.color, t_offset=t_offset)
-        seg_chain += _color_filters(clip, t_offset)
+        seg_chain += _color_filters(clip, t_offset, aspect=_post_aspect(clip, width, height, True, asset))
         t_offset += (seg_out - seg_in) / seg_speed
 
         label = f"sr{clip_counter}v{i}"

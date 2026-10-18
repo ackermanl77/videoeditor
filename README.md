@@ -20,6 +20,9 @@ deliberately layered and documented so it is easy to read, test and extend.
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
   later same-track clips to close (or open) the gap
+- **Masks on effects**: limit any effect (colour correction, blur, keys,
+  LUTs...) to a rectangle, an ellipse or one side of a linear gradient, with
+  rotation, feather and invert -- in the effect's Properties form
 - **Scene-cut detection**: Edit > Detect Scene Cuts finds the shot changes
   in the selected clip (FFmpeg `scdet`) and splits the clip there or adds a
   marker at each one -- a single undo step

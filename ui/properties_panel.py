@@ -995,6 +995,74 @@ class PropertiesPanel(QWidget):
         self._commit_effects(effects, "Edit Effect", row)
         return True
 
+    def set_effect_mask(self, row: int, mask) -> bool:
+        """Set (or clear, with None / shape "none") the selected effect's mask (F16), undoable."""
+        from core.effect_masks import clean_mask
+
+        effects = self._effects_copy()
+        if effects is None or not (0 <= row < len(effects)):
+            return False
+        mask = clean_mask(mask)
+        if effects[row].mask == mask:
+            return False
+        effects[row].mask = mask
+        self._commit_effects(effects, "Edit Effect Mask", row)
+        return True
+
+    def _mask_editor(self, row: int, effect) -> QWidget:
+        """Shape, centre, size, angle, feather and invert for the effect's mask."""
+        from core.effect_masks import DEFAULT_MASK, MASK_SHAPES, clean_mask
+
+        current = clean_mask(effect.mask) or dict(DEFAULT_MASK)
+        box = QWidget()
+        form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
+        shape = QComboBox()
+        labels = {"none": "Whole frame", "rectangle": "Rectangle", "ellipse": "Ellipse", "linear": "Linear gradient"}
+        for name in MASK_SHAPES:
+            shape.addItem(labels[name], name)
+        shape.setCurrentIndex(MASK_SHAPES.index(current["shape"]))
+        shape.setAccessibleName("Mask shape")
+        form.addRow("Mask", shape)
+        fields = {}
+        for key, label, low, high, step, scale in (
+            ("cx", "Centre X (%)", -50, 150, 1, 100), ("cy", "Centre Y (%)", -50, 150, 1, 100),
+            ("w", "Width (%)", 0, 200, 1, 100), ("h", "Height (%)", 0, 200, 1, 100),
+            ("angle", "Angle (°)", -360, 360, 1, 1), ("feather", "Feather (%)", 0, 50, 0.5, 100),
+        ):
+            spin = QDoubleSpinBox()
+            spin.setRange(low, high)
+            spin.setSingleStep(step)
+            spin.setDecimals(1)
+            spin.setValue(current[key] * scale)
+            spin.setAccessibleName(f"Mask {label}")
+            fields[key] = (spin, scale)
+            form.addRow(label, spin)
+        invert = QCheckBox("Invert (apply outside)")
+        invert.setChecked(current["invert"])
+        form.addRow("", invert)
+
+        def commit(*_args):
+            chosen = shape.currentData()
+            mask = None if chosen == "none" else {"shape": chosen, "invert": invert.isChecked(),
+                                                  **{key: spin.value() / scale for key, (spin, scale) in fields.items()}}
+            self.set_effect_mask(row, mask)
+
+        def refresh_enabled():
+            on = shape.currentData() != "none"
+            sized = shape.currentData() in ("rectangle", "ellipse")
+            for key, (spin, _scale) in fields.items():
+                spin.setEnabled(on and (sized or key not in ("w", "h")))
+            invert.setEnabled(on)
+
+        shape.currentIndexChanged.connect(lambda _i: (refresh_enabled(), commit()))
+        for spin, _scale in fields.values():
+            spin.editingFinished.connect(commit)
+        invert.toggled.connect(commit)
+        refresh_enabled()
+        box.mask_controls = {"shape": shape, "invert": invert, **{key: spin for key, (spin, _s) in fields.items()}}
+        return box
+
     def _on_effect_row_changed(self, row: int) -> None:
         while self.effect_params_form.rowCount():
             self.effect_params_form.removeRow(0)
@@ -1009,6 +1077,9 @@ class PropertiesPanel(QWidget):
         values = effect.resolved_params()
         for spec in effect.spec.params:
             self.effect_params_form.addRow(spec.label, self._param_editor(row, spec, values[spec.name]))
+        if effect.spec.stage != "source":  # stabilization works on whole frames
+            self.effect_mask_editor = self._mask_editor(row, effect)
+            self.effect_params_form.addRow(self.effect_mask_editor)
 
     def key_effect_param_at_playhead(self, row: int, name: str) -> bool:
         """Add/replace a keyframe of effect ``row``'s parameter ``name`` at the playhead (its current value).

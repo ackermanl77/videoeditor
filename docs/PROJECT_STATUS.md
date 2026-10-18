@@ -82,6 +82,18 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Masks on effects (2026-10-18, F16).** `core/effect_masks.py`: an effect's optional `mask`
+  (rectangle / ellipse / linear gradient; centre, size, angle, feather, invert; saved with the
+  project) is drawn once in pure Python at the frame's aspect, cached as a PGM, and in the graph the
+  effect runs on a `split` branch merged back with `maskedmerge` against the mask, scaled to the
+  frame with `scale2ref` and made a four-plane `yuva420p` mask with `mergeplanes` (a grey mask
+  converted to YUV would half-blend the colour). Inline labelled branches inside the clip chain,
+  unique per emission (a speed ramp emits one per segment). Works on "pre" and "post" effects; not
+  on stabilization. Static masks (no keyframes yet). Verified pixel-exact in a prototype (inside =
+  the effect's output, outside = the original, chroma included). Tests:
+  `tests/integration/test_effect_masks.py` (real FFmpeg exports, invert, pre stage, speed ramp,
+  the preview frame, the panel with undo).
+
 - **Scene-cut detection (2026-10-18, F19).** `core/scene_detect.py`: `detect_scene_cuts()` runs
   FFmpeg's `scdet` (threshold 10) on a 320 px decode of the clip's own trimmed source range,
   cancellable, dropping cuts under 0.5 s apart or from the ends; `timeline_offset_for_source()`
