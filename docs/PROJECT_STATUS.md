@@ -82,6 +82,16 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **OpenTimelineIO export/import (2026-10-18, F21).** `core/otio_io.py` writes and reads `.otio` JSON
+  directly (no `opentimelineio` wheel exists for Python 3.14): Timeline/Stack/Track/Clip.2 with
+  `media_references`, Gap, Marker.2 (nearest OTIO colour), LinearTimeWarp (speed, negative =
+  reverse), ExternalReference and a "text" GeneratorReference; the editor's own clip data rides in
+  OTIO metadata, so its own round trip is lossless. Import makes a new unsaved project, probes
+  existing files, keeps missing ones for Relink Media and reports skipped transitions/nested
+  stacks. Checked against the real opentimelineio 0.18.1 (Python 3.11, outside the project): it
+  reads this export correctly, and two files it wrote are the fixtures in `tests/data/otio/`.
+  File menu: Import / Export Timeline (OTIO). Tests: `tests/test_otio_io.py`.
+
 - **Masks on effects (2026-10-18, F16).** `core/effect_masks.py`: an effect's optional `mask`
   (rectangle / ellipse / linear gradient; centre, size, angle, feather, invert; saved with the
   project) is drawn once in pure Python at the frame's aspect, cached as a PGM, and in the graph the

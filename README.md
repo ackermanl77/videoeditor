@@ -20,6 +20,10 @@ deliberately layered and documented so it is easy to read, test and extend.
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
   later same-track clips to close (or open) the gap
+- **Timeline exchange (OpenTimelineIO)**: File > Export / Import Timeline
+  (OTIO) writes and reads `.otio` files for Kdenlive, DaVinci Resolve and
+  other OTIO tools (tracks, trims, gaps, speed/reverse, text, markers); a
+  round trip through this editor keeps everything
 - **Masks on effects**: limit any effect (colour correction, blur, keys,
   LUTs...) to a rectangle, an ellipse or one side of a linear gradient, with
   rotation, feather and invert -- in the effect's Properties form

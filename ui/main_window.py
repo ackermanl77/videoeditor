@@ -279,6 +279,8 @@ class MainWindow(QMainWindow):
         self.import_action = self._add_action(file_menu, "Import Media...", self.import_media_dialog, "Ctrl+I", icon="import")
         self.import_subtitles_action = self._add_action(file_menu, "Import Subtitles...", self.import_subtitles_dialog)
         self.relink_action = self._add_action(file_menu, "Relink Media...", self.open_relink_dialog)
+        self._add_action(file_menu, "Import Timeline (OTIO)...", self.import_otio_dialog)
+        self._add_action(file_menu, "Export Timeline (OTIO)...", self.export_otio_dialog)
         self.export_action = self._add_action(file_menu, "Export Video...", self.open_export_dialog, "Ctrl+E", icon="export")
         self.export_frame_action = self._add_action(file_menu, "Export Frame...", self.export_frame_dialog, "Ctrl+Alt+E")
         self.render_queue_action = self.render_queue_dock.toggleViewAction()
@@ -1397,6 +1399,52 @@ class MainWindow(QMainWindow):
         self._export_dialogs.append(dialog)
         dialog.destroyed.connect(lambda _obj=None, d=dialog: self._forget_export_dialog(d))
         dialog.show()
+
+    # -- OpenTimelineIO (F21) ----------------------------------------------------------
+    def export_otio_dialog(self, path: Optional[str] = None) -> Optional[str]:
+        """Save the timeline as an .otio file for Kdenlive, DaVinci Resolve and other OTIO readers."""
+        from core.otio_io import export_otio
+
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export Timeline (OTIO)", f"{self.project.name}.otio",
+                                                  "OpenTimelineIO (*.otio)")
+            if not path:
+                return None
+        try:
+            export_otio(self.project, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export Timeline (OTIO)", f"The timeline couldn't be saved:\n{exc}")
+            return None
+        self.statusBar().showMessage(f"Timeline exported to {os.path.basename(path)}", 5000)
+        return path
+
+    def import_otio_dialog(self, path: Optional[str] = None) -> bool:
+        """Open an .otio timeline as a new (unsaved) project; its media is probed, missing files kept
+        for Relink Media, and what couldn't be imported (transitions, nested stacks) is reported."""
+        from core.media_probe import probe_file
+        from core.otio_io import import_otio
+
+        if not self._confirm_discard_if_dirty():
+            return False
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Import Timeline (OTIO)", "", "OpenTimelineIO (*.otio)")
+            if not path:
+                return False
+        try:
+            project = import_otio(path, probe=probe_file)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Import Timeline (OTIO)", f"Could not import the timeline:\n{exc}")
+            return False
+        self._clear_autosave()
+        self.project = project
+        self.history = self._new_history()
+        self._thumb_pixmap_cache.clear()
+        self._filmstrip_pixmap_cache.clear()
+        self._waveform_cache.clear()
+        self._load_project_into_panels()
+        self._report_load_problems()
+        self._warn_about_missing_media()
+        return True
 
     # -- scene-cut detection (F19) ---------------------------------------------------
     def detect_scene_cuts(self, choice: Optional[str] = None) -> bool:
