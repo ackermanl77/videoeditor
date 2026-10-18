@@ -253,6 +253,11 @@ track — handy for noting "intro ends here" or "add B-roll here."
   chapters, cuts and notes at a glance; undoable and saved with the project) or
   **Delete**.
 - Markers participate in snapping, just like clip edges and the playhead.
+- **Timeline > Markers Panel** (**Ctrl+Alt+M**) lists every marker in time
+  order with its colour, timecode, name and a **note**. Double-click a
+  name or note to edit it, double-click the time (or press Enter) to jump
+  there, and press **Delete** to remove the selected marker. Every edit
+  can be undone.
 - **On export, every marker becomes a real, player-navigable chapter** —
   VLC, most browsers, and YouTube (once uploaded) will show these as jump
   points. A chapter runs from its own marker to the next one, and the last
@@ -472,6 +477,14 @@ once saved, they need this version (or newer) to open.
    and alignment.
 3. Trim and move it on the timeline like any other clip to control when it
    appears and for how long.
+
+**Styles.** The **Style** row in the Text group applies a ready-made look —
+**Lower Third**, **Centered Title**, **Caption**, **Chapter Heading**,
+**Corner Tag** — or one you saved with **Save…**, scaled to the project's
+resolution; the clip keeps its text. **Apply to Track** gives every text
+clip on the same track that style at once, which is the quick way to
+restyle a whole set of imported subtitles (one undo step; subtitles imported
+with their ASS styling keep it). **Delete** removes a saved style.
 
 *Note: during playback the preview shows text as a plain centered label
 rather than composited over your video; pause with **Accurate frame** ticked

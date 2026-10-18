@@ -9,7 +9,8 @@ Bookmark points on the shared project timeline (independent of any clip/track), 
 1. Position the playhead where you want a marker, then click **+ Marker** in the timeline toolbar, press **M**, or use **Timeline > Add Marker at Playhead**. A dialog asks for a name (pre-filled with "Marker N"); confirming adds it.
 2. Markers render as a small colored flag in the ruler band, with a thin dashed line running down through the tracks so its exact position is easy to line up against clips.
 3. **Left-click** a marker's flag to seek the playhead there. **Right-click** for **Rename...** / **Delete Marker**.
-4. Markers participate in snapping (see [timeline-editing/workflow.md](../timeline-editing/workflow.md)) — dragging or trimming a clip snaps to marker positions the same way it snaps to clip edges, the playhead, and `0:00`.
+4. **Timeline > Markers Panel** (`Ctrl+Alt+M`, `ui/markers_panel.py`) is a dock listing every marker in time order: a colour swatch, the timecode, the name and a free-text **note** (`Marker.note`, saved only when not empty, so older projects load unchanged). Name and note cells are edited in place (`RenameMarkerCommand` / `EditMarkerNoteCommand`, one undo step each; an empty name is refused). Double-clicking the time or pressing Enter seeks, and Delete removes the marker. The panel refreshes on every history change, so ruler edits and Undo show up in it.
+5. Markers participate in snapping (see [timeline-editing/workflow.md](../timeline-editing/workflow.md)) — dragging or trimming a clip snaps to marker positions the same way it snaps to clip edges, the playhead, and `0:00`.
 
 ## Chapters on export
 

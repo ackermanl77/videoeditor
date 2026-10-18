@@ -261,6 +261,17 @@ class MainWindow(QMainWindow):
         self.render_queue_dock.setWidget(self.render_queue)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.render_queue_dock)
         self.render_queue_dock.hide()
+        # Markers panel (F15): the list of markers with their notes.
+        from ui.markers_panel import MarkersPanel
+
+        self.markers_panel = MarkersPanel(lambda t: format_timecode(t, self.project.settings.fps))
+        self.markers_panel.seek_requested.connect(self.timeline.set_playhead)
+        self.markers_panel.project_modified.connect(lambda: (self.timeline.rebuild(), self._on_project_modified()))
+        self.markers_dock = QDockWidget("Markers", self)
+        self.markers_dock.setObjectName("MarkersDock")
+        self.markers_dock.setWidget(self.markers_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.markers_dock)
+        self.markers_dock.hide()
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -288,6 +299,9 @@ class MainWindow(QMainWindow):
         self.render_queue_action.setText("Render Queue")
         self.render_queue_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         file_menu.addAction(self.render_queue_action)
+        self.markers_action = self.markers_dock.toggleViewAction()
+        self.markers_action.setText("Markers Panel")
+        self.markers_action.setShortcut(QKeySequence("Ctrl+Alt+M"))
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close, "Ctrl+Q")
 
@@ -320,6 +334,7 @@ class MainWindow(QMainWindow):
 
         timeline_menu = menu_bar.addMenu("&Timeline")
         self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
+        timeline_menu.addAction(self.markers_action)
         timeline_menu.addSeparator()
         self._add_action(timeline_menu, "Nest Selected Clips", self.nest_selected_clips, "Ctrl+G")
         self._add_action(timeline_menu, "Expand Compound Clip", self.expand_compound_clip, "Ctrl+Shift+G")
@@ -629,6 +644,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_project(self.project, self.history)
         self.preview.set_project(self.project)
         self.properties.set_project(self.project, self.history)
+        self.markers_panel.set_project(self.project, self.history)
         self.timeline.get_thumbnail_for_clip = self._thumbnail_for_clip
         self.timeline.get_filmstrip_for_clip = self._filmstrip_for_clip
         self.timeline.get_waveform_for_clip = self._waveform_for_clip
@@ -1084,6 +1100,8 @@ class MainWindow(QMainWindow):
             return  # History notifies during construction, before the menus exist
         self.undo_action.setEnabled(self.history.can_undo)
         self.redo_action.setEnabled(self.history.can_redo)
+        if hasattr(self, "markers_panel") and self.markers_panel.history is self.history:
+            self.markers_panel.refresh()  # ruler edits, undo and redo show up in the list
         # The title star follows the undo position (R4): undoing back to the
         # saved state clears it again.
         self._update_title()

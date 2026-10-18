@@ -181,9 +181,13 @@ class Marker:
     name: str = "Marker"
     color: str = "#3b82f6"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    note: str = ""  # free text shown in the Markers panel (F15)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"id": self.id, "time": self.time, "name": self.name, "color": self.color}
+        data = {"id": self.id, "time": self.time, "name": self.name, "color": self.color}
+        if self.note:
+            data["note"] = self.note
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Marker":
@@ -192,6 +196,7 @@ class Marker:
             time=data.get("time", 0.0),
             name=data.get("name", "Marker"),
             color=data.get("color", "#3b82f6"),
+            note=str(data.get("note", "") or ""),
         )
 
 

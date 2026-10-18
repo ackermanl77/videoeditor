@@ -626,6 +626,28 @@ class RenameMarkerCommand(Command):
             marker.name = self.old_name
 
 
+class EditMarkerNoteCommand(Command):
+    """Change a marker's note (F15, the Markers panel)."""
+
+    def __init__(self, project: Project, marker_id: str, note: str):
+        self.project = project
+        self.marker_id = marker_id
+        self.new_note = note
+        marker = project.find_marker(marker_id)
+        self.old_note = marker.note if marker else ""
+        self.label = "Edit Marker Note"
+
+    def do(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.note = self.new_note
+
+    def undo(self) -> None:
+        marker = self.project.find_marker(self.marker_id)
+        if marker is not None:
+            marker.note = self.old_note
+
+
 class RecolorMarkerCommand(Command):
     """Change a marker's colour (F15)."""
 

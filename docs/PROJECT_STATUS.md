@@ -116,6 +116,14 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
   on a background thread with a progress dialog. Tests: `tests/integration/test_scene_detect.py`
   (real FFmpeg, three 2 s shots: cuts at exactly 2.0/4.0 s; the window flow end to end).
 
+- **Markers panel and restyling captions (2026-10-18, F15's last pieces).** A Markers dock
+  (Timeline > Markers Panel, Ctrl+Alt+M; `ui/markers_panel.py`) lists the markers with colour,
+  timecode, name and a new free-text `Marker.note` (saved only when set), edited in place with undo
+  (`EditMarkerNoteCommand`), double-click/Enter to seek, Delete to remove; it refreshes on every
+  history change. The Properties panel's Style row gained **Apply to Track**: the chosen title style
+  on every text clip of the track (styled ASS lines excepted) as one `CompositeCommand`. Tests:
+  `tests/test_markers_panel.py`.
+
 - **Compound clips / nested sequences (2026-10-18, F20).** `core/nesting.py`: Timeline > Nest
   Selected Clips (Ctrl+G) moves the selection (any tracks; the lowest selected video track gets the
   compound clip, refused if an unselected clip is in the way or a track is locked) into a sub-project

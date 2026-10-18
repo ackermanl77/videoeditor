@@ -502,6 +502,13 @@ class PropertiesPanel(QWidget):
         self.apply_title_style_btn.setToolTip("Give this text clip the chosen style (its text is kept).")
         self.apply_title_style_btn.clicked.connect(lambda: self.apply_title_style(self.title_style_combo.currentText()))
         style_row.addWidget(self.apply_title_style_btn)
+        self.apply_title_style_track_btn = QPushButton("Apply to Track")
+        self.apply_title_style_track_btn.setToolTip(
+            "Give every text clip on this clip's track the chosen style -- e.g. restyle all imported "
+            "subtitles at once (each keeps its text; one undo step).")
+        self.apply_title_style_track_btn.clicked.connect(
+            lambda: self.apply_title_style_to_track(self.title_style_combo.currentText()))
+        style_row.addWidget(self.apply_title_style_track_btn)
         self.save_title_style_btn = QPushButton("Save…")
         self.save_title_style_btn.setToolTip("Save this clip's look as a style for other text clips and projects.")
         self.save_title_style_btn.clicked.connect(lambda: self.save_title_style())
@@ -1404,6 +1411,36 @@ class PropertiesPanel(QWidget):
         self.clip_changed.emit(self.clip_id)
         self.project_modified.emit()
         return True
+
+    def apply_title_style_to_track(self, name: str) -> int:
+        """Give every text clip on the selected clip's track the style ``name`` (one undo step).
+        Styled ASS lines keep their own styling (libass draws them). Returns how many changed."""
+        from core.history import CompositeCommand
+        from core.title_templates import all_styles, apply_style
+
+        clip = self._current_clip()
+        style = all_styles().get(name)
+        track = self.project.find_clip_track(self.clip_id) if clip is not None and self.project else None
+        if clip is None or clip.media_type != MediaType.TEXT or style is None or track is None or self.history is None:
+            return 0
+        if track.locked:
+            return 0
+        commands = []
+        for other in track.sorted_clips():
+            if other.media_type != MediaType.TEXT or other.ass_event is not None:
+                continue
+            new_style = apply_style(other.text_style or TextStyle(), style, self._canvas_height())
+            if new_style != other.text_style:
+                commands.append(UpdateTextClipCommand(self.project, other.id, new_style))
+        if not commands:
+            return 0
+        self._end_gesture()
+        self.history.execute(CompositeCommand(commands, f"Apply Style to {track.name}"))
+        self.set_selected_clip(self.clip_id)
+        for command in commands:
+            self.clip_changed.emit(command.clip_id)
+        self.project_modified.emit()
+        return len(commands)
 
     def save_title_style(self, name: Optional[str] = None) -> Optional[str]:
         from core.title_templates import save_user_style, style_of
