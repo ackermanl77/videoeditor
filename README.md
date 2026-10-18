@@ -20,6 +20,9 @@ deliberately layered and documented so it is easy to read, test and extend.
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
   later same-track clips to close (or open) the gap
+- **Title styles**: a text clip's Style row applies a built-in look (Lower
+  Third, Centered Title, Caption, Chapter Heading, Corner Tag) or one you saved
+  ("Save…"), keeping its text and scaled to the project's resolution
 - **Timeline exchange (OpenTimelineIO)**: File > Export / Import Timeline
   (OTIO) writes and reads `.otio` files for Kdenlive, DaVinci Resolve and
   other OTIO tools (tracks, trims, gaps, speed/reverse, text, markers); a

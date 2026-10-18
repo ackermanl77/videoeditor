@@ -82,6 +82,9 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Title styles (2026-10-18, F23).** `core/title_templates.py`: five built-in styles and user styles in `~/.video_editor/title_styles.json`, every `TextStyle` field but the text, stored at 1080p scale (font size, outline, shadow offset and box padding scaled to the project height on apply). Properties > Text > Style: Apply (one undo step, text kept), Save…, Delete (saved styles only). Tests: `tests/test_title_templates.py`.
+- **requirements-dev.txt (2026-10-18, T5)**: runtime + pytest, so `python -m pytest -q` works in the `.venv`.
+
 - **OpenTimelineIO export/import (2026-10-18, F21).** `core/otio_io.py` writes and reads `.otio` JSON
   directly (no `opentimelineio` wheel exists for Python 3.14): Timeline/Stack/Track/Clip.2 with
   `media_references`, Gap, Marker.2 (nearest OTIO colour), LinearTimeWarp (speed, negative =

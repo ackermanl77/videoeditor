@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -486,6 +487,26 @@ class PropertiesPanel(QWidget):
         self.text_content = _PlainTextEdit()
         self.text_content.setFixedHeight(60)
         text_form.addRow("Content", self.text_content)
+
+        # Title styles (F23): built-in looks and the user's saved ones (core/title_templates.py).
+        style_row = QHBoxLayout()
+        self.title_style_combo = QComboBox()
+        self.title_style_combo.setAccessibleName("Title style")
+        style_row.addWidget(self.title_style_combo, 1)
+        self.apply_title_style_btn = QPushButton("Apply")
+        self.apply_title_style_btn.setToolTip("Give this text clip the chosen style (its text is kept).")
+        self.apply_title_style_btn.clicked.connect(lambda: self.apply_title_style(self.title_style_combo.currentText()))
+        style_row.addWidget(self.apply_title_style_btn)
+        self.save_title_style_btn = QPushButton("Save…")
+        self.save_title_style_btn.setToolTip("Save this clip's look as a style for other text clips and projects.")
+        self.save_title_style_btn.clicked.connect(lambda: self.save_title_style())
+        style_row.addWidget(self.save_title_style_btn)
+        self.delete_title_style_btn = QPushButton("Delete")
+        self.delete_title_style_btn.setToolTip("Delete the chosen saved style (built-in styles can't be deleted).")
+        self.delete_title_style_btn.clicked.connect(lambda: self.delete_title_style(self.title_style_combo.currentText()))
+        style_row.addWidget(self.delete_title_style_btn)
+        text_form.addRow("Style", style_row)
+        self.refresh_title_styles()
 
         self.font_combo = QFontComboBox()
         self.font_combo.setToolTip("Font family used in the export (resolved to the installed font file)")
@@ -1333,6 +1354,73 @@ class PropertiesPanel(QWidget):
         if color.isValid():
             setattr(self, attribute, color)
             self._apply_text_style()
+
+    # -- title styles (F23) ---------------------------------------------------------
+    def refresh_title_styles(self, select: str = "") -> None:
+        from core.title_templates import BUILTIN_STYLES, all_styles
+
+        self.title_style_combo.blockSignals(True)
+        self.title_style_combo.clear()
+        for name in all_styles():
+            self.title_style_combo.addItem(name)
+        if select:
+            self.title_style_combo.setCurrentText(select)
+        self.title_style_combo.blockSignals(False)
+        self.delete_title_style_btn.setEnabled(bool(self.title_style_combo.count()))
+        self._builtin_title_styles = set(BUILTIN_STYLES)
+
+    def _canvas_height(self) -> int:
+        return int(getattr(getattr(self.project, "settings", None), "height", 1080) or 1080)
+
+    def apply_title_style(self, name: str) -> bool:
+        """Give the selected text clip the style ``name`` (one undo step), keeping its text."""
+        from core.title_templates import all_styles, apply_style
+
+        clip = self._current_clip()
+        style = all_styles().get(name)
+        if clip is None or clip.media_type != MediaType.TEXT or style is None or self.history is None:
+            return False
+        new_style = apply_style(clip.text_style or TextStyle(), style, self._canvas_height())
+        if new_style == clip.text_style:
+            return False
+        self._end_gesture()
+        self.history.execute(UpdateTextClipCommand(self.project, self.clip_id, new_style))
+        self.set_selected_clip(self.clip_id)
+        self.clip_changed.emit(self.clip_id)
+        self.project_modified.emit()
+        return True
+
+    def save_title_style(self, name: Optional[str] = None) -> Optional[str]:
+        from core.title_templates import save_user_style, style_of
+
+        clip = self._current_clip()
+        if clip is None or clip.media_type != MediaType.TEXT or clip.text_style is None:
+            return None
+        if name is None:
+            name, ok = QInputDialog.getText(self, "Save Title Style", "Name for this style:")
+            if not ok:
+                return None
+        name = name.strip()
+        if not name:
+            return None
+        save_user_style(name, style_of(clip.text_style, self._canvas_height()))
+        self.refresh_title_styles(select=name)
+        return name
+
+    def delete_title_style(self, name: str) -> bool:
+        from core.title_templates import delete_user_style
+
+        if name in getattr(self, "_builtin_title_styles", set()) and not self._is_user_style(name):
+            return False
+        removed = delete_user_style(name)
+        self.refresh_title_styles()
+        return removed
+
+    @staticmethod
+    def _is_user_style(name: str) -> bool:
+        from core.title_templates import load_user_styles
+
+        return name in load_user_styles()
 
     def _apply_text_style(self, *_args) -> None:
         if self._loading or self.history is None or self.project is None or self.clip_id is None:
