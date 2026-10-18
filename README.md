@@ -201,11 +201,12 @@ anywhere Python does, without a display; the real-FFmpeg and offscreen Qt
 tests run too when FFmpeg and PySide6 are available, and skip otherwise:
 
 ```bash
+pip install -r requirements-dev.txt -c requirements-lock.txt   # once, in the .venv: runtime + pytest
 python -m pytest -q                       # or: python -m unittest discover -s tests -v
 ```
 
-Current result (2026-10-07, Windows, with FFmpeg in `bin/` and PySide6):
-**522 passed plus 92 subtests**, none skipped.
+Current result (2026-10-18, Windows, in `.venv` with FFmpeg in `bin/` and PySide6):
+**580 passed plus 92 subtests**, none skipped.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
 

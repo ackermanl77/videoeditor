@@ -1,0 +1,5 @@
+# Development: the runtime plus the test runner. Install into the project's .venv with
+#   pip install -r requirements-dev.txt -c requirements-lock.txt
+# so `python -m pytest -q` works there (the suite also runs under plain unittest).
+-r requirements.txt
+pytest==9.1.1
