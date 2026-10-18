@@ -10,6 +10,11 @@ Vary a video/image clip's playback speed within itself — e.g. play normally, t
 2. Set the **Speed** field (Clip Adjustments group) to the speed you want at a given moment.
 3. In the Properties panel's **Keyframes** group's Speed Ramp section, set **At** to that moment's time in seconds *from the clip's source start* (not its timeline position — see "Why source time" below), then click **+ Add**. Repeat for each speed change.
 4. With 2 or more speed keyframes, the plain **Speed** field is overridden. **- Remove Selected** deletes the highlighted row; dropping back to 0 or 1 keyframes returns to the plain constant-speed behavior.
+5. Tick **Smooth ramp** (under the keyframe table) to make the speed glide from each keyframe to the next instead of stepping (see "Smooth ramps" below). It is one undo step, and it is refused, like a speed change, if the clip would then run into the next one.
+
+## Smooth ramps (F22, 2026-10-18)
+
+With **Smooth ramp** on (`Clip.speed_ramp_smooth`), the speed changes linearly in source time from each keyframe's value to the next one's, and holds after the last keyframe. It is built from the same constant-speed segments as a stepped ramp, just many short ones: `Clip.speed_segments` splits each keyframe gap into steps of about 0.2 s of source (at most 12 per gap, because the export opens one seeked input per segment). Each step's speed is chosen so it lasts exactly as long as the true curve does over that stretch (`ln(s1/s0)/k` timeline seconds for a glide with slope `k`), so the clip's length on the timeline equals the true curve's. Everything that reads the segments follows without its own code: the timeline length and overlap checks, playhead mapping, the export's video and audio (`atempo` per step), effect masks and the preview. A left trim re-bases the keyframes with the interpolated speed at the new start, and a split adds a keyframe at the cut on both halves at the glide's speed there. The same limits as a stepped ramp apply (no Transform scale/rotation, no crossfade). The original reasoning below for building on segments still holds; smooth ramps refine it with smaller steps instead of switching to a `setpts` expression. Covered by `tests/test_smooth_speed_ramp.py`, including a real FFmpeg export whose video and audio come out at the curve's length.
 
 ## Step segments, not a smooth ramp — and why
 

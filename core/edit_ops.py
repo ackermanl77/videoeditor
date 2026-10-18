@@ -529,6 +529,7 @@ def build_detach_audio_command(project: Project, clip_id: str, has_audio: bool =
         volume=clip.volume,
         speed=clip.speed,
         speed_keyframes=list(clip.speed_keyframes),
+        speed_ramp_smooth=clip.speed_ramp_smooth,
         volume_keyframes=list(clip.volume_keyframes),
         fade_in=clip.fade_in,
         fade_out=clip.fade_out,

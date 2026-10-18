@@ -40,7 +40,8 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Clip properties**: volume, mute, playback speed, opacity, fade in/out
   (video and audio both)
 - **Speed ramps**: vary a clip's playback speed within itself (e.g.
-  normal → slow-motion → normal) via speed keyframes
+  normal → slow-motion → normal) via speed keyframes, as instant changes or
+  as a smooth glide from one keyframe to the next
 - **Reverse and freeze frame**: play a clip (picture and sound) backwards,
   and/or hold its last frame for a set time at its end
 - **Subtitles**: File > Import Subtitles (or drop a file) turns an SRT,

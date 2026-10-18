@@ -349,12 +349,17 @@ class PropertiesPanel(QWidget):
         kf_layout.addLayout(position_kf_row)
 
         kf_layout.addWidget(QLabel(
-            "Speed Ramp — 2+ keyframes override the Speed field above with step changes "
-            "(not a smooth ramp); time is seconds from the clip's SOURCE start, not its "
-            "timeline position"
+            "Speed Ramp — 2+ keyframes override the Speed field above; time is seconds from "
+            "the clip's SOURCE start, not its timeline position"
         ))
         self.speed_kf_table = self._make_keyframe_table(["Time (s)", "Speed x"])
         kf_layout.addWidget(self.speed_kf_table)
+        self.speed_smooth_checkbox = QCheckBox("Smooth ramp (glide between keyframes instead of stepping)")
+        self.speed_smooth_checkbox.setToolTip(
+            "Off: each keyframe's speed holds until the next one. On: the speed changes gradually "
+            "from one keyframe to the next.")
+        self.speed_smooth_checkbox.toggled.connect(self._commit_smooth_ramp)
+        kf_layout.addWidget(self.speed_smooth_checkbox)
 
         speed_kf_row = QHBoxLayout()
         self.speed_kf_time_spin = QDoubleSpinBox()
@@ -739,6 +744,7 @@ class PropertiesPanel(QWidget):
             self._refresh_opacity_keyframe_table(clip.opacity_keyframes)
             self._refresh_position_keyframe_table(clip.position_keyframes)
             self._refresh_speed_keyframe_table(clip.speed_keyframes)
+            self.speed_smooth_checkbox.setChecked(clip.speed_ramp_smooth)
 
             combo_idx = self.transition_combo.findData(clip.transition_out.value)
             self.transition_combo.setCurrentIndex(combo_idx if combo_idx >= 0 else 0)
@@ -840,6 +846,15 @@ class PropertiesPanel(QWidget):
             if clip is not None and abs(clip.speed - self.speed_spin.value()) > 1e-9:
                 self._loading = True
                 self.speed_spin.setValue(clip.speed)  # refused: show the real value again
+                self._loading = False
+
+    def _commit_smooth_ramp(self, checked: bool) -> None:
+        """Smooth ramp checkbox (F22): refused (and unticked) if the new length would overlap."""
+        if not self._commit_now("speed_ramp_smooth", checked, "Toggle Smooth Speed Ramp"):
+            clip = self._current_clip()
+            if clip is not None and clip.speed_ramp_smooth != checked:
+                self._loading = True
+                self.speed_smooth_checkbox.setChecked(clip.speed_ramp_smooth)
                 self._loading = False
 
     def _commit_freeze(self) -> None:

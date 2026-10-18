@@ -399,7 +399,7 @@ class PreviewPlayer(QWidget):
             return None
         return (
             clip.id, clip.media_type, clip.source_path, clip.source_in, clip.source_out,
-            clip.timeline_start, clip.speed, tuple(clip.speed_keyframes), clip.reverse, clip.freeze_frame_duration,
+            clip.timeline_start, clip.speed, tuple(clip.speed_keyframes), clip.speed_ramp_smooth, clip.reverse, clip.freeze_frame_duration,
             clip.text_style.content if clip.text_style else None, self.media_path_for(clip),
         )
 

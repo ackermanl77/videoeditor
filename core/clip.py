@@ -186,6 +186,39 @@ def _step_value(keyframes, t: float) -> Tuple[float, ...]:
     return value
 
 
+# A smooth ramp (F22) is drawn as constant-speed steps this long in source time
+# (fewer for a short interval, at most SMOOTH_RAMP_MAX_STEPS per keyframe gap,
+# since the export opens one input per step).
+SMOOTH_RAMP_STEP_SECONDS = 0.2
+SMOOTH_RAMP_MAX_STEPS = 12
+
+
+def _smooth_ramp_segments(start: float, end: float, speed_from: float,
+                          speed_to: float) -> List[Tuple[float, float, float]]:
+    """``(source_in, source_out, speed)`` steps approximating a linear glide from
+    ``speed_from`` at ``start`` to ``speed_to`` at ``end`` (source seconds).
+
+    The glide is linear in source time, so the true curve spends
+    ``ln(s1 / s0) / k`` timeline seconds on a step from speed ``s0`` to ``s1``
+    (``k`` = speed change per source second); each step's constant speed is
+    chosen to take exactly that long, which keeps the clip's duration equal to
+    the true curve's."""
+    import math
+
+    length = end - start
+    steps = max(1, min(SMOOTH_RAMP_MAX_STEPS, math.ceil(length / SMOOTH_RAMP_STEP_SECONDS - 1e-9)))
+    slope = (speed_to - speed_from) / length
+    segments = []
+    for n in range(steps):
+        a = start + length * n / steps
+        b = start + length * (n + 1) / steps if n + 1 < steps else end
+        s0 = speed_from + slope * (a - start)
+        s1 = speed_from + slope * (b - start)
+        timeline = (b - a) / s0 if abs(s1 - s0) < 1e-12 else math.log(s1 / s0) / slope
+        segments.append((a, b, (b - a) / timeline))
+    return segments
+
+
 def _non_negative(value: Any) -> float:
     """A saved float that must be >= 0 (a bad or negative value becomes 0)."""
     try:
@@ -285,6 +318,10 @@ class Clip:
     # segment each). A clip in a crossfade is rendered at constant speed.
     # See docs/workflows/speed-ramps/workflow.md.
     speed_keyframes: List[Tuple[float, float]] = field(default_factory=list)  # (source_time, speed)
+    # Smooth speed ramp (F22): the speed glides linearly from each keyframe to the
+    # next instead of stepping -- rendered as many short constant-speed segments
+    # (see Clip.speed_segments), so every consumer of the segments follows.
+    speed_ramp_smooth: bool = False
 
     # Reframe (video/image clips only) — how this clip fits a canvas whose
     # aspect ratio differs from its own, e.g. cropping 16:9 source to fill a
@@ -408,7 +445,11 @@ class Clip:
             segments.append((self.source_in, boundaries[0], speeds[0]))
         for i, start in enumerate(boundaries):
             end = boundaries[i + 1] if i + 1 < len(boundaries) else self.source_out
-            if end - start > 1e-6:
+            if end - start <= 1e-6:
+                continue
+            if self.speed_ramp_smooth and i + 1 < len(boundaries) and abs(speeds[i + 1] - speeds[i]) > 1e-9:
+                segments.extend(_smooth_ramp_segments(start, end, speeds[i], speeds[i + 1]))
+            else:
                 segments.append((start, end, speeds[i]))
         return segments or [(self.source_in, self.source_out, 1.0)]
 
@@ -594,7 +635,8 @@ class Clip:
         probe.source_in, probe.source_out = source_in, source_out
         source_shift = source_in - self.source_in
         if abs(source_shift) > 1e-9:
-            probe.speed_keyframes = _rebase_keyframes(self.speed_keyframes, source_shift, step=True)
+            probe.speed_keyframes = _rebase_keyframes(self.speed_keyframes, source_shift,
+                                                      step=not self.speed_ramp_smooth)
         # Timeline keyframes follow whatever end the clip *starts playing*
         # from: source_in normally, source_out on a reversed clip.
         if self.reverse:
@@ -697,6 +739,7 @@ class Clip:
             "opacity_keyframes": [list(kf) for kf in self.opacity_keyframes],
             "position_keyframes": [list(kf) for kf in self.position_keyframes],
             "speed_keyframes": [list(kf) for kf in self.speed_keyframes],
+            "speed_ramp_smooth": self.speed_ramp_smooth,
             "reframe_mode": self.reframe_mode.value,
             "crop_focus_x": self.crop_focus_x,
             "crop_focus_y": self.crop_focus_y,
@@ -760,6 +803,7 @@ class Clip:
             opacity_keyframes=[tuple(kf) for kf in data.get("opacity_keyframes", [])],
             position_keyframes=[tuple(kf) for kf in data.get("position_keyframes", [])],
             speed_keyframes=[tuple(kf) for kf in data.get("speed_keyframes", [])],
+            speed_ramp_smooth=bool(data.get("speed_ramp_smooth", False)),
             reframe_mode=enum(ReframeMode, "reframe_mode", ReframeMode.FIT),
             crop_focus_x=data.get("crop_focus_x", 0.5),
             crop_focus_y=data.get("crop_focus_y", 0.5),

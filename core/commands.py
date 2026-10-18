@@ -204,8 +204,8 @@ class SplitClipCommand(Command):
             e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline))
             for e in clip.effects
         ]
-        keys_before = _speed_keyframes_before(clip.speed_keyframes, offset_in_source)
-        keys_after = _speed_keyframes_after(clip.speed_keyframes, offset_in_source)
+        keys_before = _speed_keyframes_before(clip.speed_keyframes, offset_in_source, clip.speed_ramp_smooth)
+        keys_after = _speed_keyframes_after(clip.speed_keyframes, offset_in_source, clip.speed_ramp_smooth)
         cut = clip.source_in + offset_in_source
         if clip.reverse:
             second.source_out = cut
@@ -281,9 +281,13 @@ def _keyframes_after(keyframes, cut: float, tail: float):
     return [(0.0, *value)] + kept
 
 
-def _speed_at(keyframes, source_t: float) -> float:
-    """Step-function speed in effect at ``source_t`` (see ``Clip.speed_segments``)."""
+def _speed_at(keyframes, source_t: float, smooth: bool = False) -> float:
+    """Speed in effect at ``source_t`` (see ``Clip.speed_segments``): the step value,
+    or for a smooth ramp (F22) the linear glide between the keyframes around it."""
     kfs = sorted(keyframes, key=lambda k: k[0])
+    if smooth:
+        speed = interpolate_keyframes(kfs, source_t)[0]
+        return speed if speed > 0 else 1.0
     speed = kfs[0][1]
     for t, s in kfs:
         if t <= source_t + _KF_EPS:
@@ -291,20 +295,23 @@ def _speed_at(keyframes, source_t: float) -> float:
     return speed if speed > 0 else 1.0
 
 
-def _speed_keyframes_before(keyframes, cut: float):
-    """First half's speed keyframes (``None`` = not speed-ramped, leave as is)."""
+def _speed_keyframes_before(keyframes, cut: float, smooth: bool = False):
+    """First half's speed keyframes (``None`` = not speed-ramped, leave as is). A smooth
+    ramp also gets a keyframe at the cut, so the glide ends where the second half starts."""
     if len(keyframes) < 2:
         return None
     kept = [tuple(k) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] < cut - _KF_EPS]
-    return kept or [(0.0, _speed_at(keyframes, 0.0))]
+    if smooth and kept:
+        kept.append((cut, _speed_at(keyframes, cut, True)))
+    return kept or [(0.0, _speed_at(keyframes, 0.0, smooth))]
 
 
-def _speed_keyframes_after(keyframes, cut: float):
+def _speed_keyframes_after(keyframes, cut: float, smooth: bool = False):
     """Second half's speed keyframes, re-based so ``cut`` becomes 0 (``None`` = not ramped)."""
     if len(keyframes) < 2:
         return None
     kept = [(k[0] - cut, k[1]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > cut + _KF_EPS]
-    return [(0.0, _speed_at(keyframes, cut))] + kept
+    return [(0.0, _speed_at(keyframes, cut, smooth))] + kept
 
 
 def _apply_speed_keyframes(clip: Clip, keyframes) -> None:
@@ -643,7 +650,8 @@ class RecolorMarkerCommand(Command):
 
 # Clip attributes whose change alters Clip.duration (and so can push a clip
 # into the next one on its track).
-DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "source_in", "source_out", "freeze_frame_duration"})
+DURATION_ATTRIBUTES = frozenset({"speed", "speed_keyframes", "speed_ramp_smooth", "source_in", "source_out",
+                                 "freeze_frame_duration"})
 
 
 def property_change_overlaps(project: Project, clip_id: str, attribute: str, new_value: Any) -> bool:
