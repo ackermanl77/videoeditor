@@ -20,6 +20,9 @@ deliberately layered and documented so it is easy to read, test and extend.
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
   later same-track clips to close (or open) the gap
+- **Scene-cut detection**: Edit > Detect Scene Cuts finds the shot changes
+  in the selected clip (FFmpeg `scdet`) and splits the clip there or adds a
+  marker at each one -- a single undo step
 - **Markers/chapters**: bookmark points on the timeline, click to seek,
   snap clips to them, and have them embedded as real player-navigable
   chapters on export

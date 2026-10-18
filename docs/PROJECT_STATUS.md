@@ -82,6 +82,15 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Scene-cut detection (2026-10-18, F19).** `core/scene_detect.py`: `detect_scene_cuts()` runs
+  FFmpeg's `scdet` (threshold 10) on a 320 px decode of the clip's own trimmed source range,
+  cancellable, dropping cuts under 0.5 s apart or from the ends; `timeline_offset_for_source()`
+  bisects `Clip.source_time_at`, so speed, reverse and freeze frames map exactly;
+  `build_scene_cut_command()` splits the clip at each cut (latest first, the original id stays on
+  the first part) or adds "Cut N" markers, as one CompositeCommand. Edit > Detect Scene Cuts runs it
+  on a background thread with a progress dialog. Tests: `tests/integration/test_scene_detect.py`
+  (real FFmpeg, three 2 s shots: cuts at exactly 2.0/4.0 s; the window flow end to end).
+
 - **Eighth round (2026-10-11): live loudness meter, background preview renders, per-source GPU decoding.**
   - **Live loudness (F15's last piece)**: next to the level meters the preview shows the EBU R128 momentary (0.4 s), short-term (3 s) and integrated loudness (since Play, R128-gated) of the clip under the playhead with its volume or volume envelope. Each source is measured once in the background by FFmpeg's own `ebur128` filter (`core/loudness.py`, cached in `~/.video_editor/loudness/` like the waveforms); the integrated value recomputed from its momentary blocks matches FFmpeg's summary within 0.2 LU in the tests. Like the peak meter it reads the active clip, not the mix (the Export dialog measures the mix).
   - **Background preview renders (F10c)**: Playback > Render Preview (In/Out) (`Ctrl+Return`; the whole timeline without In/Out) renders the range with the export engine at 540 lines (NVENC when available) from a snapshot of the project, on a background thread with progress in the status bar. The preview then plays that file over the range (picture and mix, as exported) through a stand-in clip, so seeking, cuts and polling are the normal paths. Files are named by a hash of everything that decides the range (frame size/fps/sample rate, every clip within 5 s of it with all its properties, its track's flags, subtitle styles, source sizes and mtimes; `core/preview_render.py`): an edit there turns the ruler's bar from green to red and the preview goes back to the live view; undoing finds the old render again; edits elsewhere leave it valid. The 24 most recently used renders are kept in `~/.video_editor/preview_renders/`.

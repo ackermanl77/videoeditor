@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Roll Edit to Playhead", self.timeline.roll_selected_to_playhead, "Ctrl+R")
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
+        self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
         self._add_action(edit_menu, "Ripple Move Clip...", self.timeline.ripple_move_selected)
         self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
         self.razor_action.setCheckable(True)
@@ -1396,6 +1397,67 @@ class MainWindow(QMainWindow):
         self._export_dialogs.append(dialog)
         dialog.destroyed.connect(lambda _obj=None, d=dialog: self._forget_export_dialog(d))
         dialog.show()
+
+    # -- scene-cut detection (F19) ---------------------------------------------------
+    def detect_scene_cuts(self, choice: Optional[str] = None) -> bool:
+        """Find the shot changes in the selected video clip (FFmpeg scdet, on a background thread
+        with a cancellable progress dialog), then split the clip there or mark them -- one undo
+        step. ``choice`` ("split"/"markers") skips the question (tests)."""
+        from PySide6.QtWidgets import QProgressDialog
+
+        from core.clip import MediaType
+        from core.scene_detect import SceneDetectionCancelled, build_scene_cut_command, detect_scene_cuts
+
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        if clip is None or clip.media_type != MediaType.VIDEO:
+            QMessageBox.information(self, "Detect Scene Cuts", "Select a video clip on the timeline first.")
+            return False
+        progress = QProgressDialog("Looking for scene cuts…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Detect Scene Cuts")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    result["cuts"] = detect_scene_cuts(clip.source_path, clip.source_in, clip.source_out,
+                                                       should_cancel=progress.wasCanceled)
+                except SceneDetectionCancelled:
+                    result["cancelled"] = True
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if result.get("cancelled"):
+            return False
+        if "error" in result:
+            QMessageBox.warning(self, "Detect Scene Cuts", f"The clip couldn't be analysed:\n{result['error']}")
+            return False
+        cuts = result.get("cuts", [])
+        if not cuts or build_scene_cut_command(self.project, clip.id, cuts, "markers") is None:
+            QMessageBox.information(self, "Detect Scene Cuts", "No scene cuts found in this clip.")
+            return False
+        if choice is None:
+            box = QMessageBox(self)
+            box.setWindowTitle("Detect Scene Cuts")
+            box.setText(f"Found {len(cuts)} scene cut{'s' if len(cuts) != 1 else ''} in this clip.")
+            split = box.addButton("Split the Clip", QMessageBox.ButtonRole.AcceptRole)
+            markers = box.addButton("Add Markers", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            choice = "split" if clicked is split else "markers" if clicked is markers else None
+        if choice is None:
+            return False
+        ok = self.timeline._execute_and_select(build_scene_cut_command(self.project, clip.id, cuts, choice), False)
+        self.statusBar().showMessage(
+            f"Split the clip at {len(cuts)} scene cuts." if choice == "split" else f"Added {len(cuts)} scene-cut markers.", 5000)
+        return ok
 
     def export_frame_dialog(self, path: str | None = None) -> str | None:
         """Save the frame under the playhead -- composited as the export renders it, at the
