@@ -149,6 +149,38 @@ class ReverseExportTests(unittest.TestCase):
 
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/FFprobe not found")
+class AudioTrackSpeedRampTests(unittest.TestCase):
+    """A speed ramp on an audio-track clip used to export at constant speed: the
+    whole source played at clip.speed and overran the clip's ramped length."""
+
+    def _project(self):
+        black, ramp = _asset("black", 20.0), _asset("ramp", 2.0)
+        project = _project(black, _clip(black, src_out=3.0))
+        project.add_media_asset(ramp)
+        # Silence for source 0..1 s at 1x, then the tone (source 1..2 s) at 2x: 1.5 s.
+        clip = Clip(media_type=MediaType.AUDIO, source_path=ramp.path, source_in=0.0, source_out=2.0,
+                    timeline_start=0.0, source_duration=2.0, asset_id=ramp.id,
+                    speed_keyframes=[(0.0, 1.0), (1.0, 2.0)])
+        audio = next((t for t in project.tracks if t.track_type == TrackType.AUDIO), None) \
+            or project.add_track(TrackType.AUDIO)
+        audio.clips.append(clip)
+        self.assertAlmostEqual(clip.duration, 1.5, places=3)
+        return project
+
+    def test_the_ramp_is_rendered_and_ends_with_the_clip(self):
+        out = _export(self._project(), "audio_ramp.mp4")
+        self.assertLess(_max_volume_db(out, 0.1, 0.8), -50)  # 1x silence
+        self.assertGreater(_max_volume_db(out, 1.05, 0.4), -20)  # the tone, at 2x: 1.0-1.5 s
+        self.assertLess(_max_volume_db(out, 1.6, 1.2), -50)  # over at the clip's end, not at 2.0 s
+
+    def test_a_trimmed_export_window_inside_the_ramp_keeps_its_timing(self):
+        out = _export(self._project(), "audio_ramp_window.mp4", trim_start=0.5, trim_end=2.5)
+        self.assertAlmostEqual(_duration(out), 2.0, delta=0.1)
+        self.assertGreater(_max_volume_db(out, 0.55, 0.4), -20)  # timeline 1.0-1.5 s
+        self.assertLess(_max_volume_db(out, 1.1, 0.8), -50)
+
+
+@unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/FFprobe not found")
 class FreezeFrameExportTests(unittest.TestCase):
     def test_freeze_holds_the_last_frame_in_silence(self):
         asset = _asset("ramp", 2.0)

@@ -1449,6 +1449,19 @@ def build_filter_graph(
                 audio_labels_by_track.setdefault(track.id, []).append(label)
                 clip_counter += 1
                 continue
+            if len(clip.speed_keyframes) >= 2:
+                # Speed ramp: one atempo'd segment per speed segment, as for a
+                # video clip's own audio (without crossfade, like the video
+                # path). A single constant-speed chain would play the whole
+                # source at clip.speed and overrun the clip's ramped length.
+                _before = len(audio_labels)
+                _maybe_add_speed_ramped_audio(
+                    project, clip, _register_speed_ramp_inputs(clip, input_specs), clip_counter,
+                    filter_lines, audio_labels, probe_cache, window, sample_rate,
+                )
+                audio_labels_by_track.setdefault(track.id, []).extend(audio_labels[_before:])
+                clip_counter += 1
+                continue
             slice_head, source_in, source_length = _clip_source_slice(clip, window, fps)
             exact = _slice_is_exact(clip, window, slice_head)
             idx = len(input_specs)

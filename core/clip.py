@@ -280,11 +280,10 @@ class Clip:
     # keyframe (source_time, speed) sets the speed from that point in the
     # SOURCE (source_in-relative) forward, until the next keyframe — a step
     # change at each boundary. Affects Clip.duration (below) regardless of
-    # media type, but core/filter_graph.py only implements the actual
-    # segmented render for video/image clips — a standalone AUDIO-track
-    # clip's speed_keyframes are (for now) read for timing purposes only
-    # and don't yet get a segmented render of their own. See
-    # docs/workflows/speed-ramps/workflow.md for both of these scope calls.
+    # media type, and core/filter_graph.py renders the segments for video/
+    # image clips and for standalone AUDIO-track clips alike (one atempo'd
+    # segment each). A clip in a crossfade is rendered at constant speed.
+    # See docs/workflows/speed-ramps/workflow.md.
     speed_keyframes: List[Tuple[float, float]] = field(default_factory=list)  # (source_time, speed)
 
     # Reframe (video/image clips only) — how this clip fits a canvas whose

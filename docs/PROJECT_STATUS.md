@@ -157,6 +157,7 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Fixed
 
+- **Speed ramps on audio-track clips were ignored on export** (2026-10-17, B11). `Clip.duration` honoured the ramp, but `core/filter_graph.py` gave a standalone audio clip one constant `atempo` from `clip.speed`: a 4 s clip ramped 1x -> 2x filled 3.0 s on the timeline and exported 4.0 s at 1x, running into the next clip. It now gets the same per-segment chain as a video clip's own audio (`AudioTrackSpeedRampTests`, real FFmpeg).
 - **Found while finishing the fourth round** (each with a regression test in the `p4` files):
   - Splitting a clip with a freeze frame left the freeze on *both* halves, so the first half overlapped the second; a freeze could be lengthened into the next clip (it wasn't a duration attribute for the overlap check); trimming the right edge of a frozen clip couldn't shorten the freeze (the trim mapping clamped at the footage end).
   - Splitting or trimming a reversed clip cut the wrong end of the source (the forward mapping was used); a trimmed export or preview frame of a reversed clip seeked the forward range; a preview frame inside a freeze seeked past the footage and produced no frame.
