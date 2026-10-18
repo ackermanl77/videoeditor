@@ -490,6 +490,21 @@ with their ASS styling keep it). **Delete** removes a saved style.
 rather than composited over your video; pause with **Accurate frame** ticked
 to see it exactly as exported.*
 
+### Automatic captions
+
+**Edit > Generate Captions...** turns the speech in the selected video or
+audio clip into caption clips on a "Subtitles" track, timed to the words
+and at most two lines each. Choose a speech model (bigger is more accurate
+but slower; each is downloaded once, the first time it is used) and the
+language, or let it detect the language. The captions are ordinary caption
+clips: correct the text, restyle them all with **Apply to Track**, and
+export them burned in or as a subtitle track.
+
+This uses the free **faster-whisper** speech recogniser, which isn't
+installed with the editor. When running the editor from source, add it with
+`pip install faster-whisper`; the command tells you if it is missing. A
+graphics card (CUDA) is used when available.
+
 ### Subtitles (SRT / WebVTT / ASS)
 
 **File > Import Subtitles...** (or drop an `.srt`/`.vtt`/`.ass`/`.ssa` file on the window

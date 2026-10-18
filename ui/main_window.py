@@ -328,6 +328,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
         self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
         self._add_action(edit_menu, "Track Motion...", self.track_motion)
+        self._add_action(edit_menu, "Generate Captions...", self.generate_captions)
         self._add_action(edit_menu, "Ripple Move Clip...", self.timeline.ripple_move_selected)
         self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
         self.razor_action.setCheckable(True)
@@ -718,6 +719,12 @@ class MainWindow(QMainWindow):
         if not clips:
             self.status_bar.showMessage("No subtitle cues were found in that file.", 4000)
             return 0
+        self._add_caption_clips(clips, "Import Subtitles")
+        self.status_bar.showMessage(f"Imported {len(clips)} subtitle cue(s).", 4000)
+        return len(clips)
+
+    def _add_caption_clips(self, clips, label: str) -> None:
+        """Put caption text clips on a "Subtitles" track that has room (adding one if needed), as one undo step."""
         track = self._subtitle_track_for(clips)
         commands = []
         if track is None:
@@ -730,10 +737,94 @@ class MainWindow(QMainWindow):
         else:
             track_id = track.id
         commands.extend(AddClipCommand(self.project, track_id, clip) for clip in clips)
-        self.history.execute(CompositeCommand(commands, "Import Subtitles"))
+        self.history.execute(CompositeCommand(commands, label))
         self.timeline.rebuild()
         self._on_project_modified()
-        self.status_bar.showMessage(f"Imported {len(clips)} subtitle cue(s).", 4000)
+
+    def generate_captions(self, model_size: Optional[str] = None, language: Optional[str] = "",
+                          words_from=None) -> int:
+        """Edit > Generate Captions (F17): transcribe the selected clip's speech with faster-whisper
+        on a background thread and add the cues as caption clips (one undo step). ``model_size`` /
+        ``language`` skip the dialog and ``words_from`` replaces the model (tests)."""
+        from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QProgressDialog
+
+        from core.transcribe import (
+            DEFAULT_MODEL,
+            INSTALL_HINT,
+            LANGUAGES,
+            MODEL_DOWNLOAD,
+            MODEL_SIZES,
+            TranscriptionCancelled,
+            transcribable_problem,
+            transcribe_clip,
+            whisper_available,
+        )
+
+        title = "Generate Captions"
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        problem = transcribable_problem(clip)
+        if problem:
+            QMessageBox.information(self, title, problem)
+            return 0
+        if words_from is None and not whisper_available():
+            QMessageBox.information(self, title, INSTALL_HINT)
+            return 0
+        if model_size is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            form = QFormLayout(dialog)
+            model_combo = QComboBox()
+            for size in MODEL_SIZES:
+                model_combo.addItem(f"{size} (downloads {MODEL_DOWNLOAD[size]} the first time)", size)
+            model_combo.setCurrentIndex(MODEL_SIZES.index(DEFAULT_MODEL))
+            form.addRow("Speech model", model_combo)
+            language_combo = QComboBox()
+            for name, code in LANGUAGES:
+                language_combo.addItem(name, code)
+            form.addRow("Language", language_combo)
+            note = QLabel("Bigger models are more accurate and slower. A graphics card (CUDA) is used "
+                          "when available.")
+            note.setWordWrap(True)
+            form.addRow(note)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            form.addRow(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return 0
+            model_size, language = model_combo.currentData(), language_combo.currentData()
+        progress = QProgressDialog("Transcribing the clip's speech…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    result["cues"] = transcribe_clip(clip, model_size, language or None,
+                                                     should_cancel=progress.wasCanceled, words_from=words_from)
+                except TranscriptionCancelled:
+                    result["cancelled"] = True
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if result.get("cancelled"):
+            return 0
+        if "error" in result:
+            QMessageBox.warning(self, title, f"The clip couldn't be transcribed:\n{result['error']}")
+            return 0
+        clips = cues_to_text_clips(result.get("cues", []), name_prefix="Caption")
+        if not clips:
+            QMessageBox.information(self, title, "No speech was recognised in this clip.")
+            return 0
+        self._add_caption_clips(clips, "Generate Captions")
+        self.status_bar.showMessage(f"Added {len(clips)} caption(s).", 5000)
         return len(clips)
 
     def _ask_keep_subtitle_styling(self) -> Optional[bool]:

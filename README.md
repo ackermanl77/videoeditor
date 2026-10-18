@@ -39,6 +39,9 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Compound clips**: Timeline > Nest Selected Clips turns a selection
   (on any tracks) into one clip, rendered in the background and editable
   again with Expand Compound Clip
+- **Automatic captions**: Edit > Generate Captions transcribes a clip's
+  speech into timed caption clips with the optional `faster-whisper`
+  (`pip install faster-whisper`; the model downloads on first use)
 - **Markers panel**: every marker in a list with its colour, timecode, name
   and a note; edit in place, double-click to jump there
 - **Markers/chapters**: bookmark points on the timeline, click to seek,
@@ -218,7 +221,7 @@ python -m pytest -q                       # or: python -m unittest discover -s t
 ```
 
 Current result (2026-10-18, Windows, in `.venv` with FFmpeg in `bin/` and PySide6):
-**607 passed plus 92 subtests**, none skipped.
+**611 passed plus 92 subtests**, none skipped.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
 

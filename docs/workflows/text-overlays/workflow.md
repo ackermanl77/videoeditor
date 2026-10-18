@@ -26,6 +26,22 @@ Text content is escaped for safe use inside the `drawtext` filter string (`core/
 
 `tests/test_filter_graph.py::FilterGraphTests::test_text_clip_generates_drawtext` confirms a text clip produces a `drawtext` filter containing its content; `TextEscapingTests::test_escapes_special_characters` confirms the escaping above. Verify visually by exporting a short project with an overlapping text + video clip and confirming the text appears in the rendered file at the right time and position — the preview intentionally won't show this composite (see [preview-playback/workflow.md](../preview-playback/workflow.md)).
 
+## Automatic captions (F17, 2026-10-18)
+
+**Edit > Generate Captions...** (`MainWindow.generate_captions()`, `core/transcribe.py`) works on the selected video or audio clip (not a reversed one):
+
+1. FFmpeg extracts the clip's trimmed audio as 16 kHz mono WAV.
+2. The optional `faster-whisper` package transcribes it with `WhisperModel(size, device="auto", compute_type="auto")` (falling back to CPU int8), word timestamps and VAD filtering, on a background thread with a cancellable progress dialog.
+3. `group_words()` groups the words into cues: a new cue when the text would pass two lines of 42 characters, the cue would pass 6 s, or there is a pause of 0.8 s or more. Each cue is wrapped onto two lines at the space nearest the middle.
+4. The cue times are mapped through the clip's trim, speed and speed ramp (`timeline_offset_for_source()`).
+5. The cues become ordinary caption clips (`cues_to_text_clips()`) on a Subtitles track with room, the same path as Import Subtitles, as one undo step.
+
+Model sizes: tiny/base/small (default)/medium/large-v3. faster-whisper downloads the chosen one into the Hugging Face cache on first use (75 MB to 3 GB).
+
+Without faster-whisper, the command shows how to install it. It is not in `requirements.txt` and not in the packaged exe.
+
+Tests (`tests/integration/test_captions.py`) replace the model with a stand-in that checks the WAV it is given (mono, 16 kHz, only the trimmed range) and returns fixed words. They cover the grouping, the timing through trim and 2x speed, the menu flow with undo, and the missing-package message. A transcription with a real model hasn't been run here; it needs the model download.
+
 ## Subtitle import (round 4)
 
 - **What it does.** `core/subtitles.py` parses SRT and WebVTT (BOM/CRLF, `WEBVTT - title` headers and metadata, NOTE/STYLE/REGION blocks, text cue identifiers, cue settings, `MM:SS.mmm` without hours, markup and ASS override tags stripped, HTML entities decoded; UTF-8, UTF-16 with BOM, else Windows-1252) and `cues_to_text_clips()` makes one TEXT clip per cue (centred, `position_y=0.86`, translucent box). Overlapping cues are shortened to end where the next starts; cues with the same start are merged into one two-line caption. A stray block without a time range (a blank line inside a cue) is skipped; a file with no cue at all raises `SubtitleParseError`.

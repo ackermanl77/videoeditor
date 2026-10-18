@@ -116,6 +116,16 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
   on a background thread with a progress dialog. Tests: `tests/integration/test_scene_detect.py`
   (real FFmpeg, three 2 s shots: cuts at exactly 2.0/4.0 s; the window flow end to end).
 
+- **Automatic captions (2026-10-18, F17, partial).** Edit > Generate Captions: FFmpeg extracts the
+  selected clip's trimmed audio (16 kHz mono), the optional `faster-whisper` transcribes it (model
+  tiny..large-v3, language or auto, GPU when available, word timestamps + VAD; background thread,
+  cancellable), `core/transcribe.py::group_words()` makes two-line, <= 6 s cues split at pauses,
+  mapped through trim/speed/ramps onto the timeline and added as caption clips through the Import
+  Subtitles path (`_add_caption_clips()`), one undo step. Not a requirement: without the package the
+  command explains `pip install faster-whisper`; the packaged exe doesn't include it. Tests use a
+  stand-in model (`tests/integration/test_captions.py`); **a real model run is still to be done**
+  (it needs the model download).
+
 - **Markers panel and restyling captions (2026-10-18, F15's last pieces).** A Markers dock
   (Timeline > Markers Panel, Ctrl+Alt+M; `ui/markers_panel.py`) lists the markers with colour,
   timecode, name and a new free-text `Marker.note` (saved only when set), edited in place with undo
