@@ -14,6 +14,7 @@ These guides document current application behavior, the code paths behind each f
 - [Clip properties](clip-properties/workflow.md)
 - [Transform, keyframes, color correction, chroma key, and transitions](color-and-effects/workflow.md)
 - [Speed ramps](speed-ramps/workflow.md)
+- [Motion tracking](motion-tracking/workflow.md)
 
 ## Preview
 

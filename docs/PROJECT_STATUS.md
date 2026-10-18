@@ -116,6 +116,18 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
   on a background thread with a progress dialog. Tests: `tests/integration/test_scene_detect.py`
   (real FFmpeg, three 2 s shots: cuts at exactly 2.0/4.0 s; the window flow end to end).
 
+- **Motion tracking (2026-10-18, F18).** `core/motion_track.py`: the user boxes the object on the
+  frame under the playhead (`ui/motion_track_dialog.py`); FFmpeg's `find_rect` searches each frame
+  of a 480 px, 15 fps decode of the tracked clip's source range for that template (score above 0.3 =
+  lost, skipped). The matches go through the tracked clip's fit and Transform position/scale onto the
+  canvas, through `timeline_offset_for_source()` (speed, ramps, reverse, freeze) onto the follower's
+  clip-local time, are thinned (straight stretches -> their ends) and become the selected clip's
+  position keyframes as one undo step (Edit > Track Motion..., background thread, cancellable). No new
+  dependency. Limits: position only; the template doesn't adapt to turning/scaling; tracked clip not
+  in Fill Frame or rotated; followers are video/image clips. Tests:
+  `tests/integration/test_motion_track.py` (real FFmpeg: a moving square tracked within 4 px; the
+  menu flow within 5 px). See [motion-tracking/workflow.md](workflows/motion-tracking/workflow.md).
+
 - **Eighth round (2026-10-11): live loudness meter, background preview renders, per-source GPU decoding.**
   - **Live loudness (F15's last piece)**: next to the level meters the preview shows the EBU R128 momentary (0.4 s), short-term (3 s) and integrated loudness (since Play, R128-gated) of the clip under the playhead with its volume or volume envelope. Each source is measured once in the background by FFmpeg's own `ebur128` filter (`core/loudness.py`, cached in `~/.video_editor/loudness/` like the waveforms); the integrated value recomputed from its momentary blocks matches FFmpeg's summary within 0.2 LU in the tests. Like the peak meter it reads the active clip, not the mix (the Export dialog measures the mix).
   - **Background preview renders (F10c)**: Playback > Render Preview (In/Out) (`Ctrl+Return`; the whole timeline without In/Out) renders the range with the export engine at 540 lines (NVENC when available) from a snapshot of the project, on a background thread with progress in the status bar. The preview then plays that file over the range (picture and mix, as exported) through a stand-in clip, so seeking, cuts and polling are the normal paths. Files are named by a hash of everything that decides the range (frame size/fps/sample rate, every clip within 5 s of it with all its properties, its track's flags, subtitle styles, source sizes and mtimes; `core/preview_render.py`): an edit there turns the ruler's bar from green to red and the preview goes back to the live view; undoing finds the old render again; edits elsewhere leave it valid. The 24 most recently used renders are kept in `~/.video_editor/preview_renders/`.

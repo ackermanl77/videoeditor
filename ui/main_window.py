@@ -38,6 +38,7 @@ from core.ffmpeg_utils import (
     binary_version,
     decode_hwaccel_modes,
     encoder_supports_10bit,
+    find_binary,
     nvenc_available,
     set_decode_hwaccel,
 )
@@ -312,6 +313,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
         self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
+        self._add_action(edit_menu, "Track Motion...", self.track_motion)
         self._add_action(edit_menu, "Ripple Move Clip...", self.timeline.ripple_move_selected)
         self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
         self.razor_action.setCheckable(True)
@@ -1505,6 +1507,122 @@ class MainWindow(QMainWindow):
         ok = self.timeline._execute_and_select(build_scene_cut_command(self.project, clip.id, cuts, choice), False)
         self.statusBar().showMessage(
             f"Split the clip at {len(cuts)} scene cuts." if choice == "split" else f"Added {len(cuts)} scene-cut markers.", 5000)
+        return ok
+
+    # -- motion tracking (F18) -------------------------------------------------------
+    def _motion_track_target(self, follower: Clip) -> Optional[Clip]:
+        """The video clip under the playhead on the nearest video track below ``follower``'s."""
+        video_tracks = [t for t in self.project.tracks if t.track_type == TrackType.VIDEO]
+        follower_track = self.project.find_clip_track(follower.id)
+        if follower_track not in video_tracks:
+            return None
+        playhead = self.timeline.playhead_time
+        for track in reversed(video_tracks[:video_tracks.index(follower_track)]):
+            clip = track.clip_at(playhead)
+            if clip is not None and clip.media_type == MediaType.VIDEO:
+                return clip
+        return None
+
+    def track_motion(self, box: Optional[Tuple[float, float, float, float]] = None, keep_offset: bool = True) -> bool:
+        """Make the selected video/image clip follow an object in the video clip beneath it (F18):
+        the user draws a box on the frame under the playhead, FFmpeg's find_rect tracks it on a
+        background thread, and the result becomes the clip's position keyframes -- one undo step.
+        ``box`` (fractions of the frame) skips the dialog (tests)."""
+        from PySide6.QtWidgets import QProgressDialog
+
+        from core.motion_track import (
+            TRACK_WIDTH,
+            TrackingCancelled,
+            follow_keyframes,
+            trackable_problem,
+            track_object,
+        )
+
+        title = "Track Motion"
+        follower = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        if follower is None or follower.media_type not in (MediaType.VIDEO, MediaType.IMAGE):
+            QMessageBox.information(self, title, "Select the video or image clip that should follow the object "
+                                                 "(on a track above the clip to track), then put the playhead "
+                                                 "on a frame showing the object.")
+            return False
+        tracked = self._motion_track_target(follower)
+        if tracked is None:
+            QMessageBox.information(self, title, "There's no video clip under the playhead on a track below the "
+                                                 "selected clip.")
+            return False
+        problem = trackable_problem(tracked)
+        if problem:
+            QMessageBox.information(self, title, f"That clip can't be tracked: {problem}.")
+            return False
+        asset = self.project.asset_for_clip(tracked)
+        if asset is None or not asset.width or not asset.height:
+            QMessageBox.information(self, title, "The tracked clip's video size is unknown (is its file offline?).")
+            return False
+        local = min(max(0.0, self.timeline.playhead_time - tracked.timeline_start), tracked.playable_duration)
+        frame_time = tracked.source_time_at(local)
+        if box is None:
+            import subprocess
+            import tempfile
+
+            from ui.motion_track_dialog import MotionTrackDialog
+
+            handle, png = tempfile.mkstemp(prefix="ve_track_frame_", suffix=".png")
+            os.close(handle)
+            try:
+                subprocess.run([find_binary("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-ss",
+                                f"{frame_time:.3f}", "-i", tracked.source_path, "-frames:v", "1",
+                                "-vf", f"scale={TRACK_WIDTH}:-2", png],
+                               capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                image = QImage(png)
+            finally:
+                try:
+                    os.remove(png)
+                except OSError:
+                    pass
+            if image.isNull():
+                QMessageBox.warning(self, title, "The frame under the playhead couldn't be read.")
+                return False
+            dialog = MotionTrackDialog(image, tracked.name, follower.name, self)
+            if dialog.exec() != dialog.DialogCode.Accepted or dialog.picker.box() is None:
+                return False
+            box, keep_offset = dialog.picker.box(), dialog.keep_offset.isChecked()
+        progress = QProgressDialog("Tracking the object…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+        source_size = (asset.width, asset.height)
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    result["points"] = track_object(tracked.source_path, tracked.source_in, tracked.source_out,
+                                                    frame_time, box, source_size, should_cancel=progress.wasCanceled)
+                except TrackingCancelled:
+                    result["cancelled"] = True
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if result.get("cancelled"):
+            return False
+        if "error" in result:
+            QMessageBox.warning(self, title, f"The object couldn't be tracked:\n{result['error']}")
+            return False
+        canvas = (self.project.settings.width, self.project.settings.height)
+        keyframes = follow_keyframes(result.get("points", []), tracked, follower, source_size, canvas, keep_offset)
+        if len(keyframes) < 2:
+            QMessageBox.information(self, title, "The object wasn't found in enough frames while the selected "
+                                                 "clip is on screen. Try a box with more detail.")
+            return False
+        command = UpdateClipPropertyCommand(self.project, follower.id, "position_keyframes", keyframes, "Track Motion")
+        ok = self.timeline._execute_and_select(command, False)
+        self.properties.set_selected_clip(follower.id)
+        self.statusBar().showMessage(f"Tracked the object: {len(keyframes)} position keyframes.", 5000)
         return ok
 
     def export_frame_dialog(self, path: str | None = None) -> str | None:
