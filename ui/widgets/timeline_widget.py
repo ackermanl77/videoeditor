@@ -51,6 +51,10 @@ from core.commands import (
     build_ripple_trim_command,
 )
 from core.edit_ops import (
+    build_add_edit_all_tracks,
+    build_extend_edit_command,
+    build_extract_command,
+    build_lift_command,
     build_delete_clips_command,
     build_detach_audio_command,
     build_duplicate_command,
@@ -1338,8 +1342,66 @@ class TimelineWidget(QWidget):
     def _clip_for_asset(self, asset: MediaAsset, start: float) -> Clip:
         media_type = MediaType.IMAGE if asset.is_image else (MediaType.VIDEO if asset.has_video else MediaType.AUDIO)
         length = asset.duration if asset.duration > 0 else 5.0
-        return Clip(media_type=media_type, source_path=asset.path, source_out=length, timeline_start=start,
+        source_in = 0.0
+        # Match Frame (F28): the next Insert/Overwrite of the matched file starts at the matched frame.
+        matched = getattr(self, "matched_source", None)
+        if matched is not None and matched[0] == asset.id and media_type != MediaType.IMAGE and matched[1] < length - 0.1:
+            source_in = matched[1]
+            self.matched_source = None
+        return Clip(media_type=media_type, source_path=asset.path, source_in=source_in, source_out=length, timeline_start=start,
                     source_duration=asset.duration if asset.duration > 0 else None, asset_id=asset.id)
+
+    # ------------------------------------------------------------------
+    # Premiere-style commands (F28)
+    # ------------------------------------------------------------------
+    def _in_out_or_message(self):
+        if self.in_point is None or self.out_point is None or self.out_point <= self.in_point:
+            self.status_message.emit("Set an In point (I) and an Out point (O) first.")
+            return None
+        return self.in_point, self.out_point
+
+    def lift_in_out(self) -> bool:
+        """Lift (;): remove In-Out from every unlocked track, leaving a gap."""
+        span = self._in_out_or_message() if self.project is not None else None
+        if span is None:
+            return False
+        ok = self._execute_and_select(build_lift_command(self.project, *span), False)
+        if not ok:
+            self.status_message.emit("Nothing to lift between In and Out.")
+        return ok
+
+    def extract_in_out(self) -> bool:
+        """Extract ('): remove In-Out from every unlocked track and close the gap."""
+        span = self._in_out_or_message() if self.project is not None else None
+        if span is None:
+            return False
+        ok = self._execute_and_select(build_extract_command(self.project, *span), False)
+        if ok:
+            self.out_point = None
+            self.ruler_item.set_in_out(self.in_point, self.out_point)
+            self.set_playhead(span[0])
+        else:
+            self.status_message.emit("Nothing to extract between In and Out.")
+        return ok
+
+    def add_edit_all_tracks(self) -> bool:
+        """Add Edit to All Tracks (Shift+S): cut every clip under the playhead."""
+        if self.project is None:
+            return False
+        ok = self._execute_and_select(build_add_edit_all_tracks(self.project, self.playhead_time), False)
+        if not ok:
+            self.status_message.emit("No clip under the playhead to cut.")
+        return ok
+
+    def extend_edit_selected(self) -> bool:
+        """Extend Edit (E): move the selected clip's nearer edit point to the playhead."""
+        if self.project is None or self.selected_clip_id is None:
+            self.status_message.emit("Select a clip first.")
+            return False
+        ok = self._execute_and_select(build_extend_edit_command(self.project, self.selected_clip_id, self.playhead_time), False)
+        if not ok:
+            self.status_message.emit("Can't extend there: another clip is in the way, or there isn't enough media.")
+        return ok
 
     def insert_asset_at_playhead(self, asset: MediaAsset, overwrite: bool = False) -> bool:
         """Insert (ripple every unlocked track) or overwrite media at the playhead on the selected/first track."""

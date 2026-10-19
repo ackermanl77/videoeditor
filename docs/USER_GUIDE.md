@@ -523,6 +523,13 @@ language, or let it detect the language. The captions are ordinary caption
 clips: correct the text, restyle them all with **Apply to Track**, and
 export them burned in or as a subtitle track.
 
+Two more options in the same window:
+- **Caption style → One word at a time** makes one caption per word, shown as it
+  is spoken (the short-video look). Each word stays up until the next one, or
+  0.4 s into a pause.
+- **Translate the speech into English** uses the same speech model to write
+  English captions from speech in any language. No extra download.
+
 This uses the free **faster-whisper** speech recogniser, which isn't
 installed with the editor. When running the editor from source, add it with
 `pip install faster-whisper`; the command tells you if it is missing. A
@@ -675,6 +682,15 @@ Split, Ripple Delete, Detach Audio, Roll, Slip, Slide and Reveal in Media Bin.
   shows without moving it; **Slide** moves a clip between its neighbours,
   trimming them to compensate; **Ripple Move** moves a clip together with
   everything after it on its track.
+- **Premiere-style commands** (Edit menu):
+
+  | Command | Key | Does |
+  |---|---|---|
+  | Lift | **;** | Removes everything between In and Out on every unlocked track, leaving a gap. |
+  | Extract | **'** | The same, then closes the gap: everything after Out moves left on those tracks. |
+  | Match Frame | **F** | Finds the source of the frame at the playhead and selects its file in the Media Bin. The next Insert (**,**) or Overwrite (**.**) of it starts at that exact frame. |
+  | Add Edit to All Tracks | **Shift+S** | Cuts every clip under the playhead, on every unlocked track. |
+  | Extend Edit | **E** | Moves the selected clip's nearer edge to the playhead. An edge touching another clip rolls with it; a free edge is trimmed or extended (not past another clip or the end of the media). |
 - The same edits work by **dragging with a modifier key**:
 
   | Drag | With | Does |
@@ -712,6 +728,19 @@ preview plays instead of the original; export always uses the original.
 **Media > Generate Proxies Automatically** does this for every imported file
 larger than 1080p, 10-bit or HDR. Proxies use the NVIDIA encoder when there is
 one.
+
+## Audio mixer
+
+**Timeline > Audio Mixer** (Ctrl+Alt+A) shows one strip per track. A video track's strip is
+for its clips' own sound. Each strip has:
+
+- **Fader:** −60 to +12 dB. Double-click the value under it to reset it to 0 dB.
+- **Pan:** left/right balance.
+- **M (mute) and S (solo):** while any track is soloed, only soloed tracks are heard.
+- **Meter:** live peak and RMS of the sound under the playhead.
+
+Fader and pan apply to the export and the preview. They come after each clip's own volume,
+effects and fades, and before ducking and the master limiter. Every change is undoable.
 
 ## Video scopes
 
@@ -908,6 +937,11 @@ disabled and explained when GIF is selected.
 |---|---|
 | Command search (find any menu command by name and run it) | Ctrl+K |
 | Show / hide the Video Scopes | Ctrl+Alt+S |
+| Show / hide the Audio Mixer | Ctrl+Alt+A |
+| Lift / Extract (In to Out) | ; / ' |
+| Match Frame | F |
+| Add Edit to All Tracks | Shift+S |
+| Extend Edit to the playhead | E |
 | New Project | Ctrl+N |
 | Open Project | Ctrl+O |
 | Save Project | Ctrl+S |

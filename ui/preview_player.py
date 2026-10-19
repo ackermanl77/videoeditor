@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from core.clip import Clip, MediaType
 from core.frame_render import FrameRenderError, render_frame
+from core.mixer import track_audible, track_meter_gain
 from core.preview_render import RenderedRange, range_key
 from core.project import Project
 from core.timeline_nav import format_timecode
@@ -423,8 +424,7 @@ class PreviewPlayer(QWidget):
             return
         clip, track = self._resolve_active_clip(self._current_time)
         if clip is not None:
-            self.audio_output.setMuted(clip.muted or (track is not None and track.muted))
-            self.audio_output.setVolume(max(0.0, min(1.0, clip.volume)))
+            self._apply_output_level(clip, track)
         self._update_audio_meters()
         self._update_time_label()
 
@@ -610,8 +610,7 @@ class PreviewPlayer(QWidget):
         self.player.setPosition(int(max(0.0, source_position_s) * 1000))
         # A muted *track* silences its clips too (matching export, see
         # core/filter_graph.py); this used to honor only the clip's own flag.
-        self.audio_output.setMuted(clip.muted or (track is not None and track.muted))
-        self.audio_output.setVolume(max(0.0, min(1.0, clip.volume)))
+        self._apply_output_level(clip, track)
 
         if autoplay:
             self.player.play()
@@ -812,7 +811,7 @@ class PreviewPlayer(QWidget):
             clip is None
             or clip.media_type not in (MediaType.VIDEO, MediaType.AUDIO)
             or clip.is_silent
-            or (track is not None and track.muted)
+            or (track is not None and not track_audible(track, self.project.tracks))
             or clip.in_freeze_frame(offset)
         ):
             self.meters.set_levels(0.0, 0.0)
@@ -825,7 +824,17 @@ class PreviewPlayer(QWidget):
             self.meters.set_levels(0.0, 0.0)
             return
         peak, rms = window_levels(waveform, clip.source_time_at(offset))
+        if track is not None:
+            gain *= track_meter_gain(track)
         self.meters.set_levels(peak * gain, rms * gain)
+
+    def _apply_output_level(self, clip: Clip, track) -> None:
+        """Mute/volume of the preview's audio output: the clip's own, times its track's mixer fader
+        (F31), silenced by mute or by another track's solo -- as the export mixes it."""
+        audible = track is None or self.project is None or track_audible(track, self.project.tracks)
+        self.audio_output.setMuted(clip.muted or not audible)
+        fader = track_meter_gain(track) if track is not None else 1.0
+        self.audio_output.setVolume(max(0.0, min(1.0, clip.volume * fader)))
 
     @staticmethod
     def _clip_gain_at(clip: Clip, offset: float) -> float:

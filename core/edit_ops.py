@@ -551,3 +551,110 @@ def build_detach_audio_command(project: Project, clip_id: str, has_audio: bool =
     if clip.link_group != group:
         commands.append(UpdateClipPropertyCommand(project, clip.id, "link_group", group))
     return CompositeCommand(commands, "Detach Audio")
+
+
+# ---------------------------------------------------------------------------
+# Premiere-style commands (F28): Lift, Extract, Add Edit to All Tracks, Extend Edit, Match Frame
+# ---------------------------------------------------------------------------
+def build_lift_command(project: Project, start: float, end: float) -> Optional[Command]:
+    """Lift (;): remove the In/Out range from every unlocked track, leaving a gap.
+
+    Clips crossing In or Out are split there first, so only the part inside the
+    range goes.
+    """
+    if end - start < _EPS:
+        return None
+    unlocked = [t for t in project.tracks if not t.locked]
+    # Each split looks up the clip under its time when it runs, after the earlier splits.
+    steps = [lambda tr=track, at=at: _split_at_end(project, tr, at) for at in (start, end) for track in unlocked]
+    steps += [lambda tr=track: _remove_range(project, tr, start, end) for track in unlocked]
+    return _plan_sequential(steps, "Lift")
+
+
+def build_extract_command(project: Project, start: float, end: float) -> Optional[Command]:
+    """Extract ('): remove the In/Out range from every unlocked track and close the gap.
+
+    Like Lift, then everything after Out moves left by the range's length on the
+    same tracks, so they stay in sync. Locked tracks don't move (as in Premiere,
+    a locked track keeps its place).
+    """
+    if end - start < _EPS:
+        return None
+    lift = build_lift_command(project, start, end)
+    unlocked = [t for t in project.tracks if not t.locked]
+    length = end - start
+
+    def lift_step() -> Optional[Command]:
+        return lift
+
+    def shift_step() -> Optional[Command]:
+        moves = [
+            MoveClipCommand(project, c.id, c.timeline_start - length, t.id)
+            for t in unlocked for c in t.clips if c.timeline_start >= end - _EPS
+        ]
+        moves.sort(key=lambda m: project.find_clip(m.clip_id).timeline_start)  # earliest first: no overlaps
+        return CompositeCommand(moves, "Close Gap") if moves else None
+
+    return _plan_sequential([lift_step, shift_step], "Extract")
+
+
+def build_add_edit_all_tracks(project: Project, t: float) -> Optional[Command]:
+    """Add Edit to All Tracks: split every clip under ``t`` on every unlocked track."""
+    unlocked = [track for track in project.tracks if not track.locked]
+    return _plan_sequential(_split_steps_at(project, unlocked, t), "Add Edit to All Tracks")
+
+
+def build_extend_edit_command(project: Project, clip_id: str, t: float) -> Optional[Command]:
+    """Extend Edit (E): move the selected clip's nearer edit point to ``t``.
+
+    An edge touching a neighbour rolls with it (the neighbour gives or takes the
+    same time); a free edge is trimmed or extended, refused when it would run
+    into another clip or past the media.
+    """
+    track, prev, clip, nxt = _neighbours(project, clip_id)
+    if clip is None or track is None or track.locked:
+        return None
+    edge = "right" if abs(t - clip.timeline_end) <= abs(t - clip.timeline_start) else "left"
+    if edge == "right":
+        if nxt is not None:
+            return build_roll_command(project, clip.id, t)
+        following = [c for c in track.clips if c.id != clip.id and c.timeline_start >= clip.timeline_end - _EPS]
+        if following and t > min(c.timeline_start for c in following) + _EPS:
+            return None
+        return _trim_right_to(project, clip, t)
+    if prev is not None:
+        return build_roll_command(project, prev.id, t)
+    preceding = [c for c in track.clips if c.id != clip.id and c.timeline_end <= clip.timeline_start + _EPS]
+    if preceding and t < max(c.timeline_end for c in preceding) - _EPS:
+        return None
+    return _trim_left_to(project, clip, t)
+
+
+def match_frame(project: Project, t: float, clip_id: Optional[str] = None):
+    """Match Frame (F): ``(clip, source seconds)`` of the frame shown at timeline time ``t``.
+
+    ``clip_id`` (the selected clip) wins when it is under ``t``; otherwise the
+    top-most visible video clip there (the highest video track is drawn on top, as in
+    the preview), else an audio clip. None when nothing with a source file is under ``t``.
+    """
+    def under(clip: Clip) -> bool:
+        return clip.timeline_start - _EPS <= t < clip.timeline_end and clip.source_path and clip.media_type != MediaType.TEXT
+
+    chosen = project.find_clip(clip_id) if clip_id else None
+    if chosen is None or not under(chosen):
+        chosen = None
+        for kind in (TrackType.VIDEO, TrackType.AUDIO):
+            for track in reversed(project.tracks):
+                if track.track_type != kind or track.hidden:
+                    continue
+                found = next((c for c in track.clips if under(c)), None)
+                if found is not None:
+                    chosen = found
+                    break
+            if chosen is not None:
+                break
+    if chosen is None:
+        return None
+    offset = min(chosen.source_offset_at(t - chosen.timeline_start), chosen.source_length)
+    source = chosen.source_out - offset if chosen.reverse else chosen.source_in + offset
+    return chosen, max(0.0, source)

@@ -282,6 +282,16 @@ class MainWindow(QMainWindow):
         self.scopes_dock.setWidget(self.scopes_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.scopes_dock)
         self.scopes_dock.hide()
+        # Audio mixer (F31): fader, pan, mute/solo and a meter per track.
+        from ui.mixer_panel import MixerPanel
+
+        self.mixer_panel = MixerPanel(lambda: self.project, lambda: self.history, lambda: self.preview.current_time)
+        self.mixer_panel.project_modified.connect(lambda: (self.timeline.rebuild(), self._on_project_modified()))
+        self.mixer_dock = QDockWidget("Audio Mixer", self)
+        self.mixer_dock.setObjectName("MixerDock")
+        self.mixer_dock.setWidget(self.mixer_panel)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.mixer_dock)
+        self.mixer_dock.hide()
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -315,6 +325,9 @@ class MainWindow(QMainWindow):
         self.scopes_action = self.scopes_dock.toggleViewAction()
         self.scopes_action.setText("Video Scopes")
         self.scopes_action.setShortcut(QKeySequence("Ctrl+Alt+S"))
+        self.mixer_action = self.mixer_dock.toggleViewAction()
+        self.mixer_action.setText("Audio Mixer")
+        self.mixer_action.setShortcut(QKeySequence("Ctrl+Alt+A"))
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close, "Ctrl+Q")
 
@@ -337,6 +350,11 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Overwrite with Selected Media at Playhead", lambda: self._place_selected_asset(True), ".")
         self._add_action(edit_menu, "Detach Audio", self.timeline.detach_audio_selected, "Ctrl+Shift+D")
         self._add_action(edit_menu, "Roll Edit to Playhead", self.timeline.roll_selected_to_playhead, "Ctrl+R")
+        self._add_action(edit_menu, "Extend Edit to Playhead", self.timeline.extend_edit_selected, "E")
+        self._add_action(edit_menu, "Add Edit to All Tracks", self.timeline.add_edit_all_tracks, "Shift+S")
+        self._add_action(edit_menu, "Lift (In to Out)", self.timeline.lift_in_out, ";")
+        self._add_action(edit_menu, "Extract (In to Out)", self.timeline.extract_in_out, "'")
+        self._add_action(edit_menu, "Match Frame", self.match_frame, "F")
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
         self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
@@ -350,6 +368,7 @@ class MainWindow(QMainWindow):
         self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
         timeline_menu.addAction(self.markers_action)
         timeline_menu.addAction(self.scopes_action)
+        timeline_menu.addAction(self.mixer_action)
         timeline_menu.addSeparator()
         self._add_action(timeline_menu, "Nest Selected Clips", self.nest_selected_clips, "Ctrl+G")
         self._add_action(timeline_menu, "Expand Compound Clip", self.expand_compound_clip, "Ctrl+Shift+G")
@@ -764,13 +783,16 @@ class MainWindow(QMainWindow):
         self._on_project_modified()
 
     def generate_captions(self, model_size: Optional[str] = None, language: Optional[str] = "",
-                          words_from=None) -> int:
+                          words_from=None, style: str = "lines", translate: bool = False) -> int:
         """Edit > Generate Captions (F17): transcribe the selected clip's speech with faster-whisper
         on a background thread and add the cues as caption clips (one undo step). ``model_size`` /
         ``language`` skip the dialog and ``words_from`` replaces the model (tests)."""
-        from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QProgressDialog
+        from PySide6.QtWidgets import (
+            QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QProgressDialog,
+        )
 
         from core.transcribe import (
+            CAPTION_STYLES,
             DEFAULT_MODEL,
             INSTALL_HINT,
             LANGUAGES,
@@ -804,6 +826,14 @@ class MainWindow(QMainWindow):
             for name, code in LANGUAGES:
                 language_combo.addItem(name, code)
             form.addRow("Language", language_combo)
+            style_combo = QComboBox()
+            for name, key in CAPTION_STYLES:
+                style_combo.addItem(name, key)
+            style_combo.setToolTip("One word at a time shows each word as it is spoken (the short-video look).")
+            form.addRow("Caption style", style_combo)
+            translate_check = QCheckBox("Translate the speech into English")
+            translate_check.setToolTip("Whisper's own translation, with the same model: the captions come out in English.")
+            form.addRow("", translate_check)
             note = QLabel("Bigger models are more accurate and slower. A graphics card (CUDA) is used "
                           "when available.")
             note.setWordWrap(True)
@@ -815,6 +845,7 @@ class MainWindow(QMainWindow):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return 0
             model_size, language = model_combo.currentData(), language_combo.currentData()
+            style, translate = style_combo.currentData(), translate_check.isChecked()
         progress = QProgressDialog("Transcribing the clip's speech…", "Cancel", 0, 0, self)
         progress.setWindowTitle(title)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -825,7 +856,8 @@ class MainWindow(QMainWindow):
             def run(self_inner):
                 try:
                     result["cues"] = transcribe_clip(clip, model_size, language or None,
-                                                     should_cancel=progress.wasCanceled, words_from=words_from)
+                                                     should_cancel=progress.wasCanceled, words_from=words_from,
+                                                     style=style, translate=translate)
                 except TranscriptionCancelled:
                     result["cancelled"] = True
                 except Exception as exc:  # noqa: BLE001 -- shown to the user
@@ -1050,6 +1082,27 @@ class MainWindow(QMainWindow):
             return
         self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite)
 
+    def match_frame(self) -> bool:
+        """Match Frame (F28): find the source of the frame at the playhead -- select its file in the
+        Media Bin, and make the next Insert (,) / Overwrite (.) of it start at that very frame."""
+        from core.edit_ops import match_frame
+
+        found = match_frame(self.project, self.timeline.playhead_time, self.timeline.selected_clip_id)
+        if found is None:
+            self.status_bar.showMessage("No clip with a source file under the playhead.", 4000)
+            return False
+        clip, source_t = found
+        asset = self.project.asset_for_clip(clip)
+        if asset is None:
+            self.status_bar.showMessage("The clip's source file isn't in the Media Bin.", 4000)
+            return False
+        self._reveal_asset(asset.id)
+        self.timeline.matched_source = (asset.id, source_t)
+        self.status_bar.showMessage(
+            f"Match Frame: {asset.display_name} at {format_timecode(source_t, self.project.settings.fps)} -- "
+            "Insert (,) or Overwrite (.) places it from this frame.", 8000)
+        return True
+
     def _reveal_asset(self, asset_id: str) -> None:
         widget = self.media_bin.list_widget
         for i in range(widget.count()):
@@ -1164,6 +1217,7 @@ class MainWindow(QMainWindow):
         self.preview.refresh_after_edit()
         self._update_time_status()
         self.scopes_panel.schedule_refresh()
+        self.mixer_panel.refresh()  # cheap: rebuilds strips only when tracks change
 
     def _on_timeline_playhead_changed(self, t: float) -> None:
         if self._syncing_playhead:

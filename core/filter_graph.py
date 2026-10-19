@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, ReframeMode, TransitionType
 from core.audio_effects import audio_effect_filters
+from core.mixer import apply_track_mix, track_audible
 from core.effects import ANALYSIS_FILE_PARAM, effect_filters
 from core.media_asset import MediaAsset
 from core.output_color import REFERENCE_WHITE_NITS, SDR_8BIT, OutputColor
@@ -1206,7 +1207,7 @@ def build_filter_graph(
     # embedded audio.)
     for track_order, track in enumerate(video_tracks):
         render_video = not track.hidden and not audio_only
-        render_audio = not track.muted and not video_only
+        render_audio = track_audible(track, project.tracks) and not video_only
         if not render_video and not render_audio:
             continue
         sorted_clips = track.sorted_clips()
@@ -1450,7 +1451,7 @@ def build_filter_graph(
 
     # ---- Audio tracks ----
     for track in audio_tracks:
-        if track.muted or video_only:
+        if not track_audible(track, project.tracks) or video_only:
             continue
         audio_clips = [c for c in track.sorted_clips() if c.media_type == MediaType.AUDIO]
         crossfade_sides: Dict[int, Tuple[Clip, str, str]] = {}  # index -> (timing stand-in, curve_in, curve_out)
@@ -1518,6 +1519,8 @@ def build_filter_graph(
     # routed through sidechaincompress, keyed off its trigger track's mixed
     # audio -- e.g. background music automatically quieting under narration.
     # Mutates audio_labels in place (see _apply_audio_ducking's docstring).
+    # Track faders and pan (F31) first: a ducked bed keeps its fader level.
+    apply_track_mix(project, filter_lines, audio_labels, audio_labels_by_track)
     _apply_audio_ducking(project, filter_lines, audio_labels, audio_labels_by_track)
 
     has_audio = bool(audio_labels)

@@ -82,6 +82,34 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Premiere-style commands, audio mixer, word captions (2026-10-19, F28/F31/F33).**
+  - **F28:** `core/edit_ops.py` builders:
+    - `build_lift_command` (split at In and Out on every unlocked track, remove what's inside);
+    - `build_extract_command` (lift, then shift later clips left on the same tracks; locked tracks
+      stay);
+    - `build_add_edit_all_tracks`;
+    - `build_extend_edit_command` (the nearer edge: roll with a touching neighbour, else trim,
+      refused into another clip or past the media);
+    - `match_frame` (the selected clip if under the playhead, else the topmost visible video clip,
+      else audio; source time honours speed, ramps and reverse).
+  - **F28 UI:** Edit menu actions `;`, `'`, F, Shift+S, E. Match Frame selects the file in the Media
+    Bin and sets `timeline.matched_source`, used once by the next Insert/Overwrite of that file as
+    its `source_in`.
+  - **F31:** `Track.gain_db`/`pan`/`solo`, clamped on load; `core/mixer.py`.
+    - **Export:** `track_audible()` (mute, then solo) replaces the muted checks in the graph.
+      `apply_track_mix()` adds `volume` + a balance `pan` per clip label before ducking.
+    - **Preview:** its output volume/mute and meter follow fader, pan and solo.
+    - **Panel:** `ui/mixer_panel.py`, an Audio Mixer dock (Ctrl+Alt+A) with fader, pan, M/S and a
+      vertical meter fed by `track_levels()` from the cached waveforms. Edits go through
+      `UpdateTrackPropertyCommand`; a fader drag is one undo step when the handle is released.
+  - **F33:** `core/transcribe.py` gets `style="words"` (`word_cues()`: one cue per word, until the
+    next word or 0.4 s, never overlapping) and `translate=True` (faster-whisper
+    `task="translate"`, English), both in the Generate Captions dialog.
+  - **Tests:**
+    - `tests/test_premiere_commands.py`;
+    - `tests/test_mixer.py` (real FFmpeg: hard-left pan leaves the right channel silent);
+    - `tests/integration/test_captions.py`.
+
 - **Exe resources (2026-10-18, K8).**
   - **Publisher:** one name, "MELEJ", in the version resource (`version_info.txt`) and the installer's
     `AppPublisher`.

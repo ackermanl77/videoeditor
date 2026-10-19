@@ -135,7 +135,8 @@ def plan_nest(project: Project, clip_ids: Sequence[str]) -> Tuple[Track, Clip, L
         clips = [clip for t, clip in chosen if t is track]
         if not clips:
             continue
-        copy_track = Track(track_type=track.track_type, name=track.name, muted=track.muted, hidden=track.hidden)
+        copy_track = Track(track_type=track.track_type, name=track.name, muted=track.muted, hidden=track.hidden,
+                           gain_db=track.gain_db, pan=track.pan, solo=track.solo)
         for clip in clips:
             moved = clip.copy()
             moved.timeline_start = clip.timeline_start - start

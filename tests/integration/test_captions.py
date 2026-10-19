@@ -134,3 +134,45 @@ class TranscribeClipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WordCaptionTests(unittest.TestCase):
+    """F33: one word at a time, and the translate switch reaching faster-whisper."""
+
+    def test_one_cue_per_word_held_until_the_next_word(self):
+        cues = group_words(WORDS, "words")
+        self.assertEqual([c.text for c in cues][:3], ["Hello", "there,", "this"])
+        self.assertEqual(len(cues), len(WORDS))
+        self.assertEqual((cues[0].start, cues[0].end), (0.2, 0.5))  # until "there," starts
+        self.assertAlmostEqual(cues[5].end, 2.6 + 0.4)  # "test." held 0.4 s into the pause, not to 4.0
+        for first, second in zip(cues, cues[1:]):
+            self.assertLessEqual(first.end, second.start + 1e-9)  # never overlapping
+        short = group_words([Word(1.0, 1.02, "a"), Word(3.0, 3.5, "b")], "words")
+        self.assertAlmostEqual(short[0].end - short[0].start, 0.42)
+
+    @unittest.skipUnless(FFMPEG, "FFmpeg not available")
+    def test_word_style_and_translate_through_transcribe_clip(self):
+        clip = Clip(media_type=MediaType.VIDEO, source_path=SPEECH, source_out=6.0, timeline_start=10.0, source_duration=6.0)
+        cues = transcribe_clip(clip, words_from=_Ears(), style="words")
+        self.assertEqual(len(cues), len(WORDS))
+        self.assertAlmostEqual(cues[0].start, 10.2)
+        import types
+
+        seen = {}
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def transcribe(self, wav, **kwargs):
+                seen.update(kwargs)
+                segment = types.SimpleNamespace(words=[types.SimpleNamespace(start=0.1, end=0.4, word=" Hi")],
+                                                text=" Hi", start=0.1, end=0.4)
+                return iter([segment]), None
+
+        fake = types.ModuleType("faster_whisper")
+        fake.WhisperModel = FakeModel
+        with patch.dict("sys.modules", {"faster_whisper": fake}):
+            cues = transcribe_clip(clip, "tiny", "es", translate=True)
+        self.assertEqual(seen["task"], "translate")
+        self.assertEqual([c.text for c in cues], ["Hi"])

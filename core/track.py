@@ -25,6 +25,12 @@ def normalize_track_height(value: Any) -> int:
     return value if isinstance(value, int) and value in TRACK_HEIGHT_PRESETS.values() else DEFAULT_TRACK_HEIGHT
 
 
+def _mixer():
+    from core import mixer
+
+    return mixer
+
+
 @dataclass
 class Track:
     """A single track (video or audio) holding a list of non-overlapping clips."""
@@ -37,6 +43,10 @@ class Track:
     locked: bool = False
     hidden: bool = False
     height: int = DEFAULT_TRACK_HEIGHT  # timeline row height in pixels, one of TRACK_HEIGHT_PRESETS
+    # Audio mixer (F31, core.mixer): fader in dB, balance -1..1, solo.
+    gain_db: float = 0.0
+    pan: float = 0.0
+    solo: bool = False
 
     # Audio ducking (sidechain compression). When set, this track's own
     # audio is a "duck under" target: its mixed audio is routed through
@@ -124,6 +134,9 @@ class Track:
             "locked": self.locked,
             "hidden": self.hidden,
             "height": self.height,
+            "gain_db": self.gain_db,
+            "pan": self.pan,
+            "solo": self.solo,
             "duck_trigger_track_id": self.duck_trigger_track_id,
             "duck_threshold": self.duck_threshold,
             "duck_ratio": self.duck_ratio,
@@ -142,6 +155,9 @@ class Track:
             locked=data.get("locked", False),
             hidden=data.get("hidden", False),
             height=normalize_track_height(data.get("height")),
+            gain_db=_mixer().clean_gain(data.get("gain_db", 0.0)),
+            pan=_mixer().clean_pan(data.get("pan", 0.0)),
+            solo=bool(data.get("solo", False)),
             duck_trigger_track_id=data.get("duck_trigger_track_id"),
             duck_threshold=data.get("duck_threshold", 0.05),
             duck_ratio=data.get("duck_ratio", 8.0),

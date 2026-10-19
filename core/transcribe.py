@@ -8,6 +8,10 @@ speed ramp onto the timeline, and the editor adds them as ordinary caption text 
 "Subtitles" track. Styling, Apply to Track, soft-subtitle export and burn-in then work as for an
 imported SRT.
 
+F33: ``style="words"`` makes one cue per word instead (the punchy short-video look), each lasting
+until the next word starts (or ``WORD_HOLD_SECONDS`` at most across a pause); ``translate=True``
+uses Whisper's own speech translation into English (the same model, no extra download).
+
 faster-whisper isn't a requirement: without it the command explains how to add it. Its models are
 downloaded by faster-whisper itself on first use into the Hugging Face cache (tiny ~75 MB,
 base ~145 MB, small ~480 MB, medium ~1.5 GB, large-v3 ~3 GB).
@@ -36,6 +40,10 @@ MAX_CUE_CHARS = 2 * MAX_LINE_CHARS
 MAX_CUE_SECONDS = 6.0
 #: A pause this long between words always starts a new cue.
 CUE_GAP_SECONDS = 0.8
+CAPTION_STYLES = (("Two-line captions", "lines"), ("One word at a time", "words"))
+#: A single-word cue stays this long at most after its word when the speaker pauses.
+WORD_HOLD_SECONDS = 0.4
+MIN_WORD_SECONDS = 0.15
 INSTALL_HINT = ("Automatic captions need the optional faster-whisper package. In the editor's Python "
                 "environment run:\n\n    pip install faster-whisper\n\nThe first transcription then "
                 "downloads the chosen speech model.")
@@ -83,9 +91,26 @@ def _wrap(text: str) -> str:
     return text[:cut] + "\n" + text[cut + 1:]
 
 
-def group_words(words: Sequence[Word]) -> List[SubtitleCue]:
+def word_cues(words: Sequence[Word]) -> List[SubtitleCue]:
+    """One cue per word (F33): from its start until the next word starts -- held at most
+    WORD_HOLD_SECONDS past the word's end across a pause, and never shorter than MIN_WORD_SECONDS."""
+    spoken = [w for w in words if w.text.strip()]
+    cues = []
+    for i, word in enumerate(spoken):
+        end = word.end + WORD_HOLD_SECONDS
+        if i + 1 < len(spoken):
+            end = min(end, spoken[i + 1].start)  # cues never overlap
+        end = max(end, word.start + MIN_WORD_SECONDS)
+        cues.append(SubtitleCue(word.start, end, word.text.strip()))
+    return cues
+
+
+def group_words(words: Sequence[Word], style: str = "lines") -> List[SubtitleCue]:
     """Caption cues (times in seconds of the audio) from timed words: a new cue when the text would
-    pass two lines, the cue would pass MAX_CUE_SECONDS, or the speaker pauses."""
+    pass two lines, the cue would pass MAX_CUE_SECONDS, or the speaker pauses. ``style="words"``:
+    one cue per word (word_cues)."""
+    if style == "words":
+        return word_cues(words)
     cues: List[SubtitleCue] = []
     current: List[Word] = []
 
@@ -109,14 +134,15 @@ def group_words(words: Sequence[Word]) -> List[SubtitleCue]:
 
 
 def _whisper_words(wav_path: str, model_size: str, language: Optional[str],
-                   should_cancel: Optional[Callable[[], bool]]) -> Iterable[Word]:
+                   should_cancel: Optional[Callable[[], bool]], translate: bool = False) -> Iterable[Word]:
     from faster_whisper import WhisperModel  # optional dependency
 
     try:
         model = WhisperModel(model_size, device="auto", compute_type="auto")
     except Exception:  # noqa: BLE001 -- a broken CUDA setup: fall back to the CPU
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(wav_path, language=language, word_timestamps=True, vad_filter=True)
+    segments, _info = model.transcribe(wav_path, language=language, word_timestamps=True, vad_filter=True,
+                                       task="translate" if translate else "transcribe")
     for segment in segments:
         if should_cancel is not None and should_cancel():
             raise TranscriptionCancelled()
@@ -131,7 +157,7 @@ def _whisper_words(wav_path: str, model_size: str, language: Optional[str],
 def transcribe_clip(clip: Clip, model_size: str = DEFAULT_MODEL, language: Optional[str] = None,
                     should_cancel: Optional[Callable[[], bool]] = None,
                     words_from: Optional[Callable[[str], Iterable[Word]]] = None,
-                    ffmpeg: Optional[str] = None) -> List[SubtitleCue]:
+                    ffmpeg: Optional[str] = None, style: str = "lines", translate: bool = False) -> List[SubtitleCue]:
     """Caption cues for ``clip``'s trimmed audio, in timeline seconds. ``words_from(wav_path)``
     replaces faster-whisper (tests)."""
     from core.scene_detect import timeline_offset_for_source
@@ -150,7 +176,7 @@ def transcribe_clip(clip: Clip, model_size: str = DEFAULT_MODEL, language: Optio
             raise RuntimeError("The clip's audio couldn't be read (does it have a sound track?). "
                                + made.stderr.strip()[-300:])
         if words_from is None:
-            words = list(_whisper_words(wav, model_size, language, should_cancel))
+            words = list(_whisper_words(wav, model_size, language, should_cancel, translate))
         else:
             words = list(words_from(wav))
         if should_cancel is not None and should_cancel():
@@ -161,7 +187,7 @@ def transcribe_clip(clip: Clip, model_size: str = DEFAULT_MODEL, language: Optio
         except OSError:
             pass
     cues = []
-    for cue in group_words(words):
+    for cue in group_words(words, style):
         start = timeline_offset_for_source(clip, min(clip.source_out, clip.source_in + cue.start))
         end = timeline_offset_for_source(clip, min(clip.source_out, clip.source_in + cue.end))
         if start is None or end is None or end <= start:
