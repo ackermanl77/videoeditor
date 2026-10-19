@@ -713,6 +713,19 @@ preview plays instead of the original; export always uses the original.
 larger than 1080p, 10-bit or HDR. Proxies use the NVIDIA encoder when there is
 one.
 
+## Video scopes
+
+**Timeline > Video Scopes** (Ctrl+Alt+S) opens the Scopes panel. It measures the frame under the
+playhead exactly as the export renders it: every track, effect and colour correction. It updates a
+moment after you move the playhead or change something, while playback is paused.
+
+- **Waveform (luma)**: brightness of each column of the picture, from 0 (bottom) to 255 (top).
+  The lines at 16 and 235 are video black and white, so a trace above 235 is clipping.
+- **RGB Parade**: the same for red, green and blue side by side. Equal heights on something that
+  should be grey means it is neutral; a higher channel shows a colour cast.
+- **Vectorscope**: colour, with hue around the circle and saturation outwards. The squares are the
+  75 % colour-bar targets (R, Mg, B, Cy, G, Yl). Skin tones lie on a line between red and yellow.
+
 ## The preview player — what it does and doesn't show
 
 Press **Space**, or click the play button, to preview your edit. Click the
@@ -894,6 +907,7 @@ disabled and explained when GIF is selected.
 | Action | Shortcut |
 |---|---|
 | Command search (find any menu command by name and run it) | Ctrl+K |
+| Show / hide the Video Scopes | Ctrl+Alt+S |
 | New Project | Ctrl+N |
 | Open Project | Ctrl+O |
 | Save Project | Ctrl+S |

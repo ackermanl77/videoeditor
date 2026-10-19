@@ -82,6 +82,16 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Video scopes (2026-10-18, F24).** `core/scopes.py` passes the frame under the playhead
+  (`render_frame`, the export engine's composite) through FFmpeg's `waveform` (luma),
+  `waveform=display=parade` (on `gbrp`, panels R/G/B) and `vectorscope` (color3, colour-bar
+  targets).
+  - **UI:** `ui/scopes_panel.py` adds a Scopes dock (Timeline > Video Scopes, Ctrl+Alt+S). It renders
+    on a worker thread, debounced and only while visible and paused, with generation-checked results.
+  - **Refresh triggers:** playhead, edits and stopping playback.
+  - **Tests:** `tests/test_scopes.py`. A bright frame traces above a dark one, a red frame lights only
+    the parade's red panel, and the composited timeline frame is measured.
+
 - **Command search (2026-10-18, F27).** `ui/command_palette.py`: Help > Command Search… (Ctrl+K).
   - `collect_commands()` walks the live menu bar each time, giving every action with its menu path and
     shortcut (display-only key hints included). Disabled actions are greyed out.

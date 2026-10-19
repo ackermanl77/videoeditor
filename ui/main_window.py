@@ -272,6 +272,16 @@ class MainWindow(QMainWindow):
         self.markers_dock.setWidget(self.markers_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.markers_dock)
         self.markers_dock.hide()
+        # Scopes (F24): waveform / RGB parade / vectorscope of the frame under the playhead.
+        from ui.scopes_panel import ScopesPanel
+
+        self.scopes_panel = ScopesPanel(lambda: self.project, lambda: self.preview.current_time,
+                                        lambda: bool(getattr(self.preview, "_is_playing", False)))
+        self.scopes_dock = QDockWidget("Scopes", self)
+        self.scopes_dock.setObjectName("ScopesDock")
+        self.scopes_dock.setWidget(self.scopes_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.scopes_dock)
+        self.scopes_dock.hide()
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -302,6 +312,9 @@ class MainWindow(QMainWindow):
         self.markers_action = self.markers_dock.toggleViewAction()
         self.markers_action.setText("Markers Panel")
         self.markers_action.setShortcut(QKeySequence("Ctrl+Alt+M"))
+        self.scopes_action = self.scopes_dock.toggleViewAction()
+        self.scopes_action.setText("Video Scopes")
+        self.scopes_action.setShortcut(QKeySequence("Ctrl+Alt+S"))
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close, "Ctrl+Q")
 
@@ -336,6 +349,7 @@ class MainWindow(QMainWindow):
         timeline_menu = menu_bar.addMenu("&Timeline")
         self._add_action(timeline_menu, "Add Marker at Playhead", self.timeline.add_marker_at_playhead, "M")
         timeline_menu.addAction(self.markers_action)
+        timeline_menu.addAction(self.scopes_action)
         timeline_menu.addSeparator()
         self._add_action(timeline_menu, "Nest Selected Clips", self.nest_selected_clips, "Ctrl+G")
         self._add_action(timeline_menu, "Expand Compound Clip", self.expand_compound_clip, "Ctrl+Shift+G")
@@ -643,6 +657,7 @@ class MainWindow(QMainWindow):
         self.properties.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
 
         self.preview.time_changed.connect(self._on_preview_time_changed)
+        self.preview.playing_changed.connect(lambda playing: playing or self.scopes_panel.schedule_refresh())
         self.preview.playing_changed.connect(self._on_playing_changed)
         self.preview.transform_edited.connect(self._apply_canvas_transform)
         self.preview.render_ranges_changed.connect(self.timeline.set_render_ranges)
@@ -1148,6 +1163,7 @@ class MainWindow(QMainWindow):
         # preview shows (not on every colour/opacity slider tick).
         self.preview.refresh_after_edit()
         self._update_time_status()
+        self.scopes_panel.schedule_refresh()
 
     def _on_timeline_playhead_changed(self, t: float) -> None:
         if self._syncing_playhead:
@@ -1158,6 +1174,7 @@ class MainWindow(QMainWindow):
         self.properties.set_playhead_time(t)
         self._update_time_status()
         self._refresh_transform_target()
+        self.scopes_panel.schedule_refresh()
 
     def _on_preview_time_changed(self, t: float) -> None:
         if self._syncing_playhead:
@@ -1167,6 +1184,7 @@ class MainWindow(QMainWindow):
         self._syncing_playhead = False
         self.properties.set_playhead_time(t)
         self._update_time_status()
+        self.scopes_panel.schedule_refresh()
 
     def _update_time_status(self) -> None:
         fps = self.project.settings.fps
