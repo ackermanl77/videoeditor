@@ -75,9 +75,13 @@ icon_path = os.path.join(root_dir, "assets", "icons", "app_icon.ico")
 # The Windows version resource is rendered from core.__version__ (the single
 # version source) instead of a hard-coded 1.0.0.0; version_info.txt is the template.
 sys.path.insert(0, os.path.join(root_dir, "scripts"))
-from version_info import write_version_file  # noqa: E402
+from version_info import write_manifest, write_version_file  # noqa: E402
 
 version_path = write_version_file(workpath)
+# K8: UTF-8 active code page + PerMonitorV2 manifest, and the .vproj document icon as the exe's
+# second icon group (installer/VideoEditor.iss's DefaultIcon is VideoEditor.exe,1).
+manifest_path = write_manifest(workpath)
+document_icon_path = os.path.join(root_dir, "assets", "icons", "vproj.ico")
 
 # Folder (onedir) build: dist/VideoEditor/VideoEditor.exe plus an _internal/
 # folder, installed by installer/VideoEditor.iss. The earlier one-file exe
@@ -104,8 +108,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_path if os.path.exists(icon_path) else None,
+    icon=[icon_path, document_icon_path] if os.path.exists(document_icon_path) else icon_path,
     version=version_path if os.path.exists(version_path) else None,
+    manifest=manifest_path,
 )
 
 coll = COLLECT(

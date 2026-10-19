@@ -24,7 +24,7 @@ VSVersionInfo(
         StringTable(
           u"040904B0",
           [
-            StringStruct(u"CompanyName", u"Open Video Editor Project"),
+            StringStruct(u"CompanyName", u"MELEJ"),
             StringStruct(u"FileDescription", u"Open Video Editor"),
             StringStruct(u"FileVersion", u"{version}"),
             StringStruct(u"InternalName", u"VideoEditor"),

@@ -82,6 +82,18 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Exe resources (2026-10-18, K8).**
+  - **Publisher:** one name, "MELEJ", in the version resource (`version_info.txt`) and the installer's
+    `AppPublisher`.
+  - **Manifest:** `scripts/version_info.py::write_manifest()` adds `activeCodePage` UTF-8 +
+    `dpiAwareness` PerMonitorV2 to PyInstaller's default.
+  - **Icons:** `scripts/make_icons.py` (a Pillow developer step; the .ico files are checked in)
+    regenerates `app_icon.ico` with 16-256 px including 20/24/40, and draws `vproj.ico`. It is the
+    exe's second icon group, and the installer's `.vproj` `DefaultIcon` is `VideoEditor.exe,1`.
+  - **Verified on a built `dist\VideoEditor\VideoEditor.exe`:** REA `inspect_pe_resources` shows
+    two 9-size icon groups and the manifest; the version info reads `MELEJ | Open Video Editor |
+    0.2.0.0`; `--self-test` passes (31 filters).
+
 - **Video scopes (2026-10-18, F24).** `core/scopes.py` passes the frame under the playhead
   (`render_frame`, the export engine's composite) through FFmpeg's `waveform` (luma),
   `waveform=display=parade` (on `gbrp`, panels R/G/B) and `vectorscope` (color3, colour-bar

@@ -40,6 +40,33 @@ class BuildLayoutTests(unittest.TestCase):
             if line.startswith("Root:"):
                 self.assertTrue(line.startswith("Root: HKCU;"), line)
 
+    def test_exe_resources_publisher_manifest_and_document_icon(self):
+        """K8: one publisher (MELEJ), a UTF-8 + PerMonitorV2 manifest, 24 px and .vproj icons."""
+        import struct
+        import xml.dom.minidom
+
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import version_info
+
+        self.assertIn('u"CompanyName", u"MELEJ"', _read("version_info.txt"))
+        self.assertIn("AppPublisher=MELEJ", _read("installer", "VideoEditor.iss"))
+        self.assertIn(r'\{#AppExe},1"', _read("installer", "VideoEditor.iss"))  # DefaultIcon: the 2nd icon group
+        spec = _read("build.spec")
+        self.assertIn("manifest=manifest_path", spec)
+        self.assertIn("icon=[icon_path, document_icon_path]", spec)
+        dom = xml.dom.minidom.parseString(version_info.MANIFEST_XML)
+        self.assertEqual(dom.getElementsByTagName("activeCodePage")[0].firstChild.data, "UTF-8")
+        self.assertEqual(dom.getElementsByTagName("dpiAwareness")[0].firstChild.data, "PerMonitorV2")
+
+        def ico_sizes(name):
+            with open(os.path.join(ROOT, "assets", "icons", name), "rb") as f:
+                data = f.read()
+            count = struct.unpack_from("<H", data, 4)[0]
+            return {data[6 + 16 * i] or 256 for i in range(count)}
+
+        self.assertTrue({16, 24, 32, 48, 256} <= ico_sizes("app_icon.ico"))
+        self.assertTrue({16, 24, 32, 48, 256} <= ico_sizes("vproj.ico"))
+
     def test_build_script_and_release_workflow_use_the_folder_and_installer(self):
         build = _read("build.py")
         self.assertIn("--installer", build)
