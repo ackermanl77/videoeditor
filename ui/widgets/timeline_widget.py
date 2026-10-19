@@ -1084,7 +1084,9 @@ class TimelineWidget(QWidget):
     # ------------------------------------------------------------------
     # Editing operations
     # ------------------------------------------------------------------
-    def add_media_to_timeline(self, asset: MediaAsset, track_id: Optional[str] = None, at_time: Optional[float] = None) -> None:
+    def add_media_to_timeline(self, asset: MediaAsset, track_id: Optional[str] = None, at_time: Optional[float] = None,
+                              source_range=None) -> None:
+        """`source_range` (in, out): a subclip's part of the file (F29); None = the whole file."""
         if self.project is None or self.history is None:
             return
 
@@ -1102,12 +1104,13 @@ class TimelineWidget(QWidget):
 
         start = at_time if at_time is not None else (track.duration if track is not None else 0.0)
         length = asset.duration if asset.duration > 0 else 5.0
+        source_in, source_out = source_range if source_range else (0.0, length)
 
         clip = Clip(
             media_type=media_type,
             source_path=asset.path,
-            source_in=0.0,
-            source_out=length,
+            source_in=source_in,
+            source_out=source_out,
             timeline_start=start,
             source_duration=asset.duration if asset.duration > 0 else None,
             asset_id=asset.id,
@@ -1122,14 +1125,18 @@ class TimelineWidget(QWidget):
         self._emit_modified()
 
     def handle_media_drop(self, asset_id: str, at_time: float, row: int) -> None:
+        """A Media Bin item dropped: a file, or a subclip ("sub:<id>", F29) -- its range only."""
         if self.project is None:
             return
-        asset = self.project.find_asset(asset_id)
+        from core.subclips import media_item
+
+        asset, source_in, source_out = media_item(self.project, asset_id)
         if asset is None:
             return
         kind = TrackType.AUDIO if (asset.has_audio and not asset.has_video) else TrackType.VIDEO
         target_track = self._track_for_row(row, kind) if self._row_tracks else None
-        self.add_media_to_timeline(asset, track_id=target_track.id if target_track else None, at_time=at_time)
+        self.add_media_to_timeline(asset, track_id=target_track.id if target_track else None, at_time=at_time,
+                                   source_range=(source_in, source_out) if source_out is not None else None)
 
     def add_text_clip(self, at_time: Optional[float] = None) -> Optional[str]:
         if self.project is None or self.history is None:
@@ -1339,9 +1346,12 @@ class TimelineWidget(QWidget):
         self.rebuild()
         self._emit_modified()
 
-    def _clip_for_asset(self, asset: MediaAsset, start: float) -> Clip:
+    def _clip_for_asset(self, asset: MediaAsset, start: float, source_range=None) -> Clip:
         media_type = MediaType.IMAGE if asset.is_image else (MediaType.VIDEO if asset.has_video else MediaType.AUDIO)
         length = asset.duration if asset.duration > 0 else 5.0
+        if source_range:  # a subclip (F29)
+            return Clip(media_type=media_type, source_path=asset.path, source_in=source_range[0], source_out=source_range[1],
+                        timeline_start=start, source_duration=asset.duration if asset.duration > 0 else None, asset_id=asset.id)
         source_in = 0.0
         # Match Frame (F28): the next Insert/Overwrite of the matched file starts at the matched frame.
         matched = getattr(self, "matched_source", None)
@@ -1403,11 +1413,11 @@ class TimelineWidget(QWidget):
             self.status_message.emit("Can't extend there: another clip is in the way, or there isn't enough media.")
         return ok
 
-    def insert_asset_at_playhead(self, asset: MediaAsset, overwrite: bool = False) -> bool:
+    def insert_asset_at_playhead(self, asset: MediaAsset, overwrite: bool = False, source_range=None) -> bool:
         """Insert (ripple every unlocked track) or overwrite media at the playhead on the selected/first track."""
         if self.project is None:
             return False
-        clip = self._clip_for_asset(asset, self.playhead_time)
+        clip = self._clip_for_asset(asset, self.playhead_time, source_range)
         kind = TrackType.AUDIO if clip.media_type == MediaType.AUDIO else TrackType.VIDEO
         track = self.project.find_track(self.selected_track_id) if self.selected_track_id else None
         if track is None or track.track_type != kind:

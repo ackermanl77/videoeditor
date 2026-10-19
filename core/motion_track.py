@@ -198,6 +198,36 @@ def _simplify(keyframes: List[Tuple[float, float, float]], tolerance: float) -> 
     return kept
 
 
+def mask_track_keyframes(points: Sequence[TrackPoint], clip: Clip, source_size: Tuple[int, int],
+                         canvas_size: Tuple[int, int], tolerance: float = SIMPLIFY_TOLERANCE) -> List[List[float]]:
+    """A tracked object as an effect mask's centre track (F32): ``[clip-local seconds, cx, cy]`` in
+    fractions of the frame the clip's effects run on -- its own frame, or for Fill Frame the canvas
+    crop of it (core.filter_graph._fit_or_fill)."""
+    from core.scene_detect import timeline_offset_for_source
+
+    sw, sh = source_size
+    cw, ch = canvas_size
+    src_aspect, canvas_aspect = sw / max(1, sh), cw / max(1, ch)
+    samples = []
+    for point in points:
+        local = timeline_offset_for_source(clip, point.source_time)
+        if local is None:
+            continue
+        x, y = point.x, point.y
+        if clip.reframe_mode == ReframeMode.FILL:
+            if src_aspect > canvas_aspect:
+                visible = canvas_aspect / src_aspect
+                x = (x - (1 - visible) * clip.crop_focus_x) / visible
+            else:
+                visible = src_aspect / canvas_aspect
+                y = (y - (1 - visible) * clip.crop_focus_y) / visible
+        samples.append((round(max(0.0, local), 4), round(x, 5), round(y, 5)))
+    samples.sort()
+    deduped = [s for i, s in enumerate(samples) if i == 0 or s[0] - samples[i - 1][0] > 1e-6]
+    simplified = _simplify(deduped, tolerance) if len(deduped) >= 2 else deduped
+    return [list(s) for s in simplified]
+
+
 def follow_keyframes(points: Sequence[TrackPoint], tracked: Clip, follower: Clip, source_size: Tuple[int, int],
                      canvas_size: Tuple[int, int], keep_offset: bool = True,
                      tolerance: float = SIMPLIFY_TOLERANCE) -> List[Tuple[float, float, float]]:

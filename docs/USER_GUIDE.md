@@ -167,6 +167,14 @@ durations. From here you can:
   track (video/image files go to a video track, audio-only files go to an
   audio track).
 
+**Subclips.** Select a clip on the timeline and choose **Edit > Make Subclip...** (Ctrl+U) to save
+part of its file as a named subclip:
+- **Range:** the clip's trimmed part, or only the part between the timeline's In and Out when they
+  are set.
+- **In the bin:** it appears under its file with a ✂. Drag it, double-click it, or use Insert (,) /
+  Overwrite (.) like any file, and you get just that part.
+- **Managing:** right-click to rename or delete it. Subclips are saved with the project.
+
 An empty bin shows its own instructions ("Drop video, audio, or image
 files here...") instead of looking like a blank, confusing rectangle.
 
@@ -629,6 +637,14 @@ the correction exposes; with it off, **Borders** chooses black edges or the
 previous frame's. The preview's **Accurate frame** shows the stabilized
 picture once an export has analysed the clip.
 
+**Tracked masks.** An effect limited to a mask (the effect's **Mask** settings) can follow a moving
+object:
+- Put the playhead on a frame showing it, click **Track Mask...** and draw a box around the object.
+- The clip's footage is tracked (the same tracking as Track Motion), and the mask's centre moves
+  with the object, for example to blur a face or brighten a moving subject.
+- Its shape, size, feather and invert stay editable. **Clear Track** makes it still again.
+- A tracked mask renders a little slower than a still one (about 60 frames a second at 1080p).
+
 **Animating effect settings**: settings with a **◆** button next to them
 (Color Correction's four values and Vignette's strength) can change over the
 clip. Set the value, put the playhead on the clip and click **◆** to add a
@@ -728,6 +744,21 @@ preview plays instead of the original; export always uses the original.
 **Media > Generate Proxies Automatically** does this for every imported file
 larger than 1080p, 10-bit or HDR. Proxies use the NVIDIA encoder when there is
 one.
+
+## Workspaces
+
+**Window > Workspaces** switches the whole layout at once:
+
+| Workspace | Key | Layout |
+|---|---|---|
+| Editing | Alt+Shift+1 | The default. |
+| Color | Alt+Shift+2 | Video Scopes open, Properties larger. |
+| Audio | Alt+Shift+3 | Audio Mixer open, timeline taller. |
+| Captions | Alt+Shift+4 | Markers open, timeline taller. |
+
+- Arrange the panels as you like and choose **Save Workspace As...** to keep that layout under a name.
+- **Delete Workspace** removes a saved one, and **Reset Current Workspace** puts the current one back.
+- The editor starts in the workspace you used last.
 
 ## Audio mixer
 
@@ -938,6 +969,8 @@ disabled and explained when GIF is selected.
 | Command search (find any menu command by name and run it) | Ctrl+K |
 | Show / hide the Video Scopes | Ctrl+Alt+S |
 | Show / hide the Audio Mixer | Ctrl+Alt+A |
+| Make Subclip | Ctrl+U |
+| Workspaces: Editing / Color / Audio / Captions | Alt+Shift+1 / 2 / 3 / 4 |
 | Lift / Extract (In to Out) | ; / ' |
 | Match Frame | F |
 | Add Edit to All Tracks | Shift+S |

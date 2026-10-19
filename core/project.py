@@ -230,6 +230,8 @@ class Project:
     tracks: List[Track] = field(default_factory=list)
     media_pool: List[MediaAsset] = field(default_factory=list)
     markers: List[Marker] = field(default_factory=list)
+    # Subclips (F29, core.subclips): named source In/Out ranges of media-pool files.
+    subclips: List[Any] = field(default_factory=list)
     # Imported ASS/SSA scripts' headers (everything but [Events]: script
     # info, styles, embedded fonts) by id; styled subtitle clips refer to one
     # through Clip.ass_event.script_id (see core.subtitles).
@@ -252,6 +254,7 @@ class Project:
 
     def remove_media_asset(self, asset_id: str) -> None:
         self.media_pool = [a for a in self.media_pool if a.id != asset_id]
+        self.subclips = [s for s in self.subclips if s.asset_id != asset_id]
 
     def find_asset(self, asset_id: str) -> Optional[MediaAsset]:
         for a in self.media_pool:
@@ -380,6 +383,7 @@ class Project:
             "tracks": tracks,
             "media_pool": media_pool,
             "markers": [m.to_dict() for m in self.markers],
+            **({"subclips": [s.to_dict() for s in self.subclips]} if self.subclips else {}),
             **({"subtitle_scripts": scripts} if (scripts := self._used_subtitle_scripts()) else {}),
         }
 
@@ -423,6 +427,16 @@ class Project:
             tracks.append(track)
         project.tracks = tracks or project.tracks
         project.markers = [Marker.from_dict(m) for m in data.get("markers", [])]
+        from core.subclips import Subclip  # added without a format bump: absent = none
+
+        for raw in data.get("subclips", []) if isinstance(data.get("subclips"), list) else []:
+            try:
+                subclip = Subclip.from_dict(raw)
+            except (KeyError, TypeError, ValueError):
+                warnings.append("Skipped a subclip this version can't read.")
+                continue
+            if project.find_asset(subclip.asset_id) is not None:
+                project.subclips.append(subclip)
         scripts = data.get("subtitle_scripts")  # added without a format bump
         if isinstance(scripts, dict):
             project.subtitle_scripts = {str(k): v for k, v in scripts.items() if isinstance(v, str)}

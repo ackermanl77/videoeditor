@@ -15,6 +15,13 @@ frame's aspect, cached as a PGM file, and in the filter graph scaled to the fram
 included, gets the mask -- a grey image converted to YUV would have neutral chroma and half-blend
 the colour), and the effect's output merged over the unaffected frame with ``maskedmerge``. Masks
 are static (not keyframed).
+
+Tracked masks (F32): ``mask["track"]`` is a list of ``[clip-local seconds, cx, cy]`` -- the centre
+following an object tracked in the clip's own footage (Edit the effect > Track Mask..., which runs
+the same FFmpeg find_rect tracking as Track Motion). Such a mask is drawn per frame instead, with
+FFmpeg's ``geq`` evaluating the shape around a centre that is a piecewise-linear expression of the
+stream time (``tracked_mask_expr``), on a quarter-size copy scaled back up (about 60 fps at 1080p
+instead of 5); everything else (feather, angle, invert, the merge) is the same.
 """
 from __future__ import annotations
 
@@ -47,7 +54,55 @@ def clean_mask(mask: Any) -> Optional[Dict[str, Any]]:
         except (TypeError, ValueError):
             pass
     clean["invert"] = bool(mask.get("invert", False))
+    track = clean_track(mask.get("track"))
+    if track:
+        clean["track"] = track
     return clean
+
+
+def clean_track(value: Any) -> list:
+    """A mask track: [[t, cx, cy], ...] sorted by time, 2+ entries, numbers only (else [])."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    for entry in value:
+        try:
+            t, cx, cy = (float(v) for v in entry)
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(v) for v in (t, cx, cy)) and t >= 0:
+            out.append([round(t, 4), round(min(max(cx, -0.5), 1.5), 5), round(min(max(cy, -0.5), 1.5), 5)])
+    out.sort(key=lambda k: k[0])
+    return out if len(out) >= 2 else []
+
+
+def tracked_mask_expr(mask: Dict[str, Any], t_var: str = "T") -> str:
+    """``geq`` luma expression (0..255) of `mask` with its centre following ``mask["track"]``.
+    The same geometry as mask_value(), in units of the frame's shorter side (from W/H)."""
+    from core.filter_graph import _piecewise_linear_expr
+
+    track = mask["track"]
+    cx = _piecewise_linear_expr([(t, x) for t, x, _y in track], t_var)
+    cy = _piecewise_linear_expr([(t, y) for t, _x, y in track], t_var)
+    sx, sy = "max(W/H,1)", "max(H/W,1)"
+    dx, dy = f"((X/W-({cx}))*{sx})", f"((Y/H-({cy}))*{sy})"
+    angle = math.radians(mask["angle"])
+    cos_a, sin_a = f"{math.cos(angle):.6f}", f"{math.sin(angle):.6f}"
+    feather = f"{max(mask['feather'], 1e-6):.6f}"
+    if mask["shape"] == "linear":
+        value = f"(0.5+({dx}*{cos_a}+{dy}*{sin_a})/{feather})"
+    else:
+        u, v = f"({dx}*{cos_a}+{dy}*{sin_a})", f"(-{dx}*{sin_a}+{dy}*{cos_a})"
+        hw, hh = f"max({mask['w']:.6f}*{sx}/2,0.000001)", f"max({mask['h']:.6f}*{sy}/2,0.000001)"
+        if mask["shape"] == "rectangle":
+            outside = f"max(abs({u})-{hw},abs({v})-{hh})"
+        else:
+            outside = f"((hypot({u}/{hw},{v}/{hh})-1)*min({hw},{hh}))"
+        value = f"(0.5-{outside}/{feather})"
+    value = f"clip({value},0,1)"
+    if mask["invert"]:
+        value = f"(1-{value})"
+    return f"255*{value}"
 
 
 def mask_value(mask: Dict[str, Any], nx: float, ny: float, aspect: float) -> float:
@@ -106,12 +161,26 @@ def mask_file(mask: Dict[str, Any], aspect: float) -> str:
     return path
 
 
-def masked_filter(effect_filter: str, mask: Dict[str, Any], aspect: float) -> str:
+def masked_filter(effect_filter: str, mask: Dict[str, Any], aspect: float, t_offset: float = 0.0) -> str:
     """Comma-prefixed filter text applying ``effect_filter`` only where ``mask`` covers the frame.
-    Inline labelled branches inside a chain: valid in -filter_complex and -vf alike."""
+    Inline labelled branches inside a chain: valid in -filter_complex and -vf alike. ``t_offset``:
+    the clip-local time of the stream's first frame (a speed ramp's later segments), for tracked masks."""
     from core.effects import _escape
 
     n = next(_labels)
+    if mask.get("track"):
+        t_var = "T" if abs(t_offset) < 1e-9 else f"(T+{t_offset:.6f})"
+        # The per-pixel geq runs on a copy a quarter of the size (16x fewer pixels; the mask is soft
+        # anyway) and is scaled back onto the frame with scale2ref, so the sizes always match.
+        return (
+            f",format=yuva420p,split=4[mb{n}][me{n}][mg{n}][mr{n}];"
+            f"[me{n}]{effect_filter},format=yuva420p[mf{n}];"
+            f"[mg{n}]scale=trunc(iw/8)*2:trunc(ih/8)*2,format=gray,geq=lum='{tracked_mask_expr(mask, t_var)}'[ms{n}];"
+            f"[ms{n}][mr{n}]scale2ref=flags=bilinear[m1{n}][mx{n}];[mx{n}]nullsink;"
+            f"[m1{n}]split=2[my0{n}][mh{n}];[mh{n}]scale=iw/2:ih/2,split=2[mu{n}][mv{n}];"
+            f"[my0{n}]split=2[my{n}][ma{n}];[my{n}][mu{n}][mv{n}][ma{n}]mergeplanes=0x00102030:yuva420p[mk{n}];"
+            f"[mb{n}][mf{n}][mk{n}]maskedmerge"
+        )
     path = _escape(mask_file(mask, aspect))
     return (
         f",format=yuva420p,split=2[mb{n}][me{n}];"

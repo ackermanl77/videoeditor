@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -190,6 +191,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._warm_encoder_probes, name="encoder-probe", daemon=True).start()
 
         self._restore_window_state()
+        self._restore_workspace_choice()
 
         # Deferred so the window is fully shown before a possible recovery dialog pops up.
         QTimer.singleShot(0, self._offer_autosave_recovery)
@@ -355,6 +357,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "Lift (In to Out)", self.timeline.lift_in_out, ";")
         self._add_action(edit_menu, "Extract (In to Out)", self.timeline.extract_in_out, "'")
         self._add_action(edit_menu, "Match Frame", self.match_frame, "F")
+        self._add_action(edit_menu, "Make Subclip...", self.make_subclip, "Ctrl+U")
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
         self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
@@ -390,11 +393,87 @@ class MainWindow(QMainWindow):
         self.auto_proxy_action.setChecked(self._auto_proxies_enabled())
         self._add_action(media_menu, "Cancel Import", self.cancel_import)
 
+        window_menu = menu_bar.addMenu("&Window")
+        self.workspaces_menu = window_menu.addMenu("Workspaces")
+        self._refresh_workspaces_menu()
+        window_menu.addSeparator()
+        window_menu.addAction(self.scopes_action)
+        window_menu.addAction(self.mixer_action)
+        window_menu.addAction(self.markers_action)
+        window_menu.addAction(self.render_queue_action)
+
         help_menu = menu_bar.addMenu("&Help")
         self._add_action(help_menu, "Command Search...", self.show_command_palette, "Ctrl+K")
         self._add_action(help_menu, "Keyboard Shortcuts", self.show_shortcuts, "F1")
         self._add_action(help_menu, "User Guide", self.show_user_guide)
         self._add_action(help_menu, "About", self.show_about)
+
+    # ------------------------------------------------------------------
+    # Workspaces (F30)
+    # ------------------------------------------------------------------
+    def _refresh_workspaces_menu(self) -> None:
+        from ui import workspaces
+
+        if not hasattr(self, "current_workspace"):
+            self.current_workspace = "Editing"
+
+        menu = self.workspaces_menu
+        menu.clear()
+        self.workspace_actions = {}
+        for index, name in enumerate(workspaces.BUILT_IN, 1):
+            action = self._add_action(menu, name, lambda checked=False, n=name: self.apply_workspace(n), f"Alt+Shift+{index}")
+            self.workspace_actions[name] = action
+        saved = workspaces.saved_names()
+        if saved:
+            menu.addSeparator()
+            for name in saved:
+                self.workspace_actions[name] = self._add_action(menu, name, lambda checked=False, n=name: self.apply_workspace(n))
+        menu.addSeparator()
+        self._add_action(menu, "Save Workspace As...", self.save_workspace_as)
+        delete_menu = menu.addMenu("Delete Workspace")
+        delete_menu.setEnabled(bool(saved))
+        for name in saved:
+            self._add_action(delete_menu, name, lambda checked=False, n=name: self.delete_workspace(n))
+        self._add_action(menu, "Reset Current Workspace", lambda: self.apply_workspace(self.current_workspace))
+        for name, action in self.workspace_actions.items():
+            action.setCheckable(True)
+            action.setChecked(name == getattr(self, "current_workspace", "Editing"))
+
+    def apply_workspace(self, name: str) -> bool:
+        from ui import workspaces
+
+        if not workspaces.apply(self, name):
+            self.status_bar.showMessage(f"No workspace named {name}.", 4000)
+            return False
+        self.current_workspace = name
+        for key, action in getattr(self, "workspace_actions", {}).items():
+            action.setChecked(key == name)
+        self.status_bar.showMessage(f"Workspace: {name}", 2500)
+        return True
+
+    def save_workspace_as(self, name: Optional[str] = None) -> bool:
+        from ui import workspaces
+
+        if name is None:
+            name, ok = QInputDialog.getText(self, "Save Workspace", "Workspace name:", text=f"My Workspace {len(workspaces.saved_names()) + 1}")
+            if not ok:
+                return False
+        name = name.strip().replace("/", "-")
+        if not name or name in workspaces.BUILT_IN:
+            self.status_bar.showMessage("Choose a name that isn't one of the built-in workspaces.", 4000)
+            return False
+        workspaces.save_current(self, name)
+        self.current_workspace = name
+        self._refresh_workspaces_menu()
+        return True
+
+    def delete_workspace(self, name: str) -> None:
+        from ui import workspaces
+
+        workspaces.delete_saved(name)
+        if self.current_workspace == name:
+            self.current_workspace = "Editing"
+        self._refresh_workspaces_menu()
 
     def show_command_palette(self) -> None:
         """Ctrl+K (F27): search every menu action by name and run it."""
@@ -659,6 +738,8 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.media_bin.import_requested.connect(self.import_media_paths)
         self.media_bin.add_to_timeline_requested.connect(self._add_asset_to_timeline_end)
+        self.media_bin.subclip_rename_requested.connect(self._rename_subclip)
+        self.media_bin.subclip_delete_requested.connect(self._delete_subclip)
         self.media_bin.proxy_requested.connect(self.generate_proxy_for)
         self.media_bin.relink_requested.connect(self.open_relink_dialog)
         self.timeline.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
@@ -672,6 +753,7 @@ class MainWindow(QMainWindow):
         self.timeline.get_waveform_for_clip = self._waveform_for_clip
 
         self.properties.project_modified.connect(self._on_project_modified)
+        self.properties.track_mask_requested.connect(lambda row: self.track_effect_mask(row))
         self.properties.clip_changed.connect(self.timeline.refresh_clip)
         self.properties.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
 
@@ -690,7 +772,7 @@ class MainWindow(QMainWindow):
         self.timeline.get_thumbnail_for_clip = self._thumbnail_for_clip
         self.timeline.get_filmstrip_for_clip = self._filmstrip_for_clip
         self.timeline.get_waveform_for_clip = self._waveform_for_clip
-        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self._refresh_media_bin()
         self.history.clear()
         self.history.mark_clean()
         self.measure_decoders_for([a.path for a in self.project.media_pool if a.has_video and not a.is_image])
@@ -994,7 +1076,7 @@ class MainWindow(QMainWindow):
     def _on_asset_imported(self, asset: MediaAsset) -> None:
         self.project.add_media_asset(asset)
         self.import_progress.setValue(self.import_progress.value() + 1)
-        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self._refresh_media_bin()
         self._mark_dirty()
         if self._auto_proxies_enabled() and needs_proxy(asset):
             self.generate_proxy_for(asset.id)
@@ -1012,7 +1094,7 @@ class MainWindow(QMainWindow):
         self._thumb_pixmap_cache.pop(asset_id, None)
         self._filmstrip_pixmap_cache.pop(asset_id, None)
         self._waveform_cache.pop(asset_id, None)
-        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self._refresh_media_bin()
         self.timeline.rebuild()
 
     def _on_import_failed(self, path: str, message: str) -> None:
@@ -1035,9 +1117,11 @@ class MainWindow(QMainWindow):
             self._import_errors = []
 
     def _add_asset_to_timeline_end(self, asset_id: str) -> None:
-        asset = self.project.find_asset(asset_id)
+        from core.subclips import media_item
+
+        asset, source_in, source_out = media_item(self.project, asset_id)
         if asset is not None:
-            self.timeline.add_media_to_timeline(asset)
+            self.timeline.add_media_to_timeline(asset, source_range=(source_in, source_out) if source_out is not None else None)
 
     def _thumbnail_for_asset(self, asset: MediaAsset) -> Optional[QPixmap]:
         if asset.id in self._thumb_pixmap_cache:
@@ -1075,12 +1159,66 @@ class MainWindow(QMainWindow):
         return data
 
     def _place_selected_asset(self, overwrite: bool) -> None:
+        from core.subclips import media_item
+
         asset_id = self.media_bin.selected_asset_id()
-        asset = self.project.find_asset(asset_id) if asset_id else None
+        asset, source_in, source_out = media_item(self.project, asset_id) if asset_id else (None, 0.0, None)
         if asset is None:
             self.status_bar.showMessage("Select a file in the Media Bin first.", 4000)
             return
-        self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite)
+        self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite,
+                                               source_range=(source_in, source_out) if source_out is not None else None)
+
+    def _refresh_media_bin(self) -> None:
+        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset, self.project.subclips)
+
+    def make_subclip(self, name: Optional[str] = None) -> bool:
+        """Edit > Make Subclip (F29): the selected clip's source range -- or the part of it inside the
+        timeline's In/Out -- as a named subclip in the Media Bin. ``name`` skips the dialog (tests)."""
+        from core.subclips import AddSubclipCommand, Subclip, subclip_range
+
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        asset = self.project.asset_for_clip(clip) if clip is not None else None
+        if clip is None or asset is None or asset.is_image:
+            self.status_bar.showMessage("Select a video or audio clip on the timeline first.", 4000)
+            return False
+        span = subclip_range(clip, self.timeline.in_point, self.timeline.out_point)
+        if span is None:
+            self.status_bar.showMessage("The In/Out range doesn't cover enough of the selected clip.", 4000)
+            return False
+        if name is None:
+            default = f"{asset.display_name} {sum(1 for s in self.project.subclips if s.asset_id == asset.id) + 1}"
+            name, ok = QInputDialog.getText(self, "Make Subclip", "Subclip name:", text=default)
+            if not ok:
+                return False
+        subclip = Subclip(asset.id, span[0], span[1], name.strip() or "Subclip")
+        self.history.execute(AddSubclipCommand(self.project, subclip))
+        self._refresh_media_bin()
+        self._reveal_asset(subclip.item_id)
+        self._on_project_modified()
+        self.status_bar.showMessage(f"Subclip {subclip.name}: {span[0]:.2f}–{span[1]:.2f} s of {asset.display_name}", 5000)
+        return True
+
+    def _rename_subclip(self, item_id: str) -> None:
+        from core.subclips import RenameSubclipCommand, find_subclip
+
+        subclip = find_subclip(self.project, item_id)
+        if subclip is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Subclip", "Subclip name:", text=subclip.name)
+        if ok and name.strip():
+            self.history.execute(RenameSubclipCommand(self.project, subclip.id, name.strip()))
+            self._refresh_media_bin()
+            self._on_project_modified()
+
+    def _delete_subclip(self, item_id: str) -> None:
+        from core.subclips import RemoveSubclipCommand, find_subclip
+
+        subclip = find_subclip(self.project, item_id)
+        if subclip is not None:
+            self.history.execute(RemoveSubclipCommand(self.project, subclip.id))
+            self._refresh_media_bin()
+            self._on_project_modified()
 
     def match_frame(self) -> bool:
         """Match Frame (F28): find the source of the frame at the playhead -- select its file in the
@@ -1154,7 +1292,7 @@ class MainWindow(QMainWindow):
             asset.proxy_path = path
             self._mark_dirty()
             self.status_bar.showMessage(f"Preview proxy ready: {asset.display_name}", 4000)
-            self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+            self._refresh_media_bin()
             self.preview.refresh_after_edit()
         else:
             self.status_bar.showMessage(f"Couldn't create a proxy for {asset.display_name}.", 6000)
@@ -1251,6 +1389,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def undo(self) -> None:
         label = self.history.undo()
+        self._refresh_media_bin()
         self.timeline.rebuild()
         self.properties.set_selected_clip(self.timeline.selected_clip_id)
         self._on_project_modified()
@@ -1259,6 +1398,7 @@ class MainWindow(QMainWindow):
 
     def redo(self) -> None:
         label = self.history.redo()
+        self._refresh_media_bin()
         self.timeline.rebuild()
         self.properties.set_selected_clip(self.timeline.selected_clip_id)
         self._on_project_modified()
@@ -1446,7 +1586,7 @@ class MainWindow(QMainWindow):
         self._thumb_pixmap_cache.clear()
         self._filmstrip_pixmap_cache.clear()
         self._waveform_cache.clear()
-        self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset)
+        self._refresh_media_bin()
         self.timeline._layout_key = None
         self.timeline.rebuild()
         self.preview.refresh_after_edit()
@@ -1551,6 +1691,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Window / layout persistence
     # ------------------------------------------------------------------
+    def _restore_workspace_choice(self) -> None:
+        from ui import workspaces
+
+        self.current_workspace = workspaces.current()
+        if self.current_workspace != "Editing" and not workspaces.apply(self, self.current_workspace):
+            self.current_workspace = "Editing"
+        self._refresh_workspaces_menu()
+
     def _restore_window_state(self) -> None:
         """Restore window size/position and panel proportions from the last session.
 
@@ -1890,6 +2038,93 @@ class MainWindow(QMainWindow):
         ok = self.timeline._execute_and_select(command, False)
         self.properties.set_selected_clip(follower.id)
         self.statusBar().showMessage(f"Tracked the object: {len(keyframes)} position keyframes.", 5000)
+        return ok
+
+    def track_effect_mask(self, row: int, box: Optional[Tuple[float, float, float, float]] = None) -> bool:
+        """Effect > Track Mask (F32): track an object in the selected clip's own footage and make the
+        effect's mask centre follow it -- one undo step. ``box`` (fractions of the frame) skips the dialog."""
+        from PySide6.QtWidgets import QProgressDialog
+
+        from core.effect_masks import clean_mask
+        from core.motion_track import TRACK_WIDTH, TrackingCancelled, mask_track_keyframes, track_object
+
+        title = "Track Mask"
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        if clip is None or clip.media_type != MediaType.VIDEO or not (0 <= row < len(clip.effects)):
+            QMessageBox.information(self, title, "Select a video clip and one of its effects with a mask.")
+            return False
+        mask = clean_mask(clip.effects[row].mask)
+        asset = self.project.asset_for_clip(clip)
+        if mask is None:
+            QMessageBox.information(self, title, "Give the effect a mask shape first (rectangle, ellipse or gradient).")
+            return False
+        if asset is None or not asset.width or not asset.height:
+            QMessageBox.information(self, title, "The clip's video size is unknown (is its file offline?).")
+            return False
+        local = min(max(0.0, self.timeline.playhead_time - clip.timeline_start), clip.playable_duration)
+        frame_time = clip.source_time_at(local)
+        if box is None:
+            import subprocess
+            import tempfile
+
+            from ui.motion_track_dialog import MotionTrackDialog
+
+            handle, png = tempfile.mkstemp(prefix="ve_track_frame_", suffix=".png")
+            os.close(handle)
+            try:
+                subprocess.run([find_binary("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-ss", f"{frame_time:.3f}",
+                                "-i", clip.source_path, "-frames:v", "1", "-vf", f"scale={TRACK_WIDTH}:-2", png],
+                               capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                image = QImage(png)
+            finally:
+                try:
+                    os.remove(png)
+                except OSError:
+                    pass
+            if image.isNull():
+                QMessageBox.warning(self, title, "The frame under the playhead couldn't be read.")
+                return False
+            dialog = MotionTrackDialog(image, clip.name, "the mask", self)
+            dialog.setWindowTitle(title)
+            dialog.keep_offset.setVisible(False)
+            if dialog.exec() != dialog.DialogCode.Accepted or dialog.picker.box() is None:
+                return False
+            box = dialog.picker.box()
+        progress = QProgressDialog("Tracking the object…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+        source_size = (asset.width, asset.height)
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    result["points"] = track_object(clip.source_path, clip.source_in, clip.source_out, frame_time, box,
+                                                    source_size, should_cancel=progress.wasCanceled)
+                except TrackingCancelled:
+                    result["cancelled"] = True
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if result.get("cancelled"):
+            return False
+        if "error" in result:
+            QMessageBox.warning(self, title, "The object couldn't be tracked:\n" + result["error"])
+            return False
+        track = mask_track_keyframes(result.get("points", []), clip, source_size,
+                                     (self.project.settings.width, self.project.settings.height))
+        if len(track) < 2:
+            QMessageBox.information(self, title, "The object wasn't found in enough frames. Try a box with more detail.")
+            return False
+        ok = self.properties.set_effect_mask(row, {**mask, "track": track})
+        self.properties.set_selected_clip(clip.id)
+        self.statusBar().showMessage(f"The mask now follows the object: {len(track)} keyframes.", 5000)
         return ok
 
     def export_frame_dialog(self, path: str | None = None) -> str | None:

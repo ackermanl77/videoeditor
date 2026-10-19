@@ -82,6 +82,8 @@ class MediaBinWidget(QWidget):
     add_to_timeline_requested = Signal(str)  # asset id, append to a default track
     proxy_requested = Signal(str)  # asset id -> generate a preview proxy
     relink_requested = Signal()  # open File > Relink Media
+    subclip_rename_requested = Signal(str)  # "sub:<id>"
+    subclip_delete_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -143,6 +145,15 @@ class MediaBinWidget(QWidget):
             return
         asset_id = str(item.data(Qt.UserRole))
         menu = QMenu(self)
+        if asset_id.startswith("sub:"):
+            rename_action = menu.addAction("Rename Subclip...")
+            delete_action = menu.addAction("Delete Subclip")
+            chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+            if chosen == rename_action:
+                self.subclip_rename_requested.emit(asset_id)
+            elif chosen == delete_action:
+                self.subclip_delete_requested.emit(asset_id)
+            return
         proxy_action = menu.addAction("Generate Preview Proxy")
         relink_action = menu.addAction("Relink Media...")
         chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
@@ -167,9 +178,14 @@ class MediaBinWidget(QWidget):
         return f"{asset.display_name}\n{MediaBinWidget._format_duration(asset.duration)}{suffix}"
 
     # ------------------------------------------------------------------
-    def set_assets(self, assets: List[MediaAsset], thumbnail_provider: Optional[Callable[[MediaAsset], Optional[QPixmap]]] = None) -> None:
+    def set_assets(self, assets: List[MediaAsset], thumbnail_provider: Optional[Callable[[MediaAsset], Optional[QPixmap]]] = None,
+                   subclips=None) -> None:
+        """The pool's files, each followed by its subclips (F29), indented with a ✂."""
         self._assets = assets
         self.list_widget.clear()
+        by_asset: dict = {}
+        for subclip in subclips or []:
+            by_asset.setdefault(subclip.asset_id, []).append(subclip)
         for asset in assets:
             item = QListWidgetItem(self.asset_label(asset))
             item.setData(Qt.UserRole, asset.id)
@@ -184,11 +200,20 @@ class MediaBinWidget(QWidget):
             if pixmap is not None and not pixmap.isNull():
                 item.setIcon(QIcon(pixmap))
             self.list_widget.addItem(item)
+            for subclip in by_asset.get(asset.id, []):
+                sub_item = QListWidgetItem(
+                    f"    ✂ {subclip.name}\n    {self._format_duration(subclip.source_in)}–{self._format_duration(subclip.source_out)}"
+                    f" ({subclip.duration:.1f} s)")
+                sub_item.setData(Qt.UserRole, subclip.item_id)
+                sub_item.setToolTip(f"Subclip of {asset.display_name}: {subclip.source_in:.2f}–{subclip.source_out:.2f} s")
+                if pixmap is not None and not pixmap.isNull():
+                    sub_item.setIcon(QIcon(pixmap))
+                self.list_widget.addItem(sub_item)
         self.hint_label.setVisible(bool(assets))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
-        if seconds <= 0:
+        if seconds < 0:
             return "--:--"
         minutes = int(seconds // 60)
         secs = int(seconds % 60)

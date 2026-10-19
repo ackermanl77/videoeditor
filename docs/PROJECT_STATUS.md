@@ -82,6 +82,30 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Subclips, workspaces, tracked masks (2026-10-19, F29/F30/F32).**
+  - **F29:** `core/subclips.py` (`Subclip`, `Project.subclips` saved without a format bump, undoable
+    add/rename/remove).
+    - `subclip_range()` takes the selected clip's source range, or the part inside the timeline
+      In/Out (speed and reverse respected).
+    - Media Bin items `"sub:<id>"` are listed under their file; `media_item()` resolves them for
+      drag, double-click and Insert/Overwrite.
+    - Edit > Make Subclip (Ctrl+U).
+  - **F30:** `ui/workspaces.py`.
+    - **Built-in workspaces:** Editing / Color / Audio / Captions, which set dock visibility and
+      splitter proportions, on Window > Workspaces (Alt+Shift+1-4).
+    - **Saved workspaces:** `saveState` + splitter states in QSettings, with delete and reset. The
+      last workspace is restored at start.
+  - **F32:** `EffectInstance.mask["track"]` = `[[clip-local s, cx, cy], ...]`.
+    - **Rendering:** a tracked mask is drawn by `geq` (`tracked_mask_expr`: the static shape maths
+      around a piecewise-linear centre) on a quarter-size copy scaled back with `scale2ref`. That
+      measured 63 fps at 1080p, against 4.9 at full size.
+    - **Conversion:** `motion_track.mask_track_keyframes` maps find_rect points into the effect's
+      frame, including the Fill Frame crop, and clip time.
+    - **UI:** the mask editor's Track Mask... / Clear Track run `MainWindow.track_effect_mask`, one
+      undo step.
+  - **Tests:** `tests/test_subclips.py`, `tests/test_workspaces.py` (QSettings in a temp ini) and
+    `tests/test_tracked_masks.py` (a real render whose brightened area moves with the track).
+
 - **Premiere-style commands, audio mixer, word captions (2026-10-19, F28/F31/F33).**
   - **F28:** `core/edit_ops.py` builders:
     - `build_lift_command` (split at In and Out on every unlocked track, remove what's inside);

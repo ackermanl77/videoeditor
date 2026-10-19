@@ -411,7 +411,7 @@ def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 
             if mask is not None and effect.spec.stage != "source":
                 from core.effect_masks import masked_filter
 
-                out += masked_filter(effect.filter(t_var, easing=easing), mask, aspect)
+                out += masked_filter(effect.filter(t_var, easing=easing), mask, aspect, t_offset)
             else:
                 out += "," + effect.filter(t_var, easing=easing)
     return out

@@ -130,6 +130,7 @@ class PropertiesPanel(QWidget):
     clip_changed = Signal(str)
     # One-line user feedback, e.g. why an edit was refused (-> status bar).
     status_message = Signal(str)
+    track_mask_requested = Signal(int)  # effect row (F32): the main window runs the tracking
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1144,6 +1145,10 @@ class PropertiesPanel(QWidget):
         self._commit_effects(effects, "Edit Effect Mask", row)
         return True
 
+    def _current_effect_mask(self, row: int):
+        clip = self._current_clip()
+        return clip.effects[row].mask if clip is not None and 0 <= row < len(clip.effects) else None
+
     def _mask_editor(self, row: int, effect) -> QWidget:
         """Shape, centre, size, angle, feather and invert for the effect's mask."""
         from core.effect_masks import DEFAULT_MASK, MASK_SHAPES, clean_mask
@@ -1177,11 +1182,42 @@ class PropertiesPanel(QWidget):
         invert.setChecked(current["invert"])
         form.addRow("", invert)
 
+        # Tracked masks (F32): the centre follows an object; editing the other fields keeps the track.
+        track_row = QHBoxLayout()
+        track_label = QLabel("")
+        track_label.setStyleSheet("color: #9aa1ad;")
+        track_btn = QPushButton("Track Mask...")
+        track_btn.setToolTip("Draw a box around an object in this clip: the mask's centre follows it (FFmpeg motion tracking).")
+        track_btn.clicked.connect(lambda: self.track_mask_requested.emit(row))
+        clear_track_btn = QPushButton("Clear Track")
+        track_row.addWidget(track_btn)
+        track_row.addWidget(clear_track_btn)
+        track_row.addWidget(track_label, 1)
+        form.addRow("Follow", track_row)
+
+        def refresh_track_label():
+            track = (clean_mask(self._current_effect_mask(row)) or {}).get("track") or []
+            track_label.setText(f"follows an object ({len(track)} keys)" if track else "")
+            clear_track_btn.setEnabled(bool(track))
+
         def commit(*_args):
             chosen = shape.currentData()
             mask = None if chosen == "none" else {"shape": chosen, "invert": invert.isChecked(),
                                                   **{key: spin.value() / scale for key, (spin, scale) in fields.items()}}
+            existing = clean_mask(self._current_effect_mask(row)) or {}
+            if mask is not None and existing.get("track"):
+                mask["track"] = existing["track"]
             self.set_effect_mask(row, mask)
+
+        def clear_track():
+            existing = clean_mask(self._current_effect_mask(row))
+            if existing and existing.get("track"):
+                existing.pop("track")
+                self.set_effect_mask(row, existing)
+                refresh_track_label()
+
+        clear_track_btn.clicked.connect(clear_track)
+        refresh_track_label()
 
         def refresh_enabled():
             on = shape.currentData() != "none"
@@ -1189,13 +1225,15 @@ class PropertiesPanel(QWidget):
             for key, (spin, _scale) in fields.items():
                 spin.setEnabled(on and (sized or key not in ("w", "h")))
             invert.setEnabled(on)
+            track_btn.setEnabled(on)
 
         shape.currentIndexChanged.connect(lambda _i: (refresh_enabled(), commit()))
         for spin, _scale in fields.values():
             spin.editingFinished.connect(commit)
         invert.toggled.connect(commit)
         refresh_enabled()
-        box.mask_controls = {"shape": shape, "invert": invert, **{key: spin for key, (spin, _s) in fields.items()}}
+        box.mask_controls = {"shape": shape, "invert": invert, "track": track_btn, "clear_track": clear_track_btn,
+                             "track_label": track_label, **{key: spin for key, (spin, _s) in fields.items()}}
         return box
 
     def _on_effect_row_changed(self, row: int) -> None:
