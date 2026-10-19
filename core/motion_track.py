@@ -177,7 +177,7 @@ def frame_to_canvas(clip: Clip, local_time: float, nx: float, ny: float, source_
     src_aspect, canvas_aspect = sw / max(1, sh), cw / max(1, ch)
     fit_w, fit_h = (1.0, canvas_aspect / src_aspect) if src_aspect >= canvas_aspect else (src_aspect / canvas_aspect, 1.0)
     if len(clip.position_keyframes) >= 2:
-        cx, cy = interpolate_keyframes(clip.position_keyframes, local_time)
+        cx, cy = interpolate_keyframes(clip.position_keyframes, local_time, clip.easing_for("position"))
     else:
         cx, cy = clip.transform_x, clip.transform_y
     scale = clip.transform_scale if clip.transform_scale > 0 else 1.0

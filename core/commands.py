@@ -197,11 +197,11 @@ class SplitClipCommand(Command):
         # start, with a keyframe added exactly at the cut so the animated
         # value (or speed) in effect there carries on unchanged.
         tail_timeline = clip.duration + clip_freeze - offset_in_timeline
-        second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline)
-        second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline)
-        second.volume_keyframes = _keyframes_after(clip.volume_keyframes, offset_in_timeline, tail_timeline)
+        second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("opacity"))
+        second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("position"))
+        second.volume_keyframes = _keyframes_after(clip.volume_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("volume"))
         second.effects = [
-            e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline))
+            e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline, clip.easing_for("effects")))
             for e in clip.effects
         ]
         keys_before = _speed_keyframes_before(clip.speed_keyframes, offset_in_source, clip.speed_ramp_smooth)
@@ -218,11 +218,11 @@ class SplitClipCommand(Command):
             first_speed_keyframes = keys_before
             clip.source_out = cut
         clip.fade_out = 0.0
-        clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline)
-        clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline)
-        clip.volume_keyframes = _keyframes_before(clip.volume_keyframes, offset_in_timeline)
+        clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline, clip.easing_for("opacity"))
+        clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline, clip.easing_for("position"))
+        clip.volume_keyframes = _keyframes_before(clip.volume_keyframes, offset_in_timeline, clip.easing_for("volume"))
         clip.effects = [
-            e.with_keyframes_mapped(lambda keys: _keyframes_before(keys, offset_in_timeline)) for e in clip.effects
+            e.with_keyframes_mapped(lambda keys: _keyframes_before(keys, offset_in_timeline, clip.easing_for("effects"))) for e in clip.effects
         ]
         _apply_speed_keyframes(clip, first_speed_keyframes)
 
@@ -253,7 +253,7 @@ def _source_offset_at(clip: Clip, timeline_offset: float) -> float:
 _interpolate_keyframes = interpolate_keyframes
 
 
-def _keyframes_before(keyframes, cut: float):
+def _keyframes_before(keyframes, cut: float, easing: str = "linear"):
     """First half's opacity/position keyframes: those before ``cut``, plus one at ``cut``.
 
     Fewer than 2 keyframes means "not animated" (the scalar field applies),
@@ -263,18 +263,18 @@ def _keyframes_before(keyframes, cut: float):
     """
     if len(keyframes) < 2:
         return list(keyframes)
-    value = _interpolate_keyframes(keyframes, cut)
+    value = _interpolate_keyframes(keyframes, cut, easing)
     kept = [tuple(k) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] < cut - _KF_EPS]
     if not kept:
         kept = [(0.0, *value)]
     return kept + [(cut, *value)]
 
 
-def _keyframes_after(keyframes, cut: float, tail: float):
+def _keyframes_after(keyframes, cut: float, tail: float, easing: str = "linear"):
     """Second half's opacity/position keyframes, re-based so ``cut`` becomes 0."""
     if len(keyframes) < 2:
         return list(keyframes)
-    value = _interpolate_keyframes(keyframes, cut)
+    value = _interpolate_keyframes(keyframes, cut, easing)
     kept = [(k[0] - cut, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > cut + _KF_EPS]
     if not kept:
         kept = [(max(tail, _KF_EPS), *value)]

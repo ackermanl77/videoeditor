@@ -164,16 +164,45 @@ class AssEvent:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
-def interpolate_keyframes(keyframes, t: float) -> Tuple[float, ...]:
-    """Value(s) at ``t`` under the export's piecewise-linear, hold-at-ends semantics."""
+# Keyframe easing (F25): how a keyframed property moves between two keyframes -- one choice per
+# property (Clip.keyframe_easing), applied to every gap of its curve, in the export's FFmpeg
+# expressions (core.filter_graph._piecewise_linear_expr) and here alike.
+EASINGS = ("linear", "ease_in", "ease_out", "ease_in_out", "hold")
+EASING_LABELS = {"linear": "Linear", "ease_in": "Ease In", "ease_out": "Ease Out", "ease_in_out": "Ease In-Out", "hold": "Hold"}
+EASING_TARGETS = ("opacity", "position", "volume", "effects")
+
+
+def ease(fraction: float, easing: str = "linear") -> float:
+    """``fraction`` (0..1 of a keyframe gap) through ``easing``: quadratic in/out, smoothstep in-out,
+    or hold (the first keyframe's value until the next keyframe)."""
+    if easing == "ease_in":
+        return fraction * fraction
+    if easing == "ease_out":
+        return fraction * (2.0 - fraction)
+    if easing == "ease_in_out":
+        return fraction * fraction * (3.0 - 2.0 * fraction)
+    if easing == "hold":
+        return 0.0
+    return fraction
+
+
+def interpolate_keyframes(keyframes, t: float, easing: str = "linear") -> Tuple[float, ...]:
+    """Value(s) at ``t`` under the export's piecewise, hold-at-ends semantics (``easing``: see EASINGS)."""
     kfs = sorted(keyframes, key=lambda k: k[0])
     if t <= kfs[0][0]:
         return tuple(kfs[0][1:])
     for (t0, *v0), (t1, *v1) in zip(kfs, kfs[1:]):
         if t < t1:
-            frac = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+            frac = ease((t - t0) / (t1 - t0), easing) if t1 > t0 else 1.0
             return tuple(a + (b - a) * frac for a, b in zip(v0, v1))
     return tuple(kfs[-1][1:])
+
+
+def clean_easing(value: Any) -> Dict[str, str]:
+    """A project file's keyframe_easing made safe: known targets and easings only, linear left out."""
+    if not isinstance(value, dict):
+        return {}
+    return {target: easing for target, easing in value.items() if target in EASING_TARGETS and easing in EASINGS and easing != "linear"}
 
 
 def _step_value(keyframes, t: float) -> Tuple[float, ...]:
@@ -219,6 +248,18 @@ def _smooth_ramp_segments(start: float, end: float, speed_from: float,
     return segments
 
 
+def _audio_effects_to_dict(clip) -> dict:
+    from core.audio_effects import to_dict
+
+    return to_dict(clip)
+
+
+def _audio_effects_from_dict(data: dict) -> dict:
+    from core.audio_effects import from_dict
+
+    return from_dict(data)
+
+
 def _non_negative(value: Any) -> float:
     """A saved float that must be >= 0 (a bad or negative value becomes 0)."""
     try:
@@ -227,7 +268,7 @@ def _non_negative(value: Any) -> float:
         return 0.0
 
 
-def _rebase_keyframes(keyframes, shift: float, step: bool = False) -> list:
+def _rebase_keyframes(keyframes, shift: float, step: bool = False, easing: str = "linear") -> list:
     """Keyframes re-based so time ``shift`` becomes 0 (fewer than 2 = not animated: unchanged).
 
     A positive shift (content cut from the front) drops the keyframes before
@@ -238,7 +279,7 @@ def _rebase_keyframes(keyframes, shift: float, step: bool = False) -> list:
         return list(keyframes)
     if shift <= 0:
         return [(k[0] - shift, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0])]
-    value = _step_value(keyframes, shift) if step else interpolate_keyframes(keyframes, shift)
+    value = _step_value(keyframes, shift) if step else interpolate_keyframes(keyframes, shift, easing)
     kept = [(k[0] - shift, *k[1:]) for k in sorted(keyframes, key=lambda k: k[0]) if k[0] > shift + 1e-6]
     rebased = [(0.0, *value)] + kept
     if len(rebased) < 2:  # the cut is past the last keyframe: hold its value
@@ -277,6 +318,26 @@ class Clip:
     # option, in decibels, 0.01..97 per FFmpeg's own accepted range.
     denoise_enabled: bool = False
     denoise_strength: float = 12.0
+
+    # Audio effects (F26, core.audio_effects): noise gate, 3-band parametric EQ, compressor --
+    # each off by default; ranges and the filter chain live in core.audio_effects.FIELDS.
+    gate_enabled: bool = False
+    gate_threshold_db: float = -45.0
+    gate_range_db: float = 24.0
+    eq_enabled: bool = False
+    eq_low_gain_db: float = 0.0
+    eq_low_freq: float = 120.0
+    eq_mid_gain_db: float = 0.0
+    eq_mid_freq: float = 1000.0
+    eq_mid_q: float = 1.0
+    eq_high_gain_db: float = 0.0
+    eq_high_freq: float = 8000.0
+    comp_enabled: bool = False
+    comp_threshold_db: float = -18.0
+    comp_ratio: float = 4.0
+    comp_attack_ms: float = 20.0
+    comp_release_ms: float = 250.0
+    comp_makeup_db: float = 0.0
 
     # Visual adjustments
     opacity: float = 1.0
@@ -355,6 +416,9 @@ class Clip:
     # override the scalar ``volume`` with a piecewise-linear envelope, exactly
     # like opacity_keyframes override ``opacity``.
     volume_keyframes: List[Tuple[float, float]] = field(default_factory=list)
+    # Easing per keyframed property (F25): {"opacity"|"position"|"volume"|"effects": an EASINGS name};
+    # a property not listed is linear.
+    keyframe_easing: Dict[str, str] = field(default_factory=dict)
 
     # Generic effect stack (colour correction, keys, LUT, sharpen, blur,
     # vignette, denoise, stabilization), applied in list order -- see
@@ -648,11 +712,12 @@ class Clip:
         else:
             timeline_shift = self.timeline_offset_at(source_shift) if abs(source_shift) > 1e-9 else 0.0
         if abs(timeline_shift) > 1e-9:
-            probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift)
-            probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift)
-            probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift)
+            probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift, easing=self.easing_for("opacity"))
+            probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift, easing=self.easing_for("position"))
+            probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift, easing=self.easing_for("volume"))
+            effects_easing = self.easing_for("effects")
             probe.effects = [
-                e.with_keyframes_mapped(lambda keys: _rebase_keyframes(keys, timeline_shift)) if e.keyframes else e
+                e.with_keyframes_mapped(lambda keys: _rebase_keyframes(keys, timeline_shift, easing=effects_easing)) if e.keyframes else e
                 for e in self.effects
             ]
         return probe
@@ -679,6 +744,16 @@ class Clip:
     @property
     def has_denoise(self) -> bool:
         return self.denoise_enabled
+
+    def easing_for(self, target: str) -> str:
+        """The keyframe easing of one property (F25): "linear" unless set."""
+        return self.keyframe_easing.get(target, "linear") if self.keyframe_easing else "linear"
+
+    @property
+    def has_audio_effects(self) -> bool:
+        from core.audio_effects import has_audio_effects
+
+        return has_audio_effects(self)
 
     @property
     def has_transition(self) -> bool:
@@ -730,6 +805,7 @@ class Clip:
             "freeze_frame_duration": self.freeze_frame_duration,
             "denoise_enabled": self.denoise_enabled,
             "denoise_strength": self.denoise_strength,
+            **_audio_effects_to_dict(self),
             "opacity": self.opacity,
             "fade_in": self.fade_in,
             "fade_out": self.fade_out,
@@ -751,6 +827,7 @@ class Clip:
             "asset_id": self.asset_id,
             "link_group": self.link_group,
             "volume_keyframes": [list(kf) for kf in self.volume_keyframes],
+            "keyframe_easing": dict(self.keyframe_easing),
             "effects": [e.to_dict() for e in self.effects],
             **({"ass_event": self.ass_event.to_dict()} if self.ass_event else {}),
             **({"nested": self.nested} if self.nested else {}),
@@ -795,6 +872,8 @@ class Clip:
             freeze_frame_duration=_non_negative(data.get("freeze_frame_duration", 0.0)),
             denoise_enabled=data.get("denoise_enabled", False),
             denoise_strength=data.get("denoise_strength", 12.0),
+            # Added without a format bump: absent (older files) = off.
+            **_audio_effects_from_dict(data),
             opacity=data.get("opacity", 1.0),
             fade_in=data.get("fade_in", 0.0),
             fade_out=data.get("fade_out", 0.0),
@@ -816,6 +895,7 @@ class Clip:
             asset_id=data.get("asset_id"),
             link_group=data.get("link_group"),
             volume_keyframes=[tuple(kf) for kf in data.get("volume_keyframes", [])],
+            keyframe_easing=clean_easing(data.get("keyframe_easing")),
             effects=[EffectInstance.from_dict(e) for e in data.get("effects", []) if isinstance(e, dict)],
             # Added without a format bump: absent = a plain text clip.
             ass_event=AssEvent.from_dict(data["ass_event"]) if isinstance(data.get("ass_event"), dict) else None,

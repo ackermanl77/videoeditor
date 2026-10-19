@@ -82,6 +82,34 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Command search (2026-10-18, F27).** `ui/command_palette.py`: Help > Command Search… (Ctrl+K).
+  - `collect_commands()` walks the live menu bar each time, giving every action with its menu path and
+    shortcut (display-only key hints included). Disabled actions are greyed out.
+  - `filter_commands()` matches every query word against the path; name-prefix matches rank first.
+  - Enter runs the selected action.
+  - Tests: `tests/test_command_palette.py`.
+- **Keyframe easing (2026-10-18, F25).** `Clip.keyframe_easing`:
+  - **Choices:** `{"opacity"|"position"|"volume"|"effects": linear/ease_in/ease_out/ease_in_out/hold}`,
+    cleaned on load.
+  - **Core:** `core.clip.ease()` / `interpolate_keyframes(..., easing)`, and
+    `filter_graph._piecewise_linear_expr(..., easing)` (quadratic in/out, smoothstep in-out, hold).
+  - **Callers:** opacity (geq), position (overlay), volume, effect parameters (`effect_filters(easing=)`),
+    trims/splits (value at the cut), the preview's gain, the waveform and motion tracking.
+  - **UI:** Properties easing combos.
+  - Tests: `tests/test_keyframe_easing.py`. FFmpeg evaluates each generated expression through
+    `aevalsrc`, and it matches the Python curve to 4 decimals.
+- **Audio effects (2026-10-18, F26).** `core/audio_effects.py`: per-clip noise gate (`agate`), 3-band
+  parametric EQ (`lowshelf`/`equalizer` with Q/`highshelf`) and compressor (`acompressor`).
+  - **Defaults:** off, neutral settings emit nothing, and fields are clamped on load (`FIELDS`).
+  - **Signal chain:** after `afftdn`, before fades/volume, in both audio chains (the normal one and the
+    speed-ramped one).
+  - **Selftest:** added these filters to its list.
+  - **EQ filters:** the biquad filters instead of `anequalizer`. They are channel-agnostic, while
+    anequalizer's bands are written per channel.
+  - **UI:** Properties > Audio Effects group.
+  - Tests: `tests/test_audio_effects.py`. With FFmpeg, the gate cuts a quiet tone, the EQ boosts a
+    3 kHz tone and the compressor lowers a loud one.
+
 - **Title styles (2026-10-18, F23).** `core/title_templates.py`: five built-in styles and user styles in `~/.video_editor/title_styles.json`, every `TextStyle` field but the text, stored at 1080p scale (font size, outline, shadow offset and box padding scaled to the project height on apply). Properties > Text > Style: Apply (one undo step, text kept), Save…, Delete (saved styles only). Tests: `tests/test_title_templates.py`.
 - **requirements-dev.txt (2026-10-18, T5)**: runtime + pytest, so `python -m pytest -q` works in the `.venv`.
 

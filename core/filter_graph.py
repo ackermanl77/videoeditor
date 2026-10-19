@@ -25,6 +25,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from core.clip import Clip, MediaType, ReframeMode, TransitionType
+from core.audio_effects import audio_effect_filters
 from core.effects import ANALYSIS_FILE_PARAM, effect_filters
 from core.media_asset import MediaAsset
 from core.output_color import REFERENCE_WHITE_NITS, SDR_8BIT, OutputColor
@@ -257,7 +258,7 @@ def _fit_or_fill(
     here, before the frame gains its alpha channel.
     """
     matrix = _scale_matrix(asset, color)
-    pre = effect_filters(clip.effects, "pre", t_offset, aspect=_source_aspect(asset, width, height))
+    pre = effect_filters(clip.effects, "pre", t_offset, aspect=_source_aspect(asset, width, height), easing=clip.easing_for("effects"))
     if clip.reframe_mode == ReframeMode.FILL:
         return (
             f",scale={width}:{height}:force_original_aspect_ratio=increase{matrix}{pre},format=yuva420p"
@@ -284,7 +285,7 @@ def _color_filters(clip: Clip, t_offset: float = 0.0, aspect: float = 16 / 9) ->
     a speed ramp's later segments), so animated parameters follow the clip.
     ``aspect`` is the frame's width/height there (for masked effects).
     """
-    return effect_filters(clip.effects, "post", t_offset, aspect=aspect)
+    return effect_filters(clip.effects, "post", t_offset, aspect=aspect, easing=clip.easing_for("effects"))
 
 
 def _post_aspect(clip: Clip, width: int, height: int, pad: bool, asset: Optional[MediaAsset]) -> float:
@@ -311,7 +312,7 @@ def _volume_filter(clip: Clip) -> str:
     samples to start at the clip's own start before this step.
     """
     if clip.has_volume_automation:
-        return f",volume=eval=frame:volume='{_piecewise_linear_expr(clip.volume_keyframes, 't')}'"
+        return f",volume=eval=frame:volume='{_piecewise_linear_expr(clip.volume_keyframes, 't', clip.easing_for('volume'))}'"
     if abs(clip.volume - 1.0) > 1e-6:
         return f",volume={clip.volume:.3f}"
     return ""
@@ -367,7 +368,18 @@ def _adelay_filter(seconds: float) -> str:
     return f"adelay=delays={int(round(seconds * 1000))}:all=1"
 
 
-def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t") -> str:
+def _eased_fraction(u: str, easing: str) -> str:
+    """FFmpeg expression text for core.clip.ease() of the fraction expression ``u``."""
+    if easing == "ease_in":
+        return f"({u}*{u})"
+    if easing == "ease_out":
+        return f"({u}*(2-{u}))"
+    if easing == "ease_in_out":
+        return f"({u}*{u}*(3-2*{u}))"
+    return u
+
+
+def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t", easing: str = "linear") -> str:
     """Build an FFmpeg expression for piecewise-linear interpolation between keyframes.
 
     ``keyframes`` is a list of ``(time, value)`` pairs (need not be
@@ -376,6 +388,10 @@ def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t
     current time" — a plain ``"t"``/``"T"`` (whichever the target filter
     calls it) or a derived expression like ``"(t-2.5)"`` when the filter's
     own time origin doesn't match the keyframes' (see callers).
+
+    ``easing`` (F25, core.clip.EASINGS) shapes every gap: the fraction of the
+    gap goes through ease() -- quadratic in/out, smoothstep in-out -- and
+    "hold" keeps each keyframe's value until the next one.
     """
     kfs = sorted(keyframes, key=lambda k: k[0])
     if len(kfs) == 1:
@@ -384,7 +400,11 @@ def _piecewise_linear_expr(keyframes: List[Tuple[float, float]], t_var: str = "t
     for i in range(len(kfs) - 1, 0, -1):
         t0, v0 = kfs[i - 1]
         t1, v1 = kfs[i]
-        segment = f"({v0:.6f}+({v1:.6f}-{v0:.6f})*({t_var}-{t0:.6f})/({t1:.6f}-{t0:.6f}))"
+        if easing == "hold":
+            segment = f"{v0:.6f}"
+        else:
+            u = f"(({t_var}-{t0:.6f})/({t1:.6f}-{t0:.6f}))"
+            segment = f"({v0:.6f}+({v1:.6f}-{v0:.6f})*{_eased_fraction(u, easing)})"
         expr = f"if(lt({t_var},{t1:.6f}),{segment},{expr})"
     return f"if(lt({t_var},{kfs[0][0]:.6f}),{kfs[0][1]:.6f},{expr})"  # before the first: hold its value
 
@@ -416,7 +436,8 @@ def _position_expr(clip: Clip, origin: float = 0.0) -> Tuple[str, str]:
     t_local = f"(t{-(clip.timeline_start - origin):+.6f})"
     x_keyframes = [(t, x) for t, x, _y in clip.position_keyframes]
     y_keyframes = [(t, y) for t, _x, y in clip.position_keyframes]
-    return _piecewise_linear_expr(x_keyframes, t_local), _piecewise_linear_expr(y_keyframes, t_local)
+    easing = clip.easing_for("position")
+    return _piecewise_linear_expr(x_keyframes, t_local, easing), _piecewise_linear_expr(y_keyframes, t_local, easing)
 
 
 def _atempo_chain(speed: float) -> List[str]:
@@ -750,7 +771,7 @@ def _video_fade_and_opacity_suffix(clip: Clip, skip_fade_in: bool = False, skip_
         # multiplying whatever alpha already exists (matching
         # colorchannelmixer=aa=X's own "aa * existing alpha" semantics) so
         # this still composes correctly with fades/rotate's transparency.
-        opacity_expr = _piecewise_linear_expr(clip.opacity_keyframes, "T")
+        opacity_expr = _piecewise_linear_expr(clip.opacity_keyframes, "T", clip.easing_for("opacity"))
         suffix += f",geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='alpha(X,Y)*({opacity_expr})'"
     elif clip.opacity < 1.0:
         suffix += f",colorchannelmixer=aa={clip.opacity:.3f}"
@@ -886,6 +907,7 @@ def _maybe_add_speed_ramped_audio(
     tail = f",{_audio_format_filter(sample_rate)}"
     if clip.has_denoise:
         tail += f",afftdn=nr={clip.denoise_strength:.3f}"
+    tail += audio_effect_filters(clip)
     # The freeze-frame tail is silent (the audio simply ends there), so the
     # fade-out ends where the sound does instead of inside the silence.
     clip_len = clip.playable_duration
@@ -1698,6 +1720,8 @@ def _build_audio_chain(
     # unmodified audio level rather than an already-faded/attenuated signal.
     if clip.has_denoise:
         chain += f",afftdn=nr={clip.denoise_strength:.3f}"
+    # Gate, EQ and compressor (F26), on the same unfaded level.
+    chain += audio_effect_filters(clip)
 
     if stamp > 0:
         chain += f",asetpts=PTS+{stamp:.6f}/TB"

@@ -35,7 +35,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.clip import Clip, MediaType, ReframeMode, TextStyle, TransitionType
+from core import audio_effects
+from core.clip import EASING_LABELS, EASINGS, Clip, MediaType, ReframeMode, TextStyle, TransitionType
 from core.commands import UpdateClipPropertyCommand, UpdateTextClipCommand, property_change_overlaps
 from core.effects import LEGACY_FIELDS, REGISTRY, EffectInstance
 from core.history import History
@@ -259,6 +260,11 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(self.clip_group)
 
+        # ---- Audio Effects group (F26; clips with sound) ----
+        self.audio_fx_group = CollapsibleGroupBox("Audio Effects (Gate, EQ, Compressor)", start_expanded=False)
+        self._build_audio_effects(QFormLayout(self.audio_fx_group))
+        layout.addWidget(self.audio_fx_group)
+
         # ---- Transform group (video/image only) ----
         self.transform_group = CollapsibleGroupBox("Transform", start_expanded=True)
         transform_form = QFormLayout(self.transform_group)
@@ -347,6 +353,22 @@ class PropertiesPanel(QWidget):
         position_kf_row.addWidget(add_position_kf_btn)
         position_kf_row.addWidget(remove_position_kf_btn)
         kf_layout.addLayout(position_kf_row)
+
+        # Easing per keyframed property (F25): how it moves between its keyframes.
+        easing_form = QFormLayout()
+        self.easing_combos = {}
+        # Volume easing sits with the volume keys (audio clips have no Keyframes group).
+        for target, label, form in (("opacity", "Opacity Easing", easing_form), ("position", "Position Easing", easing_form),
+                                    ("effects", "Effects Easing", easing_form), ("volume", "Volume Easing", clip_form)):
+            combo = QComboBox()
+            for easing in EASINGS:
+                combo.addItem(EASING_LABELS[easing], easing)
+            combo.setToolTip("How the value moves between keyframes: Linear (steady), Ease In (starts slow), "
+                             "Ease Out (ends slow), Ease In-Out (both), Hold (jumps at each keyframe).")
+            combo.currentIndexChanged.connect(lambda _index, tg=target, cb=combo: self._commit_easing(tg, cb.currentData()))
+            form.addRow(label, combo)
+            self.easing_combos[target] = combo
+        kf_layout.addLayout(easing_form)
 
         kf_layout.addWidget(QLabel(
             "Speed Ramp — 2+ keyframes override the Speed field above; time is seconds from "
@@ -588,7 +610,7 @@ class PropertiesPanel(QWidget):
         # yet. Re-apply it now that every group is fully populated, so a
         # group that defaults to collapsed actually starts collapsed.
         for group in (
-            self.clip_group, self.transform_group, self.reframe_group,
+            self.clip_group, self.audio_fx_group, self.transform_group, self.reframe_group,
             self.keyframes_group, self.transition_group, self.color_group,
             self.chroma_group, self.effects_group,
         ):
@@ -682,6 +704,7 @@ class PropertiesPanel(QWidget):
         self.empty_label.setVisible(True)
         self.name_label.setVisible(False)
         self.clip_group.setVisible(False)
+        self.audio_fx_group.setVisible(False)
         self.transform_group.setVisible(False)
         self.reframe_group.setVisible(False)
         self.keyframes_group.setVisible(False)
@@ -712,6 +735,7 @@ class PropertiesPanel(QWidget):
         is_visual = clip.media_type in (MediaType.VIDEO, MediaType.IMAGE)
         self.text_group.setVisible(is_text)
         self.clip_group.setVisible(not is_text)
+        self.audio_fx_group.setVisible(clip.media_type in (MediaType.VIDEO, MediaType.AUDIO))
         self.transform_group.setVisible(is_visual)
         self.reframe_group.setVisible(is_visual)
         self.keyframes_group.setVisible(is_visual)
@@ -724,6 +748,11 @@ class PropertiesPanel(QWidget):
         self.mute_checkbox.setChecked(clip.muted)
         self.denoise_checkbox.setChecked(clip.denoise_enabled)
         self.denoise_strength_slider.setValue(int(clip.denoise_strength))
+        for target, combo in self.easing_combos.items():
+            combo.setCurrentIndex(max(0, combo.findData(clip.easing_for(target))))
+        for name, widget in self.audio_fx_widgets.items():
+            value = getattr(clip, name)
+            widget.setChecked(value) if isinstance(widget, QCheckBox) else widget.setValue(value)
         self.speed_spin.setValue(clip.speed)
         self.reverse_checkbox.setChecked(clip.reverse)
         self.freeze_spin.setValue(clip.freeze_frame_duration)
@@ -841,6 +870,69 @@ class PropertiesPanel(QWidget):
     def _edit_live(self, attribute: str, value, label: str) -> None:
         """A continuous control moved: one mergeable, undoable command per change."""
         self._execute(attribute, value, label, mergeable=True)
+
+    # (attribute, label, suffix, decimals, step) per numeric audio-effect control, grouped under its toggle.
+    _AUDIO_FX_LAYOUT = (
+        ("gate_enabled", "Noise gate", (
+            ("gate_threshold_db", "Gate Threshold", " dB", 1, 1.0),
+            ("gate_range_db", "Gate Reduction", " dB", 1, 1.0),
+        )),
+        ("eq_enabled", "Parametric EQ", (
+            ("eq_low_gain_db", "Low Shelf Gain", " dB", 1, 0.5),
+            ("eq_low_freq", "Low Shelf Freq", " Hz", 0, 10.0),
+            ("eq_mid_gain_db", "Mid Gain", " dB", 1, 0.5),
+            ("eq_mid_freq", "Mid Freq", " Hz", 0, 50.0),
+            ("eq_mid_q", "Mid Q", "", 2, 0.1),
+            ("eq_high_gain_db", "High Shelf Gain", " dB", 1, 0.5),
+            ("eq_high_freq", "High Shelf Freq", " Hz", 0, 250.0),
+        )),
+        ("comp_enabled", "Compressor", (
+            ("comp_threshold_db", "Comp Threshold", " dB", 1, 1.0),
+            ("comp_ratio", "Comp Ratio", " : 1", 1, 0.5),
+            ("comp_attack_ms", "Comp Attack", " ms", 1, 5.0),
+            ("comp_release_ms", "Comp Release", " ms", 0, 25.0),
+            ("comp_makeup_db", "Comp Make-up", " dB", 1, 0.5),
+        )),
+    )
+    _AUDIO_FX_TIPS = {
+        "gate_enabled": "Turns the clip down by the Reduction while it is quieter than the Threshold: "
+                        "room tone between words, hum between notes (FFmpeg agate).",
+        "eq_enabled": "A low shelf, a peaking mid band with its own Q and a high shelf; a band at 0 dB is off "
+                      "(FFmpeg lowshelf/equalizer/highshelf).",
+        "comp_enabled": "Evens out loud and quiet passages above the Threshold by the Ratio; Make-up brings "
+                        "the level back up (FFmpeg acompressor).",
+    }
+
+    def _build_audio_effects(self, form: QFormLayout) -> None:
+        """Gate, EQ and compressor controls, generated from core.audio_effects.FIELDS (F26)."""
+        self.audio_fx_widgets = {}
+        for toggle, toggle_label, numbers in self._AUDIO_FX_LAYOUT:
+            checkbox = QCheckBox(toggle_label)
+            checkbox.setToolTip(self._AUDIO_FX_TIPS[toggle])
+            checkbox.toggled.connect(lambda checked, a=toggle, lb=toggle_label: self._commit_now(a, checked, f"Toggle {lb}"))
+            form.addRow("", checkbox)
+            self.audio_fx_widgets[toggle] = checkbox
+            for name, label, suffix, decimals, step in numbers:
+                _default, low, high = audio_effects.FIELDS[name]
+                spin = QDoubleSpinBox()
+                spin.setRange(low, high)
+                spin.setDecimals(decimals)
+                spin.setSingleStep(step)
+                spin.setSuffix(suffix)
+                spin.editingFinished.connect(lambda a=name, w=spin, lb=label: self._commit_now(a, round(w.value(), 3), f"Edit {lb}"))
+                form.addRow(label, spin)
+                self.audio_fx_widgets[name] = spin
+
+    def _commit_easing(self, target: str, easing: str) -> None:
+        """An Easing combo changed (F25): a new keyframe_easing dict (never mutated in place, so Undo
+        keeps the old one)."""
+        clip = self._current_clip()
+        if clip is None:
+            return
+        easing_map = {key: value for key, value in clip.keyframe_easing.items() if key != target}
+        if easing != "linear":
+            easing_map[target] = easing
+        self._commit_now("keyframe_easing", easing_map, "Edit Keyframe Easing")
 
     def _commit_now(self, attribute: str, value, label: str) -> bool:
         """A discrete edit (checkbox, combo, spin box, button): its own undo step."""

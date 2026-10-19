@@ -834,7 +834,7 @@ class PreviewPlayer(QWidget):
         if clip.has_volume_automation:
             from core.clip import interpolate_keyframes
 
-            return max(0.0, interpolate_keyframes(clip.volume_keyframes, offset)[0])
+            return max(0.0, interpolate_keyframes(clip.volume_keyframes, offset, clip.easing_for("volume"))[0])
         return max(0.0, clip.volume)
 
     # -- live loudness (F15) ---------------------------------------------------

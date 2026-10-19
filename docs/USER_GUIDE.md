@@ -286,6 +286,16 @@ For video/audio clips, the **Clip Adjustments** group offers:
 Dragging a slider previews live; releasing it commits one single undo
 step for the whole drag. Everything here is undoable with **Ctrl+Z**.
 
+**Audio Effects** (a collapsed group under Clip Adjustments, for clips with sound) adds three
+effects, each with its own on/off box. They run after noise reduction and before the fades and
+volume, in the export and the preview alike:
+
+| Effect | Settings | What it does |
+|---|---|---|
+| Noise gate | Threshold, Reduction (dB) | Turns the clip down by the Reduction whenever it is quieter than the Threshold — room tone between words, hum between notes. |
+| Parametric EQ | Low shelf gain/frequency, Mid gain/frequency/Q, High shelf gain/frequency | Boosts or cuts the bass, a band of the mids (Q = how narrow) and the treble. A band left at 0 dB does nothing. |
+| Compressor | Threshold, Ratio, Attack, Release (ms), Make-up (dB) | Evens out loud and quiet passages above the Threshold by the Ratio (4:1 = 4 dB over becomes 1 dB over); Make-up brings the level back up. |
+
 **Reverse and freeze frame in detail**
 
 - A reversed clip starts on the last frame of its trimmed range and ends on
@@ -342,6 +352,19 @@ of held at one constant value:
 
 This is a simple, table-based tool (not an on-timeline curve editor), but
 it's enough for common moves like a fade, a slide-in, or a pan.
+
+**Easing.** The **Opacity / Position / Effects Easing** menus in the Keyframes group (and
+**Volume Easing** in Clip Adjustments) choose how the value moves between keyframes:
+
+- **Linear** keeps a steady speed.
+- **Ease In** starts slow.
+- **Ease Out** ends slow.
+- **Ease In-Out** starts and ends slow.
+- **Hold** jumps from one keyframe's value to the next.
+
+The choice applies to every gap of that property's curve, and the export, the preview and the
+waveform all follow it. Splitting a clip keeps the value at the cut, and each half then eases over
+its own keyframes.
 
 ## Speed ramps
 
@@ -870,6 +893,7 @@ disabled and explained when GIF is selected.
 
 | Action | Shortcut |
 |---|---|
+| Command search (find any menu command by name and run it) | Ctrl+K |
 | New Project | Ctrl+N |
 | Open Project | Ctrl+O |
 | Save Project | Ctrl+S |

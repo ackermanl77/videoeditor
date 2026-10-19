@@ -358,9 +358,16 @@ class MainWindow(QMainWindow):
         self._add_action(media_menu, "Cancel Import", self.cancel_import)
 
         help_menu = menu_bar.addMenu("&Help")
+        self._add_action(help_menu, "Command Search...", self.show_command_palette, "Ctrl+K")
         self._add_action(help_menu, "Keyboard Shortcuts", self.show_shortcuts, "F1")
         self._add_action(help_menu, "User Guide", self.show_user_guide)
         self._add_action(help_menu, "About", self.show_about)
+
+    def show_command_palette(self) -> None:
+        """Ctrl+K (F27): search every menu action by name and run it."""
+        from ui.command_palette import run_command_palette
+
+        run_command_palette(self.menuBar(), self)
 
     def _build_playback_menu(self, menu) -> None:
         """Keyboard transport: J/K/L shuttle, frame/second steps, edit/marker navigation, In/Out.

@@ -172,4 +172,5 @@ def display_gains(clip, count: int) -> List[float]:
     if not clip.has_volume_automation:
         return [max(0.0, float(clip.volume))] * count
     duration = max(clip.duration, 1e-9)
-    return [max(0.0, interpolate_keyframes(clip.volume_keyframes, (i + 0.5) / count * duration)[0]) for i in range(count)]
+    easing = clip.easing_for("volume")
+    return [max(0.0, interpolate_keyframes(clip.volume_keyframes, (i + 0.5) / count * duration, easing)[0]) for i in range(count)]

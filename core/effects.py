@@ -338,15 +338,16 @@ class EffectInstance:
             return bool(spec.active(params))
         return True
 
-    def filter(self, t_var: str = "t", extra: Optional[Dict[str, Any]] = None) -> str:
-        """The FFmpeg filter text; animated parameters become expressions of ``t_var`` (clip-local time)."""
+    def filter(self, t_var: str = "t", extra: Optional[Dict[str, Any]] = None, easing: str = "linear") -> str:
+        """The FFmpeg filter text; animated parameters become expressions of ``t_var`` (clip-local time),
+        shaped by the clip's effects easing (F25)."""
         if self.spec is None:
             return ""
         from core.filter_graph import _piecewise_linear_expr
 
         params = self.resolved_params()
         for name, keys in self.animated_params().items():
-            params[name] = _piecewise_linear_expr(keys, t_var)
+            params[name] = _piecewise_linear_expr(keys, t_var, easing)
         params.update(extra or {})
         return self.spec.build(params)
 
@@ -392,7 +393,8 @@ def _clean_mask(mask: Any) -> Optional[Dict[str, Any]]:
     return clean_mask(mask)
 
 
-def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 0.0, aspect: float = 16 / 9) -> str:
+def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 0.0, aspect: float = 16 / 9,
+                   easing: str = "linear") -> str:
     """Comma-prefixed filter text for every renderable effect of ``stage``, in list order.
 
     ``t_offset`` is the clip-local time of the stream's first frame where
@@ -409,9 +411,9 @@ def effect_filters(effects: List[EffectInstance], stage: str, t_offset: float = 
             if mask is not None and effect.spec.stage != "source":
                 from core.effect_masks import masked_filter
 
-                out += masked_filter(effect.filter(t_var), mask, aspect)
+                out += masked_filter(effect.filter(t_var, easing=easing), mask, aspect)
             else:
-                out += "," + effect.filter(t_var)
+                out += "," + effect.filter(t_var, easing=easing)
     return out
 
 
