@@ -13,3 +13,5 @@ bin/
 
 # Ajustes locales del editor
 .vscode/
+
+graphify-out/
