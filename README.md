@@ -137,7 +137,8 @@ video_editor/
 │   ├── ffmpeg_utils.py                 # Locate/run ffmpeg/ffprobe, NVENC and GPU-decode probes
 │   ├── history.py, commands.py         # Undo/redo (Command pattern) and the undoable operations
 │   ├── edit_ops.py, timeline_nav.py    # Multi-clip edits (clipboard, roll/slip/slide...), navigation
-│   ├── filter_graph.py                 # Builds the FFmpeg filter_complex graph
+│   ├── filter_graph.py                 # Builds the FFmpeg filter_complex graph (build_filter_graph, transitions)
+│   ├── filter_graph_base/_video/_audio/_text.py  # Its shared primitives, video and audio chains, drawtext overlays
 │   ├── effects.py                      # Effect registry (schema, animatable params) + instances
 │   ├── output_color.py                 # 8/10-bit SDR and HDR (PQ/HLG) export targets
 │   ├── stabilize.py                    # vid.stab motion-analysis pass + cache
@@ -149,6 +150,7 @@ video_editor/
 │   └── selftest.py                     # `--self-test`
 ├── ui/                      # PySide6 UI layer (imports from core, never the reverse)
 │   ├── main_window.py                  # Menus, toolbar, panel layout, wiring
+│   ├── window_projects/_media/_render.py  # MainWindow mixins: open/save/recent, media & proxies, rendering & export
 │   ├── media_bin.py, import_worker.py  # Media bin; background import
 │   ├── preview_player.py               # Preview panel (QMediaPlayer, Accurate frame, meters)
 │   ├── properties_panel.py             # Clip inspector panel
