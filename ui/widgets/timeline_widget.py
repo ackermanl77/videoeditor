@@ -439,6 +439,7 @@ class TimelineWidget(QWidget):
         self.zoom_slider.setMaximum(100)
         self.zoom_slider.setValue(40)
         self.zoom_slider.setFixedWidth(140)
+        self.zoom_slider.setAccessibleName("Timeline zoom")
         toolbar.addWidget(self.zoom_slider)
 
         layout.addLayout(toolbar)

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Open Video Editor: a clapperboard over two timeline clips with a playhead (blue tile). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <clipPath id="arm"><path d="M44 66 L196 30 L203 60 L51 96 Z"/></clipPath>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- clapper arm, tilted open, with stripes -->
+  <path d="M44 66 L196 30 L203 60 L51 96 Z" fill="#ffffff"/>
+  <g clip-path="url(#arm)" fill="#1e293b">
+    <path d="M70 40 L96 40 L76 110 L50 110 Z"/>
+    <path d="M118 30 L144 30 L124 100 L98 100 Z"/>
+    <path d="M166 20 L192 20 L172 90 L146 90 Z"/>
+  </g>
+  <!-- slate body -->
+  <rect x="44" y="104" width="168" height="44" rx="8" fill="#ffffff"/>
+  <!-- two clips on a timeline -->
+  <rect x="44" y="162" width="96" height="30" rx="7" fill="#93c5fd"/>
+  <rect x="146" y="162" width="66" height="30" rx="7" fill="#fbbf24"/>
+  <rect x="44" y="198" width="70" height="22" rx="6" fill="#86efac"/>
+  <!-- playhead -->
+  <rect x="160" y="150" width="8" height="78" rx="4" fill="#ef4444"/>
+  <path d="M152 146 L176 146 L164 160 Z" fill="#ef4444"/>
+</svg>

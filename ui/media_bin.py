@@ -110,6 +110,7 @@ class MediaBinWidget(QWidget):
         # F37: search what is said in the clips (words kept by Generate Captions).
         self.speech_search = QLineEdit()
         self.speech_search.setPlaceholderText("Search speech…")
+        self.speech_search.setAccessibleName("Search speech")
         self.speech_search.setToolTip("Find clips by what is said in them (after Generate Captions); "
                                       "double-click a result to go there.")
         self.speech_search.setClearButtonEnabled(True)
@@ -118,11 +119,13 @@ class MediaBinWidget(QWidget):
         self.speech_results = QListWidget()
         self.speech_results.setVisible(False)
         self.speech_results.setMaximumHeight(160)
+        self.speech_results.setAccessibleName("Speech search results")
         self.speech_results.itemActivated.connect(self._on_speech_hit)
         self.speech_results.itemDoubleClicked.connect(self._on_speech_hit)
         layout.addWidget(self.speech_results)
 
         self.list_widget = MediaListWidget()
+        self.list_widget.setAccessibleName("Media bin")
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self._on_context_menu)

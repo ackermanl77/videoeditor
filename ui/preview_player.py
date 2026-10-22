@@ -140,6 +140,13 @@ class PreviewPlayer(QWidget):
         self._poll_timer.timeout.connect(self._on_poll)
 
     # ------------------------------------------------------------------
+    def _set_play_button(self, playing: bool) -> None:
+        """The icon alone said nothing to a screen reader (UI1): name and tooltip follow the state."""
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
+        label = "Pause preview" if playing else "Play preview"
+        self.play_btn.setAccessibleName(label)
+        self.play_btn.setToolTip(label)
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -174,7 +181,7 @@ class PreviewPlayer(QWidget):
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton()
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self._set_play_button(playing=False)
         self.play_btn.setFixedWidth(36)
         controls.addWidget(self.play_btn)
 
@@ -185,6 +192,7 @@ class PreviewPlayer(QWidget):
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setMinimum(0)
         self.seek_slider.setMaximum(1000)
+        self.seek_slider.setAccessibleName("Preview position")
         controls.addWidget(self.seek_slider, 1)
 
         self.accurate_checkbox = QCheckBox("Accurate frame")
@@ -356,7 +364,7 @@ class PreviewPlayer(QWidget):
         if self._shuttle_rate < 0:
             self.player.pause()
             self._is_playing = True
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self._set_play_button(playing=True)
             self._poll_timer.start()
             self.playing_changed.emit(True)
         else:
@@ -376,14 +384,14 @@ class PreviewPlayer(QWidget):
         self._load_for_time(self._current_time, autoplay=True)
         self._is_playing = True
         self._integrated.reset()
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self._set_play_button(playing=True)
         self._poll_timer.start()
         self.playing_changed.emit(True)
 
     def pause(self) -> None:
         self.player.pause()
         self._is_playing = False
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self._set_play_button(playing=False)
         self._poll_timer.stop()
         self.playing_changed.emit(False)
         self.request_accurate_frame()

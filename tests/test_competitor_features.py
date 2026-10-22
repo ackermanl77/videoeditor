@@ -320,6 +320,18 @@ class WindowTests(unittest.TestCase):
         window.properties.set_selected_clip(clip.id)
         return clip
 
+    def test_preview_and_bin_controls_have_accessible_names(self):
+        """UI1: these were announced as an unnamed button, slider, edit and list."""
+        window = self._window()
+        preview = window.preview
+        self.assertEqual(preview.play_btn.accessibleName(), "Play preview")
+        preview._set_play_button(playing=True)
+        self.assertEqual(preview.play_btn.accessibleName(), "Pause preview")
+        self.assertEqual(preview.seek_slider.accessibleName(), "Preview position")
+        self.assertEqual(window.timeline.zoom_slider.accessibleName(), "Timeline zoom")
+        self.assertEqual(window.media_bin.speech_search.accessibleName(), "Search speech")
+        self.assertEqual(window.media_bin.list_widget.accessibleName(), "Media bin")
+
     def test_auto_color_and_reframe_are_single_undo_steps(self):
         window = self._window()
         clip = self._video_clip(window, MediaAsset(path="/m/a.mp4", duration=4.0, has_video=True, width=1920, height=1080))

@@ -1,5 +1,7 @@
 """Regenerate the Windows icons from assets/icons/app_icon_256.png (K8, a developer step -- needs
-Pillow, which the app itself doesn't; the generated .ico files are checked in):
+Pillow, which the app itself doesn't; the generated .ico files are checked in). The artwork's master
+is assets/icons/app_icon.svg (a clapperboard over timeline clips); app_icon.png, app_icon_256.png
+and splash.png are rendered from it:
 
 - assets/icons/app_icon.ico: every size Explorer and the taskbar ask for, 16-256 including 20, 24
   and 40 (the taskbar's 24 px used to be scaled down from 32 and looked blurry);
