@@ -160,7 +160,7 @@ class ToolsMixin:
 
     # -- recording (F34) ------------------------------------------------------------
     def record_media(self, kind: str = "voiceover") -> Optional[str]:
-        """File > Record: a voiceover, the screen or a webcam into the media bin (FFmpeg)."""
+        """Edit > Record Voiceover / Screen / Webcam: into the media bin (FFmpeg)."""
         from core.recording import list_devices
 
         try:

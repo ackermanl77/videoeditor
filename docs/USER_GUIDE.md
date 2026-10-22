@@ -58,7 +58,10 @@ and a timeline across the bottom.
 [Releases page](https://github.com/ackermanl77/videoeditor/releases) and run
 it. It installs for your user only (no administrator rights needed), adds
 Open Video Editor to the Start menu, and makes double-clicking a `.vproj`
-project open it in the editor. Uninstall it from Windows Settings > Apps.
+project open it in the editor. Right-clicking a video or audio file in
+File Explorer offers **Edit with Open Video Editor** (MP4, MOV, MKV, AVI,
+WebM, MPG, MTS, MP3, WAV, FLAC, M4A, OGG and more), which starts a new project with that file
+in the Media Bin. On Windows 11 the entry is under **Show more options**. Uninstall it from Windows Settings > Apps.
 No Python installation is needed. If you'd rather not install anything,
 download `VideoEditor-<version>-portable.zip` instead, unzip it anywhere and
 run `VideoEditor.exe` from that folder (keep the `_internal` folder next to
@@ -156,6 +159,13 @@ remembered the next time you open the app.
 - **Subtitle files** (`.srt`, `.vtt`) picked here or dropped on the window
   become caption clips — see [Subtitles](#subtitles-srt--webvtt).
 - Large batches can be stopped with **Media > Cancel Import**.
+- **Edit > Record Voiceover / Screen / Webcam...** (`Ctrl+Shift+R`) records
+  new media with FFmpeg: pick **Voiceover (microphone)**, **Screen** or
+  **Webcam**, the microphone and the camera, then **Start Recording** and
+  **Stop**. The file goes to `Videos\Open Video Editor\Recordings` and into
+  the Media Bin; a voiceover is also placed on an audio track at the
+  playhead (a free spot, or a new audio track — never over existing sound),
+  as one undo step.
 
 ## The Media Bin
 
@@ -174,6 +184,13 @@ part of its file as a named subclip:
 - **In the bin:** it appears under its file with a ✂. Drag it, double-click it, or use Insert (,) /
   Overwrite (.) like any file, and you get just that part.
 - **Managing:** right-click to rename or delete it. Subclips are saved with the project.
+
+**Search speech…** (under the bin) finds clips by what is said in them: type
+a word or a phrase and the list shows each place it's spoken, with its time.
+Double-click a result to move the playhead there (the clip must be on the
+timeline). It searches the words recognised by **Generate Captions** (see
+[Automatic captions](#automatic-captions)), so caption a clip once first;
+translated captions aren't searchable. The words are saved with the project.
 
 An empty bin shows its own instructions ("Drop video, audio, or image
 files here...") instead of looking like a blank, confusing rectangle.
@@ -338,6 +355,11 @@ track above another, scale it down, and move it into a corner.
 | Scale | 0.1x–3.0x | 1.0x |
 | Rotation | -180°–180° | 0° |
 
+**On the preview:** tick **Transform** under the preview to see the selected
+clip's box where the export puts it. Drag inside the box to move the clip, or
+drag a corner to scale it (one undo step per drag). Rotation stays in the
+Properties panel.
+
 **Reset Transform** puts all four back to default in one click. At the
 defaults, a clip looks exactly as it would without ever touching
 Transform.
@@ -358,8 +380,8 @@ of held at one constant value:
    animates between them instead of staying constant. **- Remove
    Selected** deletes a keyframe from the table.
 
-This is a simple, table-based tool (not an on-timeline curve editor), but
-it's enough for common moves like a fade, a slide-in, or a pan.
+The table is the quickest way to add keyframes; the **Keyframe Graph** (below)
+shows them as a curve you can drag.
 
 **Easing.** The **Opacity / Position / Effects Easing** menus in the Keyframes group (and
 **Volume Easing** in Clip Adjustments) choose how the value moves between keyframes:
@@ -373,6 +395,16 @@ it's enough for common moves like a fade, a slide-in, or a pan.
 The choice applies to every gap of that property's curve, and the export, the preview and the
 waveform all follow it. Splitting a clip keeps the value at the cut, and each half then eases over
 its own keyframes.
+
+**Keyframe Graph.** **Keyframe Graph…** (in the Keyframes group) shows a property — Opacity, Volume,
+Position X or Position Y — as a curve over the clip's time:
+
+- Drag a white keyframe to change its time and value.
+- Drag the two yellow handles to shape how the value moves between keyframes: the left one sets how
+  it leaves a keyframe, the right one how it arrives at the next. The shape applies to every gap of
+  that property, and the easing menu then shows **Custom curve**.
+- **Straight (Linear)** goes back to a steady speed.
+- Each release is one undo step.
 
 ## Speed ramps
 
@@ -479,6 +511,16 @@ change), so it can be reordered with other effects, switched off, and
 | Contrast | 0.0 – 2.0 | 1.0 |
 | Saturation | 0.0 – 3.0 | 1.0 |
 | Gamma | 0.1 – 3.0 | 1.0 |
+
+**Color Wheels (Lift / Gamma / Gain).** An effect (Effects list → add **Color Wheels**) with a hue
+and a strength for the shadows (lift), midtones (gamma) and highlights (gain): it tints each tonal
+range toward that hue — e.g. teal shadows and warm highlights. **Preserve lightness** (on by
+default) keeps the brightness unchanged.
+
+**Auto Color.** **Edit > Auto Color** (`Shift+C`) measures the frame under the playhead in the
+selected clip and sets a **Levels (Auto Color)** effect: black and white points per channel, which
+also removes a colour cast. Running it again updates the same effect; the values stay editable in
+the Effects list.
 
 ## Chroma key (green screen)
 
@@ -606,6 +648,13 @@ resize would produce.
   End (in seconds) to export only part of your timeline — useful on its
   own or alongside a Shorts preset's automatic cap.
 
+- **Keep Subject in Frame** (Edit menu): in a project whose shape differs
+  from the clip's (e.g. a 9:16 project with 16:9 footage), select the clip,
+  put the playhead on a frame showing the subject, choose **Edit > Keep
+  Subject in Frame...** and draw a box around it. The subject is tracked and
+  the clip gets Fill Frame with crop-focus keyframes that follow it, so the
+  narrow frame keeps it centred (one undo step).
+
 Markers/chapters still work correctly even on a trimmed, reframed export.
 
 > This feature is meant for your own footage, or footage you're properly
@@ -644,6 +693,13 @@ object:
   with the object, for example to blur a face or brighten a moving subject.
 - Its shape, size, feather and invert stay editable. **Clear Track** makes it still again.
 - A tracked mask renders a little slower than a still one (about 60 frames a second at 1080p).
+
+**Animated masks.** A mask can also move and change shape by keyframes, without tracking:
+- Put the playhead on the clip, set the mask's centre, size, angle and feather, and click
+  **Keyframe Here** (Mask settings, **Animate** row). Repeat at other moments.
+- With two or more keyframes the mask glides between them; **Clear Keyframes** makes it still.
+- With a track too, the track moves the centre and the keyframes the rest.
+- Trimming or splitting the clip keeps the keyframes at their moments.
 
 **Animating effect settings**: settings with a **◆** button next to them
 (Color Correction's four values and Vignette's strength) can change over the
@@ -1012,6 +1068,8 @@ disabled and explained when GIF is selected.
 | Roll / slip / slide / ripple move by dragging | Ctrl+drag an edge / Alt+drag / Ctrl+Alt+drag / Shift+drag |
 | Razor tool on/off | C |
 | Previous / next keyframe | Shift+K / Ctrl+Shift+K |
+| Auto Color | Shift+C |
+| Record voiceover / screen / webcam | Ctrl+Shift+R |
 | Keyboard shortcut list | F1 |
 
 **Help > Keyboard Shortcuts** (**F1**) lists every shortcut, generated from

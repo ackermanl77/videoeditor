@@ -53,3 +53,11 @@ Thumbnails and waveforms are cached under `~/.video_editor/thumbnails/` and `~/.
 - The import worker also makes a **filmstrip** for video files (`media_probe.generate_filmstrip`: 8 tiles across the whole file, cached next to the thumbnails, `MediaAsset.filmstrip_path`); the timeline draws the tiles for the clip's own source range (fixed here: the tile lookup divided by `source_out` instead of the file length, so a clip trimmed short of the file's end showed the file's last frames).
 - Waveform caches hold peaks **and RMS** at 100 values per second (was 25). Older caches still load (RMS = peaks). The RMS sum runs in C (`map(operator.mul)`) so long files don't import noticeably slower.
 - With `VIDEO_EDITOR_HWACCEL` set, thumbnails and filmstrips try the GPU decoder first and fall back to software; a failed attempt's image is deleted so it can't be served from the cache later. The audio-only waveform decode never uses it.
+
+## Recording, speech search and the Explorer verb (2026-10-21, F34/F37/F38)
+
+- **Recording** (Edit > Record Voiceover / Screen / Webcam..., Ctrl+Shift+R; `core/recording.py`, `ui/window_tools.py`): FFmpeg captures DirectShow microphones/cameras (`list_devices()`, with their alternative names) or the desktop (`gdigrab`) into `Videos\Open Video Editor\Recordings`; Stop sends `q` so the file is finalised. The file is imported, and a voiceover is placed on a free audio track at the playhead (or a new one) as one undo step.
+- **Speech search**: Generate Captions keeps the recognised words per asset (`MediaAsset.transcript`, saved in the project); the media bin's **Search speech…** box (`core/transcript_search.search()`) lists phrase matches, and a double-click seeks the timeline to that source moment (`timeline_time_for()`).
+- **Edit with Open Video Editor**: the installer registers a per-user `SystemFileAssociations` verb for 16 video/audio extensions; `main.media_arguments()` imports those files into a new project.
+
+Verified in `tests/test_competitor_features.py`: `RecordingTests`, `SpeechSearchTests`, `ExplorerVerbTests` and `WindowTests.test_a_voiceover_lands_on_a_free_audio_track_and_speech_hits_seek`. Real devices (microphone, webcam, screen) were not recorded in the tests.

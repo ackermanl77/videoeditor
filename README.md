@@ -15,7 +15,14 @@ deliberately layered and documented so it is easy to read, test and extend.
   AIFF, ...) and image (PNG, JPG, BMP, WebP, TIFF, GIF, ...) formats —
   drag-and-drop or file dialog; anything the installed FFmpeg build can
   decode works even beyond that list
-- **Media bin** with automatically generated thumbnails
+- **Media bin** with automatically generated thumbnails, **subclips**
+  (named In/Out ranges of a file, Edit > Make Subclip) and **Search
+  speech…**: find the moments a word or phrase is said in captioned clips
+  and jump there
+- **Recording**: Edit > Record Voiceover / Screen / Webcam (FFmpeg) straight
+  into the media bin; a voiceover lands on a free audio track at the playhead
+- **Explorer integration**: the installer adds "Edit with Open Video
+  Editor" to video and audio files' right-click menu
 - **Multi-track timeline**: unlimited video and audio tracks, drag to move
   clips, drag clip edges to trim, split at the playhead, delete, mute/lock/
   hide per track, with an optional **Ripple** mode so Delete/Trim shift
@@ -29,7 +36,8 @@ deliberately layered and documented so it is easy to read, test and extend.
   round trip through this editor keeps everything
 - **Masks on effects**: limit any effect (colour correction, blur, keys,
   LUTs...) to a rectangle, an ellipse or one side of a linear gradient, with
-  rotation, feather and invert -- in the effect's Properties form
+  rotation, feather and invert -- in the effect's Properties form; a mask can
+  follow a tracked object or be animated with its own keyframes
 - **Scene-cut detection**: Edit > Detect Scene Cuts finds the shot changes
   in the selected clip (FFmpeg `scdet`) and splits the clip there or adds a
   marker at each one -- a single undo step
@@ -67,13 +75,21 @@ deliberately layered and documented so it is easy to read, test and extend.
 - **Per-clip Transform**: position, scale, and rotation — picture-in-picture,
   split-screen, off-center framing
 - **Shorts / vertical video export**: crop-to-fill reframing (with a manual
-  focus point) into a 9:16 canvas instead of letterboxing, a duration cap,
-  and ready-made YouTube Shorts / TikTok / Instagram Reels presets
+  focus point, or **Keep Subject in Frame**: a tracked subject drives the
+  crop) into a 9:16 canvas instead of letterboxing, a duration cap, and
+  ready-made YouTube Shorts / TikTok / Instagram Reels presets
 - **Keyframing** for Opacity and Position — animate them smoothly over a
-  clip's duration instead of one constant value
+  clip's duration instead of one constant value, with Linear/Ease/Hold
+  easing or a custom curve shaped in the **Keyframe Graph**
+- **On-canvas transform**: with the preview's **Transform** box ticked, drag
+  the selected clip to move it or a corner to scale it
 - **Crossfade transitions** between adjacent clips on the same track
 - **Per-clip color correction**: brightness, contrast, saturation, gamma
-  (an effect in the clip's stack, each value keyframable)
+  (an effect in the clip's stack, each value keyframable), **Color Wheels**
+  (lift/gamma/gain) and **Auto Color** (Shift+C: per-channel levels from the
+  frame under the playhead, removing a colour cast)
+- **Video scopes**: waveform, RGB parade and vectorscope of the exported
+  frame under the playhead
 - **Chroma key** (green-screen) compositing per clip
 - **Text overlays**: content, font size, color, bold/italic, position,
   alignment
@@ -95,7 +111,12 @@ deliberately layered and documented so it is easy to read, test and extend.
   animatable (color correction, vignette) take keyframes
 - **Audio**: equal-power audio crossfades, volume keyframes, ducking with
   adjustable threshold/ratio/attack/release, master limiter, loudness targets
-  and an EBU R128 loudness meter (Export > Measure)
+  and an EBU R128 loudness meter (Export > Measure); per-clip noise gate,
+  three-band EQ and compressor; an **Audio Mixer** with per-track fader,
+  pan, mute and solo
+- **Workspaces** (Editing / Color / Audio / Captions, Alt+Shift+1-4, or your
+  own) and **command search** (Ctrl+K: every menu action, filtered as you
+  type)
 - **Editing tools**: multi-select (Ctrl+click, rubber band), copy/cut/paste,
   duplicate, paste attributes, insert/overwrite, roll/slip/slide and ripple
   move (also as drags: Ctrl+edge = roll, Alt = slip, Ctrl+Alt = slide,
@@ -140,6 +161,16 @@ video_editor/
 │   ├── filter_graph.py                 # Builds the FFmpeg filter_complex graph (build_filter_graph, transitions)
 │   ├── filter_graph_base/_video/_audio/_text.py  # Its shared primitives, video and audio chains, drawtext overlays
 │   ├── effects.py                      # Effect registry (schema, animatable params) + instances
+│   ├── effect_masks.py                 # Effect masks (shapes, tracked centre, keyframes) as geq/maskedmerge
+│   ├── audio_effects.py, mixer.py      # Per-clip gate/EQ/compressor; track fader, pan, mute, solo
+│   ├── motion_track.py, scene_detect.py  # Motion tracking (and Keep Subject in Frame); scene cuts
+│   ├── auto_color.py, scopes.py        # Auto Color levels; waveform/parade/vectorscope
+│   ├── nesting.py, subclips.py         # Compound clips; subclips
+│   ├── transcribe.py, transcript_search.py  # Automatic captions (faster-whisper); speech search
+│   ├── recording.py                    # Voiceover / screen / webcam capture with FFmpeg
+│   ├── title_templates.py, transform_geometry.py  # Title styles; on-canvas transform math
+│   ├── otio_io.py                      # OpenTimelineIO export/import
+│   ├── preview_render.py, decode_choice.py  # Background In/Out preview renders; per-source GPU decoding
 │   ├── output_color.py                 # 8/10-bit SDR and HDR (PQ/HLG) export targets
 │   ├── stabilize.py                    # vid.stab motion-analysis pass + cache
 │   ├── exporter.py, export_presets.py  # Runs FFmpeg with progress; export presets
@@ -151,6 +182,11 @@ video_editor/
 ├── ui/                      # PySide6 UI layer (imports from core, never the reverse)
 │   ├── main_window.py                  # Menus, toolbar, panel layout, wiring
 │   ├── window_projects/_media/_render.py  # MainWindow mixins: open/save/recent, media & proxies, rendering & export
+│   ├── window_tools.py                 # MainWindow mixin: Auto Color, the Record dialog
+│   ├── keyframe_graph.py               # Keyframe Graph dialog
+│   ├── motion_track_dialog.py          # Draw a box to track
+│   ├── markers_panel.py, mixer_panel.py, scopes_panel.py  # Markers, Audio Mixer and Scopes docks
+│   ├── workspaces.py, command_palette.py  # Workspaces; Ctrl+K command search
 │   ├── media_bin.py, import_worker.py  # Media bin; background import
 │   ├── preview_player.py               # Preview panel (QMediaPlayer, Accurate frame, meters)
 │   ├── properties_panel.py             # Clip inspector panel
@@ -222,8 +258,8 @@ pip install -r requirements-dev.txt -c requirements-lock.txt   # once, in the .v
 python -m pytest -q                       # or: python -m unittest discover -s tests -v
 ```
 
-Current result (2026-10-18, Windows, in `.venv` with FFmpeg in `bin/` and PySide6):
-**611 passed plus 92 subtests**, none skipped.
+Current result (2026-10-22, Windows, in `.venv` with FFmpeg in `bin/` and PySide6):
+**679 passed plus 92 subtests**, none skipped (the same 679 under `unittest`).
 
 GitHub Actions (`.github/workflows/ci.yml`) runs this same command, plus a `compileall` syntax check, on every push and pull request — with no install step at all, since nothing under `core/` (what `tests/` exercises) depends on a third-party package. A second, Windows job installs the pinned FFmpeg and PySide6 and runs the full suite (real-FFmpeg integration tests and offscreen Qt tests, `QT_QPA_PLATFORM=offscreen`) plus `python main.py --self-test`.
 

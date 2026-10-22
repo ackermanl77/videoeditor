@@ -28,7 +28,7 @@ Make a clip (a logo, a sticker, a blur patch, a picture-in-picture) move with an
 - `find_rect` matches the template as it was drawn. An object that turns, changes size or is covered is lost while it does; those frames are skipped.
 - The tracked clip can't be in Fill Frame mode or rotated (the command says so). The follower must be a video or image clip, because text clips have no position keyframes.
 - Only the position is tracked, not scale or rotation.
-- Effect masks are static, so a mask can't follow the object. To blur a moving face, track a blurred or pixelated copy of the clip, cropped small, on a track above.
+- To blur a moving face, use an effect mask's **Track Mask...** (the mask's centre follows the object) or animate the mask with **Keyframe Here** (see the User Guide's "Tracked masks" and "Animated masks").
 
 ## Verification
 
@@ -37,3 +37,9 @@ Make a clip (a logo, a sticker, a blur patch, a picture-in-picture) move with an
 - The log parsing, template box clamping, fit/Transform mapping and follower timing/offset/thinning.
 - `find_rect` with the real FFmpeg on a generated clip of a square moving 150 px/s right and 30 px/s down: every tracked centre lies within 4 px of the true path on the 640×360 frame.
 - The whole Edit > Track Motion flow in the main window: the follower's keyframes lie within 5 px of the true path, Undo removes them, and the box-picker dialog works.
+
+## Keep Subject in Frame (2026-10-21, F35)
+
+Edit > Keep Subject in Frame... tracks a subject in a video clip whose shape differs from the project's (e.g. 16:9 footage in a 9:16 project) and, instead of moving another clip, animates the clip's own **Fill Frame** crop focus (`Clip.crop_focus_keyframes`, `motion_track.reframe_keyframes()`): the focus centres the subject, clamped so the crop never leaves the frame. The export's Fill crop becomes a per-frame expression of those keyframes. One undo step; the keyframes are saved with the project and rebased when the clip is trimmed or split.
+
+Verified in `tests/test_competitor_features.py`: `ReframeTests` (focus clamping, a real render whose crop follows the keyframes, saving and splitting) and `WindowTests.test_auto_color_and_reframe_are_single_undo_steps`.
