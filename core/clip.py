@@ -170,6 +170,35 @@ class AssEvent:
 EASINGS = ("linear", "ease_in", "ease_out", "ease_in_out", "hold")
 EASING_LABELS = {"linear": "Linear", "ease_in": "Ease In", "ease_out": "Ease Out", "ease_in_out": "Ease In-Out", "hold": "Hold"}
 EASING_TARGETS = ("opacity", "position", "volume", "effects")
+# A custom curve (F39, the keyframe graph): "curve:<m0>,<m1>", the slopes of every gap's easing at its
+# start and end (1, 1 = linear; 0, 0 = smooth in-out; over 1 overshoots). A cubic Hermite fraction, so
+# the export's FFmpeg expression (core.filter_graph_base._eased_fraction) is exact.
+CURVE_PREFIX = "curve:"
+CURVE_SLOPE_RANGE = (-3.0, 6.0)
+
+
+def curve_easing(m0: float, m1: float) -> str:
+    low, high = CURVE_SLOPE_RANGE
+    return f"{CURVE_PREFIX}{min(max(float(m0), low), high):.3f},{min(max(float(m1), low), high):.3f}"
+
+
+def curve_slopes(easing: str) -> Optional[Tuple[float, float]]:
+    """(m0, m1) of a "curve:" easing, or None for any other (or a malformed one)."""
+    if not isinstance(easing, str) or not easing.startswith(CURVE_PREFIX):
+        return None
+    try:
+        m0, m1 = (float(v) for v in easing[len(CURVE_PREFIX):].split(","))
+    except ValueError:
+        return None
+    low, high = CURVE_SLOPE_RANGE
+    if not (low <= m0 <= high and low <= m1 <= high):
+        return None
+    return m0, m1
+
+
+def hermite(fraction: float, m0: float, m1: float) -> float:
+    u = fraction
+    return (u ** 3 - 2 * u ** 2 + u) * m0 + (-2 * u ** 3 + 3 * u ** 2) + (u ** 3 - u ** 2) * m1
 
 
 def ease(fraction: float, easing: str = "linear") -> float:
@@ -183,6 +212,9 @@ def ease(fraction: float, easing: str = "linear") -> float:
         return fraction * fraction * (3.0 - 2.0 * fraction)
     if easing == "hold":
         return 0.0
+    slopes = curve_slopes(easing)
+    if slopes is not None:
+        return hermite(fraction, *slopes)
     return fraction
 
 
@@ -202,7 +234,8 @@ def clean_easing(value: Any) -> Dict[str, str]:
     """A project file's keyframe_easing made safe: known targets and easings only, linear left out."""
     if not isinstance(value, dict):
         return {}
-    return {target: easing for target, easing in value.items() if target in EASING_TARGETS and easing in EASINGS and easing != "linear"}
+    return {target: easing for target, easing in value.items()
+            if target in EASING_TARGETS and (easing in EASINGS or curve_slopes(easing) is not None) and easing != "linear"}
 
 
 def _step_value(keyframes, t: float) -> Tuple[float, ...]:
@@ -258,6 +291,18 @@ def _audio_effects_from_dict(data: dict) -> dict:
     from core.audio_effects import from_dict
 
     return from_dict(data)
+
+
+def _clean_focus_keyframes(value: Any) -> List[Tuple[float, float, float]]:
+    """A project file's crop_focus_keyframes made safe: (t >= 0, x and y clamped to 0..1), sorted."""
+    out = []
+    for item in value if isinstance(value, list) else []:
+        try:
+            t, x, y = (float(v) for v in item[:3])
+        except (TypeError, ValueError):
+            continue
+        out.append((max(0.0, t), min(1.0, max(0.0, x)), min(1.0, max(0.0, y))))
+    return sorted(out)
 
 
 def _non_negative(value: Any) -> float:
@@ -396,6 +441,9 @@ class Clip:
     reframe_mode: ReframeMode = ReframeMode.FIT
     crop_focus_x: float = 0.5
     crop_focus_y: float = 0.5
+    # Subject-following reframe (F35): (clip-local seconds, focus x, focus y); 2+ animate the Fill
+    # crop (core.motion_track.reframe_keyframes makes them from a tracked object).
+    crop_focus_keyframes: List[Tuple[float, float, float]] = field(default_factory=list)
 
     # Text overlay data (only used when media_type == TEXT)
     text_style: Optional[TextStyle] = None
@@ -714,10 +762,12 @@ class Clip:
         if abs(timeline_shift) > 1e-9:
             probe.opacity_keyframes = _rebase_keyframes(self.opacity_keyframes, timeline_shift, easing=self.easing_for("opacity"))
             probe.position_keyframes = _rebase_keyframes(self.position_keyframes, timeline_shift, easing=self.easing_for("position"))
+            probe.crop_focus_keyframes = _rebase_keyframes(self.crop_focus_keyframes, timeline_shift)
             probe.volume_keyframes = _rebase_keyframes(self.volume_keyframes, timeline_shift, easing=self.easing_for("volume"))
             effects_easing = self.easing_for("effects")
             probe.effects = [
-                e.with_keyframes_mapped(lambda keys: _rebase_keyframes(keys, timeline_shift, easing=effects_easing)) if e.keyframes else e
+                e.with_keyframes_mapped(lambda keys: _rebase_keyframes(keys, timeline_shift, easing=effects_easing))
+                if e.keyframes or (e.mask and (e.mask.get("track") or e.mask.get("keyframes"))) else e
                 for e in self.effects
             ]
         return probe
@@ -822,6 +872,7 @@ class Clip:
             "reframe_mode": self.reframe_mode.value,
             "crop_focus_x": self.crop_focus_x,
             "crop_focus_y": self.crop_focus_y,
+            **({"crop_focus_keyframes": [list(kf) for kf in self.crop_focus_keyframes]} if self.crop_focus_keyframes else {}),
             "text_style": self.text_style.to_dict() if self.text_style else None,
             "source_duration": self.source_duration,
             "asset_id": self.asset_id,
@@ -890,6 +941,7 @@ class Clip:
             reframe_mode=enum(ReframeMode, "reframe_mode", ReframeMode.FIT),
             crop_focus_x=data.get("crop_focus_x", 0.5),
             crop_focus_y=data.get("crop_focus_y", 0.5),
+            crop_focus_keyframes=_clean_focus_keyframes(data.get("crop_focus_keyframes")),
             text_style=TextStyle.from_dict(text_style) if text_style else None,
             source_duration=data.get("source_duration"),
             asset_id=data.get("asset_id"),

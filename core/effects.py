@@ -145,6 +145,47 @@ def _build_denoise(p: Dict[str, Any]) -> str:
     return f"hqdn3d={s:.3f}:{s * 0.75:.3f}:{s * 1.5:.3f}:{s * 1.125:.3f}"
 
 
+# F36: lift/gamma/gain as three colour wheels. Each wheel is a hue (degrees) and a strength; the
+# push is split over R, G and B by the cosine of the hue's distance to each primary, so it sums to
+# zero (the brightness stays put) -- what dragging a wheel's puck does. FFmpeg colorbalance takes
+# -1..1 per channel and tonal range; pl=1 keeps each pixel's lightness.
+WHEEL_RANGES = (("shadows", "s"), ("midtones", "m"), ("highlights", "h"))
+
+
+def wheel_offsets(hue: float, strength: float) -> Tuple[float, float, float]:
+    import math
+
+    angle = math.radians(float(hue))
+    return tuple(float(strength) * math.cos(angle - math.radians(phase)) * 2.0 / 3.0 for phase in (0.0, 120.0, 240.0))
+
+
+def _build_color_wheels(p: Dict[str, Any]) -> str:
+    parts = []
+    for name, key in WHEEL_RANGES:
+        r, g, b = wheel_offsets(p[f"{name}_hue"], p[f"{name}_strength"])
+        parts.append(f"r{key}={r:.4f}:g{key}={g:.4f}:b{key}={b:.4f}")
+    return f"colorbalance={':'.join(parts)}:pl={1 if p['preserve_lightness'] else 0},format=yuva420p"
+
+
+def _color_wheels_active(p: Dict[str, Any]) -> bool:
+    return any(float(p[f"{name}_strength"]) > 1e-4 for name, _key in WHEEL_RANGES)
+
+
+def _build_color_levels(p: Dict[str, Any]) -> str:
+    """Per-channel black/white points (Auto color, core/auto_color.py)."""
+    parts = []
+    for channel in "rgb":
+        low, high = float(p[f"{channel}_low"]), float(p[f"{channel}_high"])
+        if high <= low:
+            high = min(1.0, low + 0.01)
+        parts.append(f"{channel}imin={low:.4f}:{channel}imax={high:.4f}")
+    return f"colorlevels={':'.join(parts)},format=yuva420p"
+
+
+def _color_levels_active(p: Dict[str, Any]) -> bool:
+    return any(abs(float(p[f"{c}_low"])) > 1e-4 or abs(float(p[f"{c}_high"]) - 1.0) > 1e-4 for c in "rgb")
+
+
 #: Key under which core.filter_graph passes a stabilized clip's motion
 #: analysis file (see core/stabilize.py) to the ``stabilize`` builder.
 ANALYSIS_FILE_PARAM = "_analysis_file"
@@ -178,6 +219,36 @@ REGISTRY: Dict[str, EffectKind] = {
             _build_color_correction,
             description="Brightness, contrast, saturation and gamma (FFmpeg eq); every value can be keyframed.",
             active=_color_correction_active,
+        ),
+        EffectKind(
+            "color_wheels", "Color Wheels (Lift / Gamma / Gain)",
+            tuple(
+                spec
+                for name, label in (("shadows", "Lift (shadows)"), ("midtones", "Gamma (midtones)"), ("highlights", "Gain (highlights)"))
+                for spec in (
+                    ParamSpec(f"{name}_hue", f"{label} hue", "float", 0.0, 0.0, 360.0, 1.0),
+                    ParamSpec(f"{name}_strength", f"{label} strength", "float", 0.0, 0.0, 1.0, 0.01),
+                )
+            ) + (ParamSpec("preserve_lightness", "Preserve lightness", "bool", True),),
+            _build_color_wheels,
+            description="Tint the shadows, midtones and highlights separately: a hue (0 = red, 120 = green, "
+                        "240 = blue) and a strength for each wheel.",
+            active=_color_wheels_active,
+        ),
+        EffectKind(
+            "color_levels", "Levels (Auto Color)",
+            tuple(
+                spec
+                for channel, label in (("r", "Red"), ("g", "Green"), ("b", "Blue"))
+                for spec in (
+                    ParamSpec(f"{channel}_low", f"{label} black point", "float", 0.0, 0.0, 0.9, 0.005),
+                    ParamSpec(f"{channel}_high", f"{label} white point", "float", 1.0, 0.1, 1.0, 0.005),
+                )
+            ),
+            _build_color_levels,
+            description="Per-channel black and white points. Effect > Auto Color measures the frame under the "
+                        "playhead and sets them, which also removes a colour cast.",
+            active=_color_levels_active,
         ),
         EffectKind(
             "colorkey", "Chroma Key (RGB)",
@@ -355,6 +426,12 @@ class EffectInstance:
         """A copy with ``fn`` applied to every parameter's keyframe list (trims and splits)."""
         clone = copy.deepcopy(self)
         clone.keyframes = {name: [tuple(k) for k in fn(list(keys))] for name, keys in self.keyframes.items()}
+        if clone.mask:
+            # A tracked centre (F32) and mask keyframes (F16) are clip-local too.
+            for key in ("track", "keyframes"):
+                if clone.mask.get(key):
+                    clone.mask[key] = [list(k) for k in fn([tuple(k) for k in clone.mask[key]])]
+            clone.mask = _clean_mask(clone.mask)
         return clone
 
     def to_dict(self) -> Dict[str, Any]:

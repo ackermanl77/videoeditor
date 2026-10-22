@@ -69,6 +69,7 @@ from ui.import_worker import ImportWorker
 from ui.window_projects import ProjectsMixin, PROJECT_FILE_FILTER, MAX_RECENT_PROJECTS, _recent_projects_path, _load_recent_projects, _save_recent_projects  # noqa: F401
 from ui.window_media import MediaMixin, _cache_dir, _waveform_cache_dir, AUTO_PROXY_SETTING  # noqa: F401
 from ui.window_render import RenderMixin  # noqa: F401
+from ui.window_tools import ToolsMixin
 from ui.relink_dialog import RelinkDialog
 from ui.render_queue import RenderQueueWidget
 from ui.media_bin import MediaBinWidget
@@ -95,7 +96,7 @@ def _strict_mode() -> bool:
     return os.environ.get("VIDEO_EDITOR_STRICT", "") not in ("", "0")
 
 
-class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, QMainWindow):
+class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow):
     # (asset id, proxy path or None) from a proxy-encoding thread.
     _proxy_finished = Signal(str, object)
     # (files measured, of which decode on the GPU) from the decoder-timing thread (PG2).
@@ -323,6 +324,9 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, QMainWindow):
         self._add_action(edit_menu, "Slide Clip...", self.timeline.slide_selected)
         self._add_action(edit_menu, "Detect Scene Cuts...", self.detect_scene_cuts)
         self._add_action(edit_menu, "Track Motion...", self.track_motion)
+        self._add_action(edit_menu, "Keep Subject in Frame...", self.track_reframe)
+        self._add_action(edit_menu, "Auto Color", self.auto_color, "Shift+C")
+        self._add_action(edit_menu, "Record Voiceover / Screen / Webcam...", self.record_media, "Ctrl+Shift+R")
         self._add_action(edit_menu, "Generate Captions...", self.generate_captions)
         self._add_action(edit_menu, "Ripple Move Clip...", self.timeline.ripple_move_selected)
         self.razor_action = self._add_action(edit_menu, "Razor Tool", self.timeline.set_razor_mode, "C")
@@ -615,6 +619,7 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, QMainWindow):
         self.media_bin.subclip_delete_requested.connect(self._delete_subclip)
         self.media_bin.proxy_requested.connect(self.generate_proxy_for)
         self.media_bin.relink_requested.connect(self.open_relink_dialog)
+        self.media_bin.spoken_hit_activated.connect(self.go_to_spoken)
         self.timeline.status_message.connect(lambda message: self.status_bar.showMessage(message, 5000))
         self.timeline.reveal_asset_requested.connect(self._reveal_asset)
 

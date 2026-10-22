@@ -157,9 +157,11 @@ def _whisper_words(wav_path: str, model_size: str, language: Optional[str],
 def transcribe_clip(clip: Clip, model_size: str = DEFAULT_MODEL, language: Optional[str] = None,
                     should_cancel: Optional[Callable[[], bool]] = None,
                     words_from: Optional[Callable[[str], Iterable[Word]]] = None,
-                    ffmpeg: Optional[str] = None, style: str = "lines", translate: bool = False) -> List[SubtitleCue]:
+                    ffmpeg: Optional[str] = None, style: str = "lines", translate: bool = False,
+                    on_words: Optional[Callable[[List[list]], None]] = None) -> List[SubtitleCue]:
     """Caption cues for ``clip``'s trimmed audio, in timeline seconds. ``words_from(wav_path)``
-    replaces faster-whisper (tests)."""
+    replaces faster-whisper (tests). ``on_words`` receives the words as ``[start, end, word]`` in
+    seconds of the clip's source file (F37: the media bin's speech search)."""
     from core.scene_detect import timeline_offset_for_source
 
     problem = transcribable_problem(clip)
@@ -186,6 +188,8 @@ def transcribe_clip(clip: Clip, model_size: str = DEFAULT_MODEL, language: Optio
             os.remove(wav)
         except OSError:
             pass
+    if on_words is not None:
+        on_words([[clip.source_in + w.start, clip.source_in + w.end, w.text.strip()] for w in words if w.text.strip()])
     cues = []
     for cue in group_words(words, style):
         start = timeline_offset_for_source(clip, min(clip.source_out, clip.source_in + cue.start))

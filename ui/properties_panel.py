@@ -364,12 +364,18 @@ class PropertiesPanel(QWidget):
             combo = QComboBox()
             for easing in EASINGS:
                 combo.addItem(EASING_LABELS[easing], easing)
+            combo.addItem("Custom curve", "curve")  # F39: shaped in the keyframe graph
             combo.setToolTip("How the value moves between keyframes: Linear (steady), Ease In (starts slow), "
                              "Ease Out (ends slow), Ease In-Out (both), Hold (jumps at each keyframe).")
             combo.currentIndexChanged.connect(lambda _index, tg=target, cb=combo: self._commit_easing(tg, cb.currentData()))
             form.addRow(label, combo)
             self.easing_combos[target] = combo
         kf_layout.addLayout(easing_form)
+        self.graph_btn = QPushButton("Keyframe Graph…")
+        self.graph_btn.setToolTip("See a property's keyframes as a curve: drag keyframes, and drag handles to "
+                                  "shape the easing (F39).")
+        self.graph_btn.clicked.connect(self.open_keyframe_graph)
+        kf_layout.addWidget(self.graph_btn)
 
         kf_layout.addWidget(QLabel(
             "Speed Ramp — 2+ keyframes override the Speed field above; time is seconds from "
@@ -750,7 +756,10 @@ class PropertiesPanel(QWidget):
         self.denoise_checkbox.setChecked(clip.denoise_enabled)
         self.denoise_strength_slider.setValue(int(clip.denoise_strength))
         for target, combo in self.easing_combos.items():
-            combo.setCurrentIndex(max(0, combo.findData(clip.easing_for(target))))
+            easing = clip.easing_for(target)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData("curve" if easing.startswith("curve:") else easing)))
+            combo.blockSignals(False)
         for name, widget in self.audio_fx_widgets.items():
             value = getattr(clip, name)
             widget.setChecked(value) if isinstance(widget, QCheckBox) else widget.setValue(value)
@@ -930,10 +939,30 @@ class PropertiesPanel(QWidget):
         clip = self._current_clip()
         if clip is None:
             return
+        if easing == "curve":
+            current = clip.easing_for(target)
+            if current.startswith("curve:"):
+                return
+            easing = "curve:0.000,0.000"  # starts as a smooth in-out; shape it in the keyframe graph
         easing_map = {key: value for key, value in clip.keyframe_easing.items() if key != target}
         if easing != "linear":
             easing_map[target] = easing
         self._commit_now("keyframe_easing", easing_map, "Edit Keyframe Easing")
+
+    def open_keyframe_graph(self):
+        """F39: the keyframe graph of the selected clip; its edits go through this panel's undo steps."""
+        from ui.keyframe_graph import KeyframeGraphDialog
+
+        dialog = KeyframeGraphDialog(
+            self._current_clip,
+            lambda attribute, keyframes: self._commit_now(attribute, keyframes, "Edit Keyframes in Graph"),
+            self._commit_easing,
+            self,
+        )
+        dialog.finished.connect(lambda _result: self.set_selected_clip(self.clip_id) if self.clip_id else None)
+        dialog.show()
+        self._keyframe_graph = dialog
+        return dialog
 
     def _commit_now(self, attribute: str, value, label: str) -> bool:
         """A discrete edit (checkbox, combo, spin box, button): its own undo step."""
@@ -1195,6 +1224,60 @@ class PropertiesPanel(QWidget):
         track_row.addWidget(track_label, 1)
         form.addRow("Follow", track_row)
 
+        # Keyframed masks (F16): a snapshot of centre/size/angle/feather at the playhead; 2+ animate.
+        keys_row = QHBoxLayout()
+        key_btn = QPushButton("Keyframe Here")
+        key_btn.setToolTip("Store the mask's current centre, size, angle and feather at the playhead. "
+                           "With two or more keyframes the mask moves and reshapes between them.")
+        clear_keys_btn = QPushButton("Clear Keyframes")
+        keys_label = QLabel("")
+        keys_label.setStyleSheet("color: #9aa1ad;")
+        keys_row.addWidget(key_btn)
+        keys_row.addWidget(clear_keys_btn)
+        keys_row.addWidget(keys_label, 1)
+        form.addRow("Animate", keys_row)
+
+        def refresh_keys_label():
+            existing = self._current_effect_mask(row) or {}
+            keys = existing.get("keyframes") or []
+            pending = existing.get("_pending_keyframe")
+            keys_label.setText(f"{len(keys)} keyframes" if keys else ("1 keyframe (add another)" if pending else ""))
+            clear_keys_btn.setEnabled(bool(keys) or bool(pending))
+
+        def add_mask_keyframe():
+            from core.effect_masks import KEYFRAME_PARAMS
+
+            clip = self._current_clip()
+            existing = clean_mask(self._current_effect_mask(row))
+            if clip is None or existing is None:
+                return
+            t = round(min(max(0.0, self.playhead_time - clip.timeline_start), clip.duration), 4)
+            snapshot = [t] + [fields[key][0].value() / fields[key][1] for key in KEYFRAME_PARAMS]
+            raw = self._current_effect_mask(row) or {}
+            keys = [list(k) for k in (raw.get("keyframes") or ([raw["_pending_keyframe"]] if raw.get("_pending_keyframe") else []))]
+            keys = [k for k in keys if abs(k[0] - t) > 1e-6] + [snapshot]
+            existing.pop("keyframes", None)
+            if len(keys) >= 2:
+                existing["keyframes"] = sorted(keys)
+                self.set_effect_mask(row, existing)
+            else:
+                # One keyframe animates nothing yet: remember it on the effect (not rendered) for the next.
+                clip.effects[row].mask = {**existing, "_pending_keyframe": snapshot}
+            refresh_keys_label()
+
+        def clear_mask_keyframes():
+            existing = clean_mask(self._current_effect_mask(row))
+            clip = self._current_clip()
+            if existing is not None and clip is not None:
+                existing.pop("keyframes", None)
+                clip.effects[row].mask.pop("_pending_keyframe", None) if clip.effects[row].mask else None
+                self.set_effect_mask(row, existing)
+            refresh_keys_label()
+
+        key_btn.clicked.connect(add_mask_keyframe)
+        clear_keys_btn.clicked.connect(clear_mask_keyframes)
+        refresh_keys_label()
+
         def refresh_track_label():
             track = (clean_mask(self._current_effect_mask(row)) or {}).get("track") or []
             track_label.setText(f"follows an object ({len(track)} keys)" if track else "")
@@ -1207,6 +1290,8 @@ class PropertiesPanel(QWidget):
             existing = clean_mask(self._current_effect_mask(row)) or {}
             if mask is not None and existing.get("track"):
                 mask["track"] = existing["track"]
+            if mask is not None and existing.get("keyframes"):
+                mask["keyframes"] = existing["keyframes"]
             self.set_effect_mask(row, mask)
 
         def clear_track():

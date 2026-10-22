@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 #: ffprobe ``color_transfer`` values that mark a source as HDR (PQ / HLG).
 HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
@@ -47,6 +47,9 @@ class MediaAsset:
     # Low-resolution, short-GOP copy used by the preview only (export always
     # reads the original ``path``). None until one is generated.
     proxy_path: Optional[str] = None
+    # Words recognised by Generate Captions (F37): [start, end, word], seconds in this file;
+    # the media bin searches them (core/transcript_search.py).
+    transcript: List[list] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -82,4 +85,9 @@ class MediaAsset:
         # Unknown keys (from a newer version, or a hand-edited file) are
         # ignored rather than raising TypeError in __init__.
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}
+        if "transcript" in values:
+            from core.transcript_search import clean_transcript
+
+            values["transcript"] = clean_transcript(values["transcript"])
+        return cls(**values)

@@ -73,6 +73,17 @@ def project_argument(argv: list[str]) -> str | None:
     return None
 
 
+#: Media types Explorer's "Edit with Open Video Editor" passes (F38, installer/VideoEditor.iss).
+MEDIA_ARGUMENT_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg", ".mts",
+                             ".m2ts", ".mp3", ".wav", ".m4a", ".flac", ".ogg")
+
+
+def media_arguments(argv: list[str]) -> list[str]:
+    """Media files given on the command line ("Edit with Open Video Editor" in Explorer), existing ones only."""
+    return [os.path.abspath(arg) for arg in argv[1:]
+            if not arg.startswith("-") and arg.lower().endswith(MEDIA_ARGUMENT_EXTENSIONS) and os.path.isfile(arg)]
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         # Checks the bundled FFmpeg, required filters and a real one-second
@@ -117,6 +128,10 @@ def main() -> int:
         # zero-delay timer), so a recovered session still gets the
         # "discard unsaved changes?" question before the file replaces it.
         QTimer.singleShot(0, lambda: window.open_project_file(project_path))
+    media_paths = media_arguments(sys.argv)
+    if media_paths and not project_path:
+        # F38: imported into the media bin of the new project, after any autosave-recovery offer.
+        QTimer.singleShot(0, lambda: window.import_media_paths(media_paths))
 
     if splash is not None:
         splash.finish(window)

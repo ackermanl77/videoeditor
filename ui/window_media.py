@@ -197,7 +197,8 @@ class MediaMixin:
                 try:
                     result["cues"] = transcribe_clip(clip, model_size, language or None,
                                                      should_cancel=progress.wasCanceled, words_from=words_from,
-                                                     style=style, translate=translate)
+                                                     style=style, translate=translate,
+                                                     on_words=lambda words: result.update(words=words))
                 except TranscriptionCancelled:
                     result["cancelled"] = True
                 except Exception as exc:  # noqa: BLE001 -- shown to the user
@@ -213,6 +214,7 @@ class MediaMixin:
         if "error" in result:
             QMessageBox.warning(self, title, f"The clip couldn't be transcribed:\n{result['error']}")
             return 0
+        self._remember_transcript(clip, result.get("words") if not translate else None)
         clips = cues_to_text_clips(result.get("cues", []), name_prefix="Caption")
         if not clips:
             QMessageBox.information(self, title, "No speech was recognised in this clip.")
@@ -220,6 +222,28 @@ class MediaMixin:
         self._add_caption_clips(clips, "Generate Captions")
         self.status_bar.showMessage(f"Added {len(clips)} caption(s).", 5000)
         return len(clips)
+
+    def _remember_transcript(self, clip, words) -> None:
+        """Keep the recognised words on the clip's asset for the media bin's speech search (F37)."""
+        from core.transcript_search import merge_transcript
+
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or not words:
+            return
+        asset.transcript = merge_transcript(asset.transcript, words)
+        self._refresh_media_bin()
+        self._on_project_modified()
+
+    def go_to_spoken(self, asset_id: str, source_time: float) -> bool:
+        """A speech-search hit (F37): move the playhead to where the timeline plays that moment."""
+        from core.transcript_search import timeline_time_for
+
+        when = timeline_time_for(self.project, asset_id, source_time)
+        if when is None:
+            self.status_bar.showMessage("That moment isn't on the timeline yet: add the clip first.", 6000)
+            return False
+        self.timeline.set_playhead(when)
+        return True
 
     def _ask_keep_subtitle_styling(self) -> Optional[bool]:
         """True = keep the ASS/SSA styling, False = plain text, None = cancel."""
@@ -333,6 +357,8 @@ class MediaMixin:
 
     def _on_asset_imported(self, asset: MediaAsset) -> None:
         self.project.add_media_asset(asset)
+        if hasattr(self, "_place_pending_voiceover"):
+            self._place_pending_voiceover(asset)  # F34: a recorded voiceover goes onto the timeline
         self.import_progress.setValue(self.import_progress.value() + 1)
         self._refresh_media_bin()
         self._mark_dirty()

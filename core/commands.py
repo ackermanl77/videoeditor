@@ -126,7 +126,7 @@ class TrimClipCommand(Command):
         self.label = "Trim Clip"
 
     _FIELDS = ("source_in", "source_out", "timeline_start", "freeze_frame_duration", "speed_keyframes",
-               "opacity_keyframes", "position_keyframes", "volume_keyframes")
+               "opacity_keyframes", "position_keyframes", "volume_keyframes", "crop_focus_keyframes")
 
     @classmethod
     def _snapshot(cls, clip: Clip) -> dict:
@@ -199,6 +199,7 @@ class SplitClipCommand(Command):
         tail_timeline = clip.duration + clip_freeze - offset_in_timeline
         second.opacity_keyframes = _keyframes_after(clip.opacity_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("opacity"))
         second.position_keyframes = _keyframes_after(clip.position_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("position"))
+        second.crop_focus_keyframes = _keyframes_after(clip.crop_focus_keyframes, offset_in_timeline, tail_timeline, "linear")
         second.volume_keyframes = _keyframes_after(clip.volume_keyframes, offset_in_timeline, tail_timeline, clip.easing_for("volume"))
         second.effects = [
             e.with_keyframes_mapped(lambda keys: _keyframes_after(keys, offset_in_timeline, tail_timeline, clip.easing_for("effects")))
@@ -220,6 +221,7 @@ class SplitClipCommand(Command):
         clip.fade_out = 0.0
         clip.opacity_keyframes = _keyframes_before(clip.opacity_keyframes, offset_in_timeline, clip.easing_for("opacity"))
         clip.position_keyframes = _keyframes_before(clip.position_keyframes, offset_in_timeline, clip.easing_for("position"))
+        clip.crop_focus_keyframes = _keyframes_before(clip.crop_focus_keyframes, offset_in_timeline, "linear")
         clip.volume_keyframes = _keyframes_before(clip.volume_keyframes, offset_in_timeline, clip.easing_for("volume"))
         clip.effects = [
             e.with_keyframes_mapped(lambda keys: _keyframes_before(keys, offset_in_timeline, clip.easing_for("effects"))) for e in clip.effects

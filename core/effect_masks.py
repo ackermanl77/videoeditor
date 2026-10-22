@@ -14,7 +14,12 @@ frame's aspect, cached as a PGM file, and in the filter graph scaled to the fram
 ``scale2ref``, split into a full four-plane ``yuva420p`` mask (``mergeplanes``: every plane, alpha
 included, gets the mask -- a grey image converted to YUV would have neutral chroma and half-blend
 the colour), and the effect's output merged over the unaffected frame with ``maskedmerge``. Masks
-are static (not keyframed).
+can also be keyframed (below).
+
+Keyframed masks (F16): ``mask["keyframes"]`` is a list of ``[clip-local seconds, cx, cy, w, h, angle,
+feather]`` snapshots (2+ animate). Each value becomes a piecewise-linear expression of the stream time
+and the mask is drawn per frame with ``geq``, exactly like a tracked mask; with a track too, the track
+drives the centre and the keyframes the rest.
 
 Tracked masks (F32): ``mask["track"]`` is a list of ``[clip-local seconds, cx, cy]`` -- the centre
 following an object tracked in the clip's own footage (Edit the effect > Track Mask..., which runs
@@ -40,6 +45,8 @@ DEFAULT_MASK: Dict[str, Any] = {"shape": "none", "cx": 0.5, "cy": 0.5, "w": 0.5,
 _LIMITS = {"cx": (-0.5, 1.5), "cy": (-0.5, 1.5), "w": (0.0, 2.0), "h": (0.0, 2.0), "angle": (-360.0, 360.0),
            "feather": (0.0, 0.5)}
 _labels = itertools.count(1)
+#: The animatable mask values, in the order a keyframe stores them after its time.
+KEYFRAME_PARAMS = ("cx", "cy", "w", "h", "angle", "feather")
 
 
 def clean_mask(mask: Any) -> Optional[Dict[str, Any]]:
@@ -57,7 +64,48 @@ def clean_mask(mask: Any) -> Optional[Dict[str, Any]]:
     track = clean_track(mask.get("track"))
     if track:
         clean["track"] = track
+    keyframes = clean_mask_keyframes(mask.get("keyframes"))
+    if keyframes:
+        clean["keyframes"] = keyframes
     return clean
+
+
+def clean_mask_keyframes(value: Any) -> list:
+    """Mask keyframes [[t, cx, cy, w, h, angle, feather], ...], values clamped, sorted, 2+ (else [])."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    for entry in value:
+        try:
+            numbers = [float(v) for v in entry]
+        except (TypeError, ValueError):
+            continue
+        if len(numbers) != 1 + len(KEYFRAME_PARAMS) or not all(math.isfinite(v) for v in numbers) or numbers[0] < 0:
+            continue
+        row = [round(numbers[0], 4)]
+        for key, number in zip(KEYFRAME_PARAMS, numbers[1:]):
+            low, high = _LIMITS[key]
+            row.append(round(min(max(number, low), high), 5))
+        out.append(row)
+    out.sort(key=lambda k: k[0])
+    return out if len(out) >= 2 else []
+
+
+def is_animated(mask: Dict[str, Any]) -> bool:
+    return bool(mask.get("track") or mask.get("keyframes"))
+
+
+def mask_at(mask: Dict[str, Any], t: float) -> Dict[str, Any]:
+    """The mask's values at clip-local time ``t`` (keyframes, then the track's centre) -- the preview's view."""
+    from core.clip import interpolate_keyframes
+
+    out = dict(mask)
+    if mask.get("keyframes"):
+        values = interpolate_keyframes([tuple(k) for k in mask["keyframes"]], t)
+        out.update(dict(zip(KEYFRAME_PARAMS, values)))
+    if mask.get("track"):
+        out["cx"], out["cy"] = interpolate_keyframes([tuple(k) for k in mask["track"]], t)
+    return out
 
 
 def clean_track(value: Any) -> list:
@@ -81,19 +129,34 @@ def tracked_mask_expr(mask: Dict[str, Any], t_var: str = "T") -> str:
     The same geometry as mask_value(), in units of the frame's shorter side (from W/H)."""
     from core.filter_graph import _piecewise_linear_expr
 
-    track = mask["track"]
-    cx = _piecewise_linear_expr([(t, x) for t, x, _y in track], t_var)
-    cy = _piecewise_linear_expr([(t, y) for t, _x, y in track], t_var)
+    keyframes = mask.get("keyframes") or []
+
+    def value(name: str) -> str:
+        if keyframes:
+            index = 1 + KEYFRAME_PARAMS.index(name)
+            return f"({_piecewise_linear_expr([(k[0], k[index]) for k in keyframes], t_var)})"
+        return f"{mask[name]:.6f}"
+
+    track = mask.get("track")
+    if track:
+        cx = _piecewise_linear_expr([(t, x) for t, x, _y in track], t_var)
+        cy = _piecewise_linear_expr([(t, y) for t, _x, y in track], t_var)
+    else:
+        cx, cy = value("cx"), value("cy")
     sx, sy = "max(W/H,1)", "max(H/W,1)"
     dx, dy = f"((X/W-({cx}))*{sx})", f"((Y/H-({cy}))*{sy})"
-    angle = math.radians(mask["angle"])
-    cos_a, sin_a = f"{math.cos(angle):.6f}", f"{math.sin(angle):.6f}"
-    feather = f"{max(mask['feather'], 1e-6):.6f}"
+    if keyframes:
+        cos_a, sin_a = f"cos({value('angle')}*PI/180)", f"sin({value('angle')}*PI/180)"
+        feather = f"max({value('feather')},0.000001)"
+    else:
+        angle = math.radians(mask["angle"])
+        cos_a, sin_a = f"{math.cos(angle):.6f}", f"{math.sin(angle):.6f}"
+        feather = f"{max(mask['feather'], 1e-6):.6f}"
     if mask["shape"] == "linear":
         value = f"(0.5+({dx}*{cos_a}+{dy}*{sin_a})/{feather})"
     else:
         u, v = f"({dx}*{cos_a}+{dy}*{sin_a})", f"(-{dx}*{sin_a}+{dy}*{cos_a})"
-        hw, hh = f"max({mask['w']:.6f}*{sx}/2,0.000001)", f"max({mask['h']:.6f}*{sy}/2,0.000001)"
+        hw, hh = f"max({value('w')}*{sx}/2,0.000001)", f"max({value('h')}*{sy}/2,0.000001)"
         if mask["shape"] == "rectangle":
             outside = f"max(abs({u})-{hw},abs({v})-{hh})"
         else:
@@ -168,7 +231,7 @@ def masked_filter(effect_filter: str, mask: Dict[str, Any], aspect: float, t_off
     from core.effects import _escape
 
     n = next(_labels)
-    if mask.get("track"):
+    if is_animated(mask):
         t_var = "T" if abs(t_offset) < 1e-9 else f"(T+{t_offset:.6f})"
         # The per-pixel geq runs on a copy a quarter of the size (16x fewer pixels; the mask is soft
         # anyway) and is scaled back onto the frame with scale2ref, so the sizes always match.

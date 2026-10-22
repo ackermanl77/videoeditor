@@ -137,10 +137,16 @@ def _fit_or_fill(
     matrix = _scale_matrix(asset, color)
     pre = effect_filters(clip.effects, "pre", t_offset, aspect=_source_aspect(asset, width, height), easing=clip.easing_for("effects"))
     if clip.reframe_mode == ReframeMode.FILL:
+        fx, fy = f"{clip.crop_focus_x:.4f}", f"{clip.crop_focus_y:.4f}"
+        if len(clip.crop_focus_keyframes) >= 2:
+            # F35: the crop follows a tracked subject; crop evaluates x/y per frame.
+            t_var = "t" if abs(t_offset) < 1e-9 else f"(t+{t_offset:.6f})"
+            fx = _piecewise_linear_expr([(t, x) for t, x, _y in clip.crop_focus_keyframes], t_var)
+            fy = _piecewise_linear_expr([(t, y) for t, _x, y in clip.crop_focus_keyframes], t_var)
         return (
             f",scale={width}:{height}:force_original_aspect_ratio=increase{matrix}{pre},format=yuva420p"
-            f",crop={width}:{height}:'(iw-{width})*{clip.crop_focus_x:.4f}'"
-            f":'(ih-{height})*{clip.crop_focus_y:.4f}'"
+            f",crop={width}:{height}:'(iw-{width})*{fx}'"
+            f":'(ih-{height})*{fy}'"
         )
     out = f",scale={width}:{height}:force_original_aspect_ratio=decrease{matrix}{pre},format=yuva420p"
     if pad:

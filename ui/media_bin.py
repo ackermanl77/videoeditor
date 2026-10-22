@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -84,6 +85,7 @@ class MediaBinWidget(QWidget):
     relink_requested = Signal()  # open File > Relink Media
     subclip_rename_requested = Signal(str)  # "sub:<id>"
     subclip_delete_requested = Signal(str)
+    spoken_hit_activated = Signal(str, float)  # asset id, source seconds (F37)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -104,6 +106,21 @@ class MediaBinWidget(QWidget):
         self.import_btn.clicked.connect(self._on_import_clicked)
         header.addWidget(self.import_btn)
         layout.addLayout(header)
+
+        # F37: search what is said in the clips (words kept by Generate Captions).
+        self.speech_search = QLineEdit()
+        self.speech_search.setPlaceholderText("Search speech…")
+        self.speech_search.setToolTip("Find clips by what is said in them (after Generate Captions); "
+                                      "double-click a result to go there.")
+        self.speech_search.setClearButtonEnabled(True)
+        self.speech_search.textChanged.connect(self._on_speech_search)
+        layout.addWidget(self.speech_search)
+        self.speech_results = QListWidget()
+        self.speech_results.setVisible(False)
+        self.speech_results.setMaximumHeight(160)
+        self.speech_results.itemActivated.connect(self._on_speech_hit)
+        self.speech_results.itemDoubleClicked.connect(self._on_speech_hit)
+        layout.addWidget(self.speech_results)
 
         self.list_widget = MediaListWidget()
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -134,6 +151,32 @@ class MediaBinWidget(QWidget):
         asset_id = item.data(Qt.UserRole)
         if asset_id:
             self.add_to_timeline_requested.emit(str(asset_id))
+
+    def _on_speech_search(self, text: str) -> None:
+        from core.transcript_search import search
+
+        self.speech_results.clear()
+        query = text.strip()
+        if not query:
+            self.speech_results.setVisible(False)
+            return
+        hits = search(self._assets, query)
+        if not hits:
+            item = QListWidgetItem("Not found (only clips you've generated captions for are searchable)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.speech_results.addItem(item)
+        for hit in hits:
+            minutes, seconds = divmod(int(hit.start), 60)
+            item = QListWidgetItem(f"{hit.asset_name} {minutes}:{seconds:02d} — {hit.snippet}")
+            item.setData(Qt.UserRole, (hit.asset_id, hit.start))
+            item.setToolTip(hit.snippet)
+            self.speech_results.addItem(item)
+        self.speech_results.setVisible(True)
+
+    def _on_speech_hit(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.UserRole)
+        if data:
+            self.spoken_hit_activated.emit(str(data[0]), float(data[1]))
 
     def selected_asset_id(self):
         item = self.list_widget.currentItem()

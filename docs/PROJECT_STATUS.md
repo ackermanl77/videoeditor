@@ -82,6 +82,34 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **2026-10-21: recording, subject-following reframe, colour wheels + Auto Color, speech search,
+  Explorer verb, keyframe graph, keyframed masks (F34-F39, F16).**
+  - F34 `core/recording.py`, Edit > Record Voiceover / Screen / Webcam (Ctrl+Shift+R): FFmpeg DirectShow
+    (microphone/webcam, opened by DirectShow's unique "Alternative name") and `gdigrab` (screen), stopped
+    with "q" so the file is finalised. Files go to `Videos\Open Video Editor\Recordings` and the media bin;
+    a voiceover is placed at the playhead on a free audio track (or a new one) via `build_add_clip_command`.
+    Checked for real: 2.5 s of microphone (WAV) and of the screen (MP4).
+  - F35 `Clip.crop_focus_keyframes` + `motion_track.reframe_keyframes()` (f = (x - v/2)/(1 - v), clamped,
+    lightly smoothed); the Fill `crop` takes a per-frame expression; Edit > Keep Subject in Frame tracks the
+    object and sets Fill + the keyframes in one undo step. Rebased on trim and split. A render test checks a
+    moving square stays centred in a 9:16 crop (and that a fixed crop loses it).
+  - F36 effect kinds `color_wheels` (lift/gamma/gain as hue + strength per range, FFmpeg `colorbalance`,
+    brightness-neutral offsets) and `color_levels` (per-channel `colorlevels`); Edit > Auto Color (Shift+C)
+    measures the frame under the playhead (`core/auto_color.py`, 0.5/99.5 % per channel, pure Python).
+  - F37 `MediaAsset.transcript` (words in source seconds, kept by Generate Captions) and
+    `core/transcript_search.py`; the media bin's "Search speech…" box finds phrases (accents/case ignored)
+    and a hit moves the playhead to where a timeline clip plays it.
+  - F38 the installer registers "Edit with Open Video Editor" for 16 media types under
+    `HKCU\Software\Classes\SystemFileAssociations\<ext>\shell`; `main.py` imports media files it is given.
+    The installer compiles with Inno Setup 6.
+  - F39 the keyframe graph (Properties > Keyframe Graph…, `ui/keyframe_graph.py`): opacity, volume and
+    position X/Y as curves; drag keyframes; drag two handles to shape a custom "curve:m0,m1" easing (a cubic
+    Hermite, exact in the FFmpeg expression).
+  - F16 now animates: mask keyframes `[t, cx, cy, w, h, angle, feather]` (Keyframe Here / Clear Keyframes
+    in the mask editor) render per frame through the tracked-mask `geq` path; mask keyframes and tracks are
+    rebased on trim/split (which also fixes trimmed tracked masks).
+  - Tests: `tests/test_competitor_features.py` (19, with real FFmpeg renders).
+
 - **Subclips, workspaces, tracked masks (2026-10-19, F29/F30/F32).**
   - **F29:** `core/subclips.py` (`Subclip`, `Project.subclips` saved without a format bump, undoable
     add/rename/remove).

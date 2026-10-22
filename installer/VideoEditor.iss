@@ -71,6 +71,56 @@ Root: HKCU; Subkey: "Software\Classes\{#ProjectProgId}\shell\open\command"; Valu
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExe}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExe}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".vproj"; ValueData: ""
+; F38: "Edit with Open Video Editor" on media files (per user; the file's own default app is
+; left alone). main.py imports the files it is given into the media bin.
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp4\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp4\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp4\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mov\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mov\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mov\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mkv\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mkv\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mkv\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avi\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avi\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avi\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.webm\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.webm\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.webm\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4v\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4v\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4v\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wmv\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wmv\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wmv\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpg\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpeg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpeg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mpeg\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mts\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mts\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mts\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m2ts\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m2ts\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m2ts\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp3\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp3\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.mp3\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wav\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wav\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.wav\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4a\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4a\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.m4a\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.flac\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.flac\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.flac\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ogg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: ""; ValueData: "Edit with {#AppName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ogg\shell\{#AppKey}.Edit"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ogg\shell\{#AppKey}.Edit\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent

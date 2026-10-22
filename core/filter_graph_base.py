@@ -86,6 +86,13 @@ def _eased_fraction(u: str, easing: str) -> str:
         return f"({u}*(2-{u}))"
     if easing == "ease_in_out":
         return f"({u}*{u}*(3-2*{u}))"
+    from core.clip import curve_slopes
+
+    slopes = curve_slopes(easing)
+    if slopes is not None:  # F39: a cubic Hermite fraction, the same as core.clip.hermite()
+        m0, m1 = slopes
+        return (f"(({u}*{u}*{u}-2*{u}*{u}+{u})*{m0:.4f}+(3*{u}*{u}-2*{u}*{u}*{u})"
+                f"+({u}*{u}*{u}-{u}*{u})*{m1:.4f})")
     return u
 
 

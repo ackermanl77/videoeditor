@@ -493,6 +493,102 @@ class RenderMixin:
         self.statusBar().showMessage(f"The mask now follows the object: {len(track)} keyframes.", 5000)
         return ok
 
+    def track_reframe(self, box: Optional[Tuple[float, float, float, float]] = None) -> bool:
+        """Edit > Keep Subject in Frame (F35): track an object in the selected Fill clip and animate its
+        crop focus so a narrower export (9:16 from 16:9) keeps the subject centred -- one undo step.
+        ``box`` (fractions of the frame) skips the dialog."""
+        from PySide6.QtWidgets import QProgressDialog
+
+        from core.clip import ReframeMode
+        from core.commands import UpdateClipPropertyCommand
+        from core.motion_track import TRACK_WIDTH, TrackingCancelled, reframe_keyframes, track_object
+
+        title = "Keep Subject in Frame"
+        clip = self.project.find_clip(self.timeline.selected_clip_id) if self.timeline.selected_clip_id else None
+        if clip is None or clip.media_type != MediaType.VIDEO:
+            QMessageBox.information(self, title, "Select a video clip first.")
+            return False
+        asset = self.project.asset_for_clip(clip)
+        if asset is None or not asset.width or not asset.height:
+            QMessageBox.information(self, title, "The clip's video size is unknown (is its file offline?).")
+            return False
+        canvas = (self.project.settings.width, self.project.settings.height)
+        if abs(asset.width / asset.height - canvas[0] / canvas[1]) < 0.01:
+            QMessageBox.information(self, title, "The clip already has the project's shape: there is nothing to crop. "
+                                                 "Use it in a project with another aspect (e.g. 9:16).")
+            return False
+        local = min(max(0.0, self.timeline.playhead_time - clip.timeline_start), clip.playable_duration)
+        frame_time = clip.source_time_at(local)
+        if box is None:
+            import subprocess
+            import tempfile
+
+            from ui.motion_track_dialog import MotionTrackDialog
+
+            handle, png = tempfile.mkstemp(prefix="ve_track_frame_", suffix=".png")
+            os.close(handle)
+            try:
+                subprocess.run([find_binary("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-ss", f"{frame_time:.3f}",
+                                "-i", clip.source_path, "-frames:v", "1", "-vf", f"scale={TRACK_WIDTH}:-2", png],
+                               capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                image = QImage(png)
+            finally:
+                try:
+                    os.remove(png)
+                except OSError:
+                    pass
+            if image.isNull():
+                QMessageBox.warning(self, title, "The frame under the playhead couldn't be read.")
+                return False
+            dialog = MotionTrackDialog(image, clip.name, "the crop", self)
+            dialog.setWindowTitle(title)
+            dialog.keep_offset.setVisible(False)
+            if dialog.exec() != dialog.DialogCode.Accepted or dialog.picker.box() is None:
+                return False
+            box = dialog.picker.box()
+        progress = QProgressDialog("Tracking the subject…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        result: dict = {}
+        source_size = (asset.width, asset.height)
+
+        class _Worker(QThread):
+            def run(self_inner):
+                try:
+                    result["points"] = track_object(clip.source_path, clip.source_in, clip.source_out, frame_time, box,
+                                                    source_size, should_cancel=progress.wasCanceled)
+                except TrackingCancelled:
+                    result["cancelled"] = True
+                except Exception as exc:  # noqa: BLE001 -- shown to the user
+                    result["error"] = str(exc)
+
+        worker = _Worker(self)
+        worker.start()
+        while not worker.wait(50):
+            QApplication.processEvents()
+        progress.close()
+        if result.get("cancelled"):
+            return False
+        if "error" in result:
+            QMessageBox.warning(self, title, "The subject couldn't be tracked:\n" + result["error"])
+            return False
+        keyframes = reframe_keyframes(result.get("points", []), clip, source_size, canvas)
+        if len(keyframes) < 2:
+            QMessageBox.information(self, title, "The subject wasn't found in enough frames. Try a box with more detail.")
+            return False
+        from core.history import CompositeCommand
+
+        self.history.execute(CompositeCommand([
+            UpdateClipPropertyCommand(self.project, clip.id, "reframe_mode", ReframeMode.FILL, title),
+            UpdateClipPropertyCommand(self.project, clip.id, "crop_focus_keyframes", keyframes, title),
+        ], title))
+        self.timeline.refresh_clip(clip.id)
+        self.properties.set_selected_clip(clip.id)
+        self._on_project_modified()
+        self.statusBar().showMessage(f"The crop now follows the subject: {len(keyframes)} keyframes.", 5000)
+        return True
+
     def queue_export(self, settings) -> None:
         """Queue an export of the project as it is right now (a snapshot) and show the queue."""
         job = self.render_queue.add_job(self.project, settings)

@@ -228,6 +228,45 @@ def mask_track_keyframes(points: Sequence[TrackPoint], clip: Clip, source_size: 
     return [list(s) for s in simplified]
 
 
+def reframe_keyframes(points: Sequence[TrackPoint], clip: Clip, source_size: Tuple[int, int],
+                      canvas_size: Tuple[int, int], tolerance: float = SIMPLIFY_TOLERANCE,
+                      smoothing: int = 5) -> List[Tuple[float, float, float]]:
+    """F35: the Fill crop focus ``(clip-local seconds, fx, fy)`` that keeps a tracked subject in the
+    middle of a narrower canvas (a 16:9 shot exported 9:16). With v the visible fraction of the
+    source along the cropped axis, the subject at x lands at (x - (1-v)·f)/v; centring it gives
+    f = (x - v/2)/(1 - v), clamped so the crop never leaves the picture. A short moving average
+    (``smoothing`` samples) calms the tracker's jitter before simplifying."""
+    from core.scene_detect import timeline_offset_for_source
+
+    sw, sh = source_size
+    cw, ch = canvas_size
+    src_aspect, canvas_aspect = sw / max(1, sh), cw / max(1, ch)
+    samples = []
+    for point in points:
+        local = timeline_offset_for_source(clip, point.source_time)
+        if local is None:
+            continue
+        fx, fy = clip.crop_focus_x, clip.crop_focus_y
+        if src_aspect > canvas_aspect + 1e-9:
+            visible = canvas_aspect / src_aspect
+            fx = (point.x - visible / 2) / (1 - visible)
+        elif src_aspect < canvas_aspect - 1e-9:
+            visible = src_aspect / canvas_aspect
+            fy = (point.y - visible / 2) / (1 - visible)
+        samples.append((max(0.0, local), min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))))
+    samples.sort()
+    samples = [s for i, s in enumerate(samples) if i == 0 or s[0] - samples[i - 1][0] > 1e-6]
+    if smoothing > 1 and len(samples) > 2:
+        half = smoothing // 2
+        smoothed = []
+        for i, (t, _x, _y) in enumerate(samples):
+            window = samples[max(0, i - half): i + half + 1]
+            smoothed.append((t, sum(s[1] for s in window) / len(window), sum(s[2] for s in window) / len(window)))
+        samples = smoothed
+    samples = [(round(t, 4), round(x, 5), round(y, 5)) for t, x, y in samples]
+    return _simplify(samples, tolerance) if len(samples) >= 2 else samples
+
+
 def follow_keyframes(points: Sequence[TrackPoint], tracked: Clip, follower: Clip, source_size: Tuple[int, int],
                      canvas_size: Tuple[int, int], keep_offset: bool = True,
                      tolerance: float = SIMPLIFY_TOLERANCE) -> List[Tuple[float, float, float]]:
