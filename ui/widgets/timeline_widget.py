@@ -1208,6 +1208,22 @@ class TimelineWidget(QWidget):
         self.rebuild()
         self._emit_modified()
 
+    def toggle_selected_track(self, flag: str) -> None:
+        """Timeline > Selected Track > Mute/Lock/Hide: the header toggles for the track whose header
+        was clicked, else the selected clip's track -- reachable from the keyboard and by screen
+        readers, which can't see the header's drawn buttons."""
+        if self.project is None:
+            return
+        track = self.project.find_track(self.selected_track_id) if self.selected_track_id else None
+        if track is None and self.selected_clip_id is not None:
+            track = self.project.find_clip_track(self.selected_clip_id)
+        if track is None or track not in self._row_tracks:
+            return
+        row = self._row_tracks.index(track)
+        signal = {"muted": self.signals.track_mute_toggled, "locked": self.signals.track_lock_toggled,
+                  "hidden": self.signals.track_hidden_toggled}[flag]
+        signal.emit(row)
+
     def delete_selected_track(self) -> None:
         """Delete the track whose header was clicked, else the selected clip's track.
 

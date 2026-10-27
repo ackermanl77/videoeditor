@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QIcon,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QPolygonF,
@@ -826,14 +827,61 @@ class ClipItem(QGraphicsObject):
         event.accept()
 
 
+def draw_track_icon(painter: QPainter, kind: str, rect: QRectF, color: QColor, active: bool) -> None:
+    """The track header toggles' icons, drawn as vectors (no font or image needed): a speaker for
+    mute, a padlock for lock, an eye for hide, a speaker with a down arrow for ducking. An active
+    mute/hide gets a strike-through, like Omniclip's and most editors' track headers."""
+    pen = QPen(color)
+    pen.setWidthF(1.4)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    r = rect.adjusted(3.5, 3.5, -3.5, -3.5)
+    x, y, w, h = r.x(), r.y(), r.width(), r.height()
+    if kind in ("mute", "duck"):
+        speaker = QPolygonF([QPointF(x, y + h * 0.35), QPointF(x + w * 0.25, y + h * 0.35), QPointF(x + w * 0.5, y + h * 0.1),
+                             QPointF(x + w * 0.5, y + h * 0.9), QPointF(x + w * 0.25, y + h * 0.65), QPointF(x, y + h * 0.65)])
+        painter.setBrush(color)
+        painter.drawPolygon(speaker)
+        painter.setBrush(Qt.NoBrush)
+        if kind == "mute":
+            painter.drawArc(QRectF(x + w * 0.35, y + h * 0.25, w * 0.4, h * 0.5), -50 * 16, 100 * 16)
+            painter.drawArc(QRectF(x + w * 0.3, y + h * 0.05, w * 0.7, h * 0.9), -50 * 16, 100 * 16)
+        else:
+            painter.drawLine(QPointF(x + w * 0.82, y + h * 0.15), QPointF(x + w * 0.82, y + h * 0.85))
+            painter.drawLine(QPointF(x + w * 0.66, y + h * 0.66), QPointF(x + w * 0.82, y + h * 0.85))
+            painter.drawLine(QPointF(x + w * 0.98, y + h * 0.66), QPointF(x + w * 0.82, y + h * 0.85))
+    elif kind == "lock":
+        painter.drawRoundedRect(QRectF(x + w * 0.12, y + h * 0.45, w * 0.76, h * 0.55), 1.5, 1.5)
+        shackle = QPainterPath()
+        shackle.moveTo(x + w * 0.28, y + h * 0.45)
+        shackle.arcTo(QRectF(x + w * 0.28, y, w * 0.44, h * 0.6), 180, -180)
+        painter.drawPath(shackle)
+    elif kind == "hide":
+        eye = QPainterPath()
+        eye.moveTo(x, y + h / 2)
+        eye.quadTo(QPointF(x + w / 2, y - h * 0.05), QPointF(x + w, y + h / 2))
+        eye.quadTo(QPointF(x + w / 2, y + h * 1.05), QPointF(x, y + h / 2))
+        painter.drawPath(eye)
+        painter.setBrush(color)
+        painter.drawEllipse(QPointF(x + w / 2, y + h / 2), w * 0.14, h * 0.14)
+        painter.setBrush(Qt.NoBrush)
+    if active and kind in ("mute", "hide"):
+        painter.drawLine(QPointF(x, y + h), QPointF(x + w, y))
+
+
 class ToggleButtonItem(QGraphicsObject):
-    """A tiny clickable square icon-button used in track headers."""
+    """A tiny clickable square icon-button used in track headers. With an `icon` it draws that
+    (draw_track_icon) instead of its one-letter `label`."""
 
     clicked = Signal()
 
-    def __init__(self, label: str, size: int = 18, parent: Optional[QGraphicsItem] = None, description: str = ""):
+    def __init__(self, label: str, size: int = 18, parent: Optional[QGraphicsItem] = None, description: str = "",
+                 icon: Optional[str] = None):
         super().__init__(parent)
         self.label = label
+        self.icon = icon
         self.size = size
         self.description = description
         self.active = False
@@ -861,7 +909,11 @@ class ToggleButtonItem(QGraphicsObject):
         painter.setBrush(bg)
         painter.setPen(QPen(QColor(theme.COLOR_BORDER)))
         painter.drawRoundedRect(self.boundingRect(), 3, 3)
-        painter.setPen(QColor("white") if self.active else QColor(theme.COLOR_TEXT_DIM))
+        foreground = QColor("white") if self.active else QColor(theme.COLOR_TEXT_DIM)
+        if self.icon:
+            draw_track_icon(painter, self.icon, self.boundingRect(), foreground, self.active)
+            return
+        painter.setPen(foreground)
         font = QFont()
         font.setPointSize(8)
         font.setBold(True)
@@ -916,12 +968,14 @@ class TrackHeaderItem(QGraphicsObject):
         self.setPos(0, layout.top(row))
         buttons_y = self.row_height - 24
 
-        # Letters stay compact; every toggle has a tooltip naming it and its state
-        # ("H" was easily read as headphones or help).
-        self.mute_btn = ToggleButtonItem("M", parent=self, description="Mute track audio")
-        self.lock_btn = ToggleButtonItem("L", parent=self, description="Lock track against edits")
-        self.hide_btn = ToggleButtonItem("H", parent=self, description="Hide track picture (audio still plays)")
-        self.duck_btn = ToggleButtonItem("D", parent=self, description="Duck audio under another track (click to set)")
+        # Icons (UI2), each with a tooltip naming it and its state -- the letters M/L/H/D were
+        # easy to misread ("H" as headphones or help). Graphics items are invisible to screen
+        # readers, so the same toggles are also checkable actions in the header's context menu and
+        # in Timeline > Selected Track.
+        self.mute_btn = ToggleButtonItem("M", parent=self, description="Mute track audio", icon="mute")
+        self.lock_btn = ToggleButtonItem("L", parent=self, description="Lock track against edits", icon="lock")
+        self.hide_btn = ToggleButtonItem("H", parent=self, description="Hide track picture (audio still plays)", icon="hide")
+        self.duck_btn = ToggleButtonItem("D", parent=self, description="Duck audio under another track (click to set)", icon="duck")
         self.mute_btn.setPos(HEADER_WIDTH - 92, buttons_y)
         self.lock_btn.setPos(HEADER_WIDTH - 70, buttons_y)
         self.hide_btn.setPos(HEADER_WIDTH - 48, buttons_y)
@@ -974,6 +1028,15 @@ class TrackHeaderItem(QGraphicsObject):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu()
+        toggles = {}
+        for button, text, signal in ((self.mute_btn, "Mute Track", self.signals.track_mute_toggled),
+                                     (self.lock_btn, "Lock Track", self.signals.track_lock_toggled),
+                                     (self.hide_btn, "Hide Track Picture", self.signals.track_hidden_toggled)):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(button.active)
+            toggles[action] = signal
+        menu.addSeparator()
         rename_action = menu.addAction("Rename Track...")
         up_action = menu.addAction("Move Track Up")
         down_action = menu.addAction("Move Track Down")
@@ -987,6 +1050,8 @@ class TrackHeaderItem(QGraphicsObject):
         menu.addSeparator()
         duck_action = menu.addAction("Duck Audio Under / Ducking Settings...")
         chosen = menu.exec(event.screenPos())
+        if chosen in toggles:
+            toggles[chosen].emit(self.row)
         if chosen in height_actions:
             self.signals.track_height_requested.emit(self.row, height_actions[chosen])
         if chosen == rename_action:

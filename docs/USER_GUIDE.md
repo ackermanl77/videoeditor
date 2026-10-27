@@ -217,11 +217,15 @@ The timeline is where you arrange your edit.
   **Small** / **Medium** / **Large** to make its row shorter or taller (a
   taller row shows more of a clip's waveform or filmstrip). Saved with the
   project and undoable.
-- **Mute / Lock / Hide a track**: click a track header's **M** / **L** /
-  **H** buttons. A locked track's clips can't be dragged or trimmed; a
-  hidden video track's picture is left out of the preview and the export,
-  but its sound is kept (mute it to silence it). The **D** button sets up
-  ducking (see [Ducking settings](#effects-audio-automation-and-editing-tools)).
+- **Mute / Lock / Hide a track**: click a track header's speaker / padlock /
+  eye buttons (a struck-through speaker or eye means muted or hidden), or
+  right-click the header, or use **Timeline > Selected Track** for the
+  track you clicked (or the selected clip's track) — the menus also work
+  from the keyboard and with a screen reader. A locked track's clips can't
+  be dragged or trimmed; a hidden video track's picture is left out of the
+  preview and the export, but its sound is kept (mute it to silence it). The
+  speaker-with-arrow button sets up ducking (see
+  [Ducking settings](#effects-audio-automation-and-editing-tools)).
 - Tracks are strictly non-overlapping — a move or trim that would overlap
   another clip on the same track snaps back instead of applying.
 
@@ -726,7 +730,7 @@ next one and the two crossfade with an equal-power curve (no dip in the
 middle). As with video transitions, the second clip starts the transition
 duration early. Video crossfades now use the same equal-power audio curve.
 
-**Ducking settings**: the track header's **D** button (or right-click > Duck
+**Ducking settings**: the track header's ducking button (or right-click > Duck
 Audio Under) now also sets threshold, ratio, attack and release.
 
 **Selecting several clips**: **Ctrl+click** adds or removes a clip; drag on

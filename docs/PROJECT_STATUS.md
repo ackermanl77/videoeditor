@@ -82,6 +82,13 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
 
 ## Recently Added
 
+- **Track header icons (2026-10-24, UI audit UI2).** `ToggleButtonItem` draws vector icons
+  (`timeline_items.draw_track_icon`: speaker, padlock, eye, speaker with a down arrow for ducking; an active
+  mute/hide is struck through) instead of the letters M/L/H/D, keeping its tooltips. Graphics items are
+  invisible to assistive technology, so the same toggles are also checkable actions in the header's context
+  menu and in Timeline > Selected Track (`TimelineWidget.toggle_selected_track`: the clicked header's track,
+  else the selected clip's), all through `UpdateTrackPropertyCommand`. `tests/test_track_header_ui.py`.
+
 - **2026-10-21: recording, subject-following reframe, colour wheels + Auto Color, speech search,
   Explorer verb, keyframe graph, keyframed masks (F34-F39, F16).**
   - F34 `core/recording.py`, Edit > Record Voiceover / Screen / Webcam (Ctrl+Shift+R): FFmpeg DirectShow
