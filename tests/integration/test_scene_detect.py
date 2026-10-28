@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import importlib.util
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from core.scene_detect import (
 from tests.integration import test_p2_real_ffmpeg as p2
 
 FFMPEG = p2.FFMPEG
+HAS_QT = importlib.util.find_spec("PySide6") is not None
 _TMP = None
 SHOTS = None
 
@@ -88,6 +90,7 @@ class SceneDetectTests(unittest.TestCase):
         self.assertEqual(project.markers, [])
         self.assertIsNone(build_scene_cut_command(project, clip.id, [0.1], "split"))  # nothing inside
 
+    @unittest.skipUnless(HAS_QT, "PySide6 is not installed")
     def test_the_edit_menu_action_runs_end_to_end(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication

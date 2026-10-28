@@ -13,6 +13,11 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+try:  # CI's dependency-free job has no PySide6: skip this whole module there, as the other Qt tests do
+    import PySide6  # noqa: F401
+except ImportError:  # pragma: no cover - PySide6 missing
+    raise unittest.SkipTest("PySide6 is not installed in this interpreter") from None
+
 from PySide6.QtGui import QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 

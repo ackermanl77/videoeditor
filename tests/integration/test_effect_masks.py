@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import importlib.util
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from core.project import Project, ProjectSettings
 from tests.integration import test_p2_real_ffmpeg as p2
 
 FFMPEG, FFPROBE = p2.FFMPEG, p2.FFPROBE
+HAS_QT = importlib.util.find_spec("PySide6") is not None
 W, H = 160, 90
 _TMP = None
 GREY = None
@@ -130,7 +132,7 @@ class MaskedEffectExportTests(unittest.TestCase):
         self.assertTrue(frame)  # the preview path builds the same graph
 
 
-@unittest.skipUnless(FFMPEG, "FFmpeg not found")
+@unittest.skipUnless(FFMPEG and HAS_QT, "FFmpeg or PySide6 not available")
 class MaskPanelTests(unittest.TestCase):
     def test_the_panel_sets_and_clears_a_mask_as_undoable_edits(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from core.clip import Clip, MediaType, TextStyle
 from core.effects import EffectInstance
@@ -55,7 +56,9 @@ class OtioExportTests(unittest.TestCase):
         self.assertEqual((video["kind"], audio["kind"]), ("Video", "Audio"))
         fast, gap, title = video["children"]
         self.assertEqual(fast["OTIO_SCHEMA"], "Clip.2")
-        self.assertEqual(fast["media_references"]["DEFAULT_MEDIA"]["target_url"], "file:///C:/media/shots.mp4")
+        # A drive path is only absolute on Windows; on POSIX abspath() puts the working folder first.
+        expected = "file:///C:/media/shots.mp4" if os.name == "nt" else Path(os.path.abspath(MEDIA)).as_uri()
+        self.assertEqual(fast["media_references"]["DEFAULT_MEDIA"]["target_url"], expected)
         self.assertEqual(fast["source_range"]["start_time"]["value"], 25.0)  # 1.0 s at 25 fps
         self.assertEqual(fast["source_range"]["duration"]["value"], 50.0)  # 2.0 s on the timeline
         self.assertEqual(fast["effects"], [{"OTIO_SCHEMA": "LinearTimeWarp.1", "name": "", "effect_name": "LinearTimeWarp",
