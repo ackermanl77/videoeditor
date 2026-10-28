@@ -155,6 +155,10 @@ def main() -> int:
             "ffprobe.exe on Windows) into ./bin/ before building.\n"
         )
 
+    # THIRD_PARTY_NOTICES.md lists the packages actually being bundled; build.spec ships it.
+    notices = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "third_party_notices.py")], cwd=ROOT)
+    if notices.returncode != 0:
+        return notices.returncode
     cmd = [sys.executable, "-m", "PyInstaller", "build.spec", "--noconfirm"]
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT)

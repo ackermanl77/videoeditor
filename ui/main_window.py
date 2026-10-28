@@ -7,8 +7,8 @@ import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QIcon, QImage, QKeySequence, QPixmap
+from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -1046,6 +1046,18 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
 
     def show_about(self) -> None:
         QMessageBox.about(self, f"About {APP_NAME}", self.about_text())
+
+    def show_update(self, info) -> None:
+        """A newer release exists (core/update_check.py; main.py checks once per launch)."""
+        self.status_bar.showMessage(f"{APP_NAME} {info.version} is available.", 15000)
+        notes = f"\n\n{info.notes}" if info.notes else ""
+        answer = QMessageBox.question(
+            self, "Update Available",
+            f"{APP_NAME} {info.version} is available (you have {__version__}).{notes}\n\nOpen the download page?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(info.url))
 
     def closeEvent(self, event) -> None:
         if self.render_queue.queue.pending_count():

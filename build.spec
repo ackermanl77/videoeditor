@@ -43,7 +43,8 @@ a = Analysis(
     pathex=[root_dir],
     binaries=ffmpeg_binaries,
     # The Help > User Guide dialog reads docs/USER_GUIDE.md.
-    datas=[("assets", "assets"), ("docs/USER_GUIDE.md", "docs")],
+    # The license and third-party notices travel with every build (scripts/third_party_notices.py).
+    datas=[("assets", "assets"), ("docs/USER_GUIDE.md", "docs"), ("LICENSE", "."), ("THIRD_PARTY_NOTICES.md", ".")],
     hiddenimports=[
         "PySide6.QtMultimedia",
         "PySide6.QtMultimediaWidgets",

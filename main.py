@@ -15,10 +15,11 @@ import sys
 # from another directory or bundled by PyInstaller.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QObject, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen  # noqa: E402
 
+from core import __version__, diagnostics, update_check  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 from ui.theme import DARK_STYLESHEET  # noqa: E402
 
@@ -27,6 +28,20 @@ log = logging.getLogger("video_editor")
 
 APP_ID = "OpenVideoEditor.VideoEditor.1"  # Windows AppUserModelID
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icons")
+
+
+class _GuiThreadRelay(QObject):
+    """Hands messages from any thread to the GUI thread (a queued signal hops threads safely;
+    a QMessageBox can't): uncaught-exception reports and a found update."""
+
+    error = Signal(str)
+    update = Signal(object)
+
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self.error.connect(lambda text: QMessageBox.critical(window, "Open Video Editor Error", text),
+                           Qt.QueuedConnection)
+        self.update.connect(window.show_update, Qt.QueuedConnection)
 
 
 def _set_windows_app_id() -> None:
@@ -93,6 +108,8 @@ def main() -> int:
         return run_self_test()
 
     _set_windows_app_id()
+    # The windowed build has no console: log to a file (core/diagnostics.py).
+    diagnostics.configure_logging()
 
     QApplication.setApplicationName("Open Video Editor")
     QApplication.setApplicationDisplayName("Open Video Editor")
@@ -121,6 +138,11 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
+    relay = _GuiThreadRelay(window)
+    # Any uncaught exception (a Qt slot, a worker thread) is logged and shown in a dialog.
+    diagnostics.install_excepthooks(relay.error.emit)
+    # Does nothing until core/update_check.py's UPDATE_FEED_URL is set.
+    update_check.check_in_background(__version__, relay.update.emit)
 
     project_path = project_argument(sys.argv)
     if project_path:
