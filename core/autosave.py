@@ -19,7 +19,7 @@ import os
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from core.project import write_json_atomic
@@ -78,6 +78,7 @@ class OrphanedAutosave:
     path: str
     meta: Dict[str, Any]
     modified: float
+    generations: List[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -88,7 +89,7 @@ class OrphanedAutosave:
         return self.meta.get("original_path")
 
     def discard(self) -> None:
-        stem = self.path[: -len(".vproj")]
+        stem = self.path.split(".vproj", 1)[0]
         for leftover in glob.glob(glob.escape(stem) + ".*"):
             try:
                 os.remove(leftover)
@@ -117,16 +118,25 @@ class AutosaveSession:
     def write(self, project_data: Dict[str, Any], meta: Dict[str, Any]) -> None:
         """Save a new autosave generation, keeping the previous ones as ``.1``..``.N``."""
         self._ensure_lock()
-        for n in range(KEEP_GENERATIONS, 0, -1):
-            older = f"{self.path}.{n - 1}" if n > 1 else self.path
+        pending_path = self.path + ".pending"
+        write_json_atomic(pending_path, project_data)
+        oldest = f"{self.path}.{KEEP_GENERATIONS}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for n in range(KEEP_GENERATIONS - 1, 0, -1):
+            older = f"{self.path}.{n}"
             if os.path.exists(older):
-                os.replace(older, f"{self.path}.{n}")
-        write_json_atomic(self.path, project_data)
+                os.replace(older, f"{self.path}.{n + 1}")
+        if os.path.exists(self.path):
+            os.replace(self.path, f"{self.path}.1")
+        os.replace(pending_path, self.path)
         write_json_atomic(self.meta_path, dict(meta, saved=time.time()))
 
     def generations(self) -> List[str]:
         """Existing autosave files of this session, newest first."""
-        paths = [self.path] + [f"{self.path}.{n}" for n in range(1, KEEP_GENERATIONS + 1)]
+        paths = [self.path + ".pending", self.path] + [
+            f"{self.path}.{n}" for n in range(1, KEEP_GENERATIONS + 1)
+        ]
         return [p for p in paths if os.path.exists(p)]
 
     def clear(self) -> None:
@@ -151,8 +161,24 @@ def find_orphaned_autosaves(directory: Optional[str] = None, exclude_session: Op
     """Autosaves whose session lock is missing or names a dead process, newest first."""
     directory = directory or default_autosave_dir()
     found: List[OrphanedAutosave] = []
-    for path in glob.glob(os.path.join(glob.escape(directory), "*.vproj")):
-        stem = os.path.basename(path)[: -len(".vproj")]
+    grouped: Dict[str, List[str]] = {}
+    for path in glob.glob(os.path.join(glob.escape(directory), "*.vproj*")):
+        filename = os.path.basename(path)
+        marker = filename.find(".vproj")
+        if marker < 0:
+            continue
+        suffix = filename[marker + len(".vproj") :]
+        if suffix and suffix != ".pending":
+            if not suffix.startswith(".") or not suffix[1:].isdigit():
+                continue
+            if not 1 <= int(suffix[1:]) <= KEEP_GENERATIONS:
+                continue
+        stem = filename[:marker]
+        base_path = os.path.join(directory, stem + ".vproj")
+        grouped.setdefault(base_path, []).append(path)
+
+    for base_path, paths in grouped.items():
+        stem = os.path.basename(base_path)[: -len(".vproj")]
         if exclude_session and stem == exclude_session:
             continue
         lock = os.path.join(directory, f"{stem}.lock")
@@ -167,10 +193,18 @@ def find_orphaned_autosaves(directory: Optional[str] = None, exclude_session: Op
             continue
         meta: Dict[str, Any] = {}
         try:
-            with open(path + ".meta.json", "r", encoding="utf-8") as f:
+            with open(base_path + ".meta.json", "r", encoding="utf-8") as f:
                 meta = json.load(f)
         except (OSError, json.JSONDecodeError):
             pass
-        found.append(OrphanedAutosave(path=path, meta=meta, modified=os.path.getmtime(path)))
+        paths.sort(key=os.path.getmtime, reverse=True)
+        found.append(
+            OrphanedAutosave(
+                path=paths[0],
+                meta=meta,
+                modified=os.path.getmtime(paths[0]),
+                generations=paths,
+            )
+        )
     found.sort(key=lambda o: o.modified, reverse=True)
     return found

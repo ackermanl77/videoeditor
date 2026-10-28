@@ -6,6 +6,7 @@ No window is shown and no input is simulated. Skipped without PySide6.
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,7 +15,7 @@ try:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
     from PySide6.QtGui import QColor, QImage
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QMessageBox
 
     from core.clip import Clip, MediaType
     from core.effects import EffectInstance
@@ -467,6 +468,96 @@ class MainWindowP2Tests(_QtCase):
         warning.assert_called_once()
         self.assertEqual(window.project.name, "Assoc")
         window.deleteLater()
+
+    def test_oversized_project_shows_a_clear_open_error(self):
+        with tempfile.TemporaryDirectory(prefix="ve_large_project_") as tmp:
+            path = os.path.join(tmp, "too-large.vproj")
+            with open(path, "wb") as f:
+                f.write(b"x" * (1024 * 1024 + 1))
+            window = self._window()
+            original_project = window.project
+            try:
+                with (
+                    patch("core.project.MAX_PROJECT_FILE_SIZE_BYTES", 1024 * 1024),
+                    patch("ui.main_window.QMessageBox.critical") as critical,
+                ):
+                    window._open_project_from_path(path)
+                self.assertEqual(window.project, original_project)
+                self.assertIn("1 MiB size limit", critical.call_args.args[2])
+            finally:
+                window._autosave_session.close()
+                window.deleteLater()
+
+    def _recovery_window(self, home, autosave_dir):
+        with patch.dict(os.environ, {"USERPROFILE": home, "HOME": home}), \
+                patch("ui.main_window._autosave_dir", return_value=autosave_dir), \
+                patch("ui.main_window.nvenc_available", return_value=False):
+            from ui.main_window import MainWindow
+
+            window = MainWindow()
+        window._autosave_timer.stop()
+        return window
+
+    def test_autosave_recovery_falls_back_and_saves_before_discarding_source(self):
+        from core.autosave import AutosaveSession
+
+        with tempfile.TemporaryDirectory(prefix="ve_recovery_") as home:
+            autosave_dir = os.path.join(home, "autosave")
+            os.makedirs(autosave_dir)
+            orphan = AutosaveSession(autosave_dir, pid=999_999_999)
+            orphan.write(Project(name="Fallback").to_dict(), {"name": "Fallback"})
+            orphan.write(Project(name="Newer").to_dict(), {"name": "Newer"})
+            with open(orphan.path, "w", encoding="utf-8") as f:
+                f.write("{")
+            os.utime(orphan.path, (2_000_000_000, 2_000_000_000))
+            window = self._recovery_window(home, autosave_dir)
+            try:
+                with patch("ui.main_window._autosave_dir", return_value=autosave_dir), \
+                        patch("ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes):
+                    window._offer_autosave_recovery()
+                self.assertEqual(window.project.name, "Fallback")
+                self.assertFalse(os.path.exists(orphan.path))
+                saved = window._autosave_session.generations()
+                self.assertTrue(saved)
+                with open(saved[0], encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["name"], "Fallback")
+            finally:
+                window._autosave_session.close()
+                window.deleteLater()
+
+    def test_recovery_source_is_retained_when_post_recovery_save_fails(self):
+        from core.autosave import AutosaveSession
+
+        with tempfile.TemporaryDirectory(prefix="ve_recovery_") as home:
+            autosave_dir = os.path.join(home, "autosave")
+            os.makedirs(autosave_dir)
+            orphan = AutosaveSession(autosave_dir, pid=999_999_999)
+            orphan.write(Project(name="Keep source").to_dict(), {"name": "Keep source"})
+            window = self._recovery_window(home, autosave_dir)
+            try:
+                with patch("ui.main_window._autosave_dir", return_value=autosave_dir), \
+                        patch("ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes), \
+                        patch.object(window._autosave_session, "write", side_effect=OSError("disk full")):
+                    window._offer_autosave_recovery()
+                self.assertEqual(window.project.name, "Keep source")
+                self.assertTrue(os.path.exists(orphan.path))
+            finally:
+                window._autosave_session.close()
+                window.deleteLater()
+
+    def test_recent_projects_write_failure_preserves_previous_file(self):
+        from ui import window_projects
+
+        with tempfile.TemporaryDirectory(prefix="ve_recent_") as home, \
+                patch.dict(os.environ, {"USERPROFILE": home, "HOME": home}):
+            path = window_projects._recent_projects_path()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["previous.vproj"], f)
+            with patch("core.project.os.replace", side_effect=OSError("replace failed")):
+                window_projects._save_recent_projects(["new.vproj"])
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), ["previous.vproj"])
+            self.assertEqual(os.listdir(os.path.dirname(path)), ["recent_projects.json"])
 
     def test_about_and_shortcut_list(self):  # K6, F14
         from core import __version__

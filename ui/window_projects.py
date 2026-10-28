@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from core.project import Project, write_backup_copy
+from core.project import Project, write_backup_copy, write_json_atomic
 from ui.relink_dialog import RelinkDialog
 
 
@@ -40,9 +40,8 @@ def _load_recent_projects() -> List[str]:
 
 def _save_recent_projects(paths: List[str]) -> None:
     try:
-        with open(_recent_projects_path(), "w", encoding="utf-8") as f:
-            json.dump(paths, f, indent=2)
-    except OSError:
+        write_json_atomic(_recent_projects_path(), paths, indent=2)
+    except (OSError, TypeError, ValueError):
         pass
 
 
@@ -207,6 +206,15 @@ class ProjectsMixin:
             )
         except (OSError, TypeError, ValueError):
             pass  # autosaving is a courtesy; never interrupt the user for it
+        else:
+            self._discard_recovery_source()
 
     def _clear_autosave(self) -> None:
         self._autosave_session.clear()
+        self._discard_recovery_source()
+
+    def _discard_recovery_source(self) -> None:
+        source = getattr(self, "_recovery_source", None)
+        if source is not None:
+            source.discard()
+            self._recovery_source = None

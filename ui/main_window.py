@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import threading
@@ -48,7 +47,7 @@ from core.history import CompositeCommand, History
 from core.media_asset import MediaAsset
 from core.exporter import ExportCancelled, Exporter
 from core.preview_render import cached_render, render_preview
-from core.project import Project, write_backup_copy
+from core.project import Project, read_project_data, write_backup_copy
 from core.proxy import generate_proxy, needs_proxy
 from core.subtitles import (
     SubtitleParseError,
@@ -111,6 +110,7 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         # Changes outside History (imported media, proxies, recovered work).
         self._media_dirty = False
         self._autosave_session = AutosaveSession(_autosave_dir())
+        self._recovery_source = None
         self._export_dialogs: List[ExportDialog] = []
         self._proxy_jobs: set = set()
         self._syncing_playhead = False
@@ -886,15 +886,17 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
             orphan.discard()
             return
 
-        try:
-            with open(orphan.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            project = Project.from_dict(data)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Recover Unsaved Work", f"Could not recover the autosave:\n{exc}")
-            orphan.discard()
+        project = None
+        last_error = None
+        for generation in orphan.generations or [orphan.path]:
+            try:
+                project = Project.from_dict(read_project_data(generation))
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if project is None:
+            QMessageBox.critical(self, "Recover Unsaved Work", f"Could not recover the autosave:\n{last_error}")
             return
-        orphan.discard()
         original_path = orphan.original_path
 
         project.file_path = original_path
@@ -905,6 +907,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         self._waveform_cache.clear()
         self._load_project_into_panels()
         self._mark_dirty()  # recovered state doesn't exist on disk at `original_path` yet
+        self._recovery_source = orphan
+        self._autosave()
         self._warn_about_missing_media()
 
     # ------------------------------------------------------------------

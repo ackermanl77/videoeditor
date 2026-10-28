@@ -6,7 +6,7 @@ import unittest
 
 from core.clip import Clip, MediaType
 from core.media_asset import MediaAsset
-from core.project import Project
+from core.project import Project, ProjectFileError
 from core.track import TrackType
 
 
@@ -130,6 +130,68 @@ class AtomicSaveTests(unittest.TestCase):
             Project(name="Two").save(path)
             self.assertEqual(Project.load(path).name, "Two")
             self.assertEqual(os.listdir(tmp), ["p.vproj"])
+
+
+class ProjectLoadLimitTests(unittest.TestCase):
+    def test_load_rejects_a_project_over_the_size_limit(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "too-large.vproj")
+            with open(path, "wb") as f:
+                f.seek(1024 * 1024)
+                f.write(b"x")
+
+            with (
+                patch("core.project.MAX_PROJECT_FILE_SIZE_BYTES", 1024 * 1024),
+                self.assertRaisesRegex(ProjectFileError, "1 MiB size limit"),
+            ):
+                Project.load(path)
+
+    def test_load_reports_malformed_json_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "malformed.vproj")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{")
+
+            with self.assertRaisesRegex(ProjectFileError, "contains invalid JSON"):
+                Project.load(path)
+
+    def test_from_dict_rejects_an_oversized_collection(self):
+        from unittest.mock import patch
+
+        data = {"tracks": [{}, {}, {}]}
+        with (
+            patch("core.project.MAX_PROJECT_COLLECTION_ITEMS", 2),
+            self.assertRaisesRegex(
+                ProjectFileError, "collection contains too many items"
+            ),
+        ):
+            Project.from_dict(data)
+
+    def test_from_dict_rejects_too_many_items_across_collections(self):
+        from unittest.mock import patch
+
+        data = {"name": "Large", "nested": {"items": [1, 2]}}
+        with (
+            patch("core.project.MAX_PROJECT_COLLECTION_ITEMS", 10),
+            patch("core.project.MAX_PROJECT_TOTAL_ITEMS", 3),
+            self.assertRaisesRegex(ProjectFileError, "too many collection items"),
+        ):
+            Project.from_dict(data)
+
+    def test_from_dict_rejects_excessive_nesting(self):
+        from unittest.mock import patch
+
+        with (
+            patch("core.project.MAX_PROJECT_NESTING_DEPTH", 1),
+            self.assertRaisesRegex(ProjectFileError, "nested too deeply"),
+        ):
+            Project.from_dict({"a": {"b": []}})
+
+    def test_from_dict_rejects_non_object_json(self):
+        with self.assertRaisesRegex(ProjectFileError, "JSON object at the top level"):
+            Project.from_dict([])
 
 
 if __name__ == "__main__":

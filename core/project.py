@@ -28,9 +28,80 @@ from core.track import Track, TrackType
 #: effect-parameter keyframes. Older files are migrated on load.
 PROJECT_FILE_VERSION = 3
 
+MAX_PROJECT_FILE_SIZE_BYTES = 64 * 1024 * 1024
+MAX_PROJECT_COLLECTION_ITEMS = 50_000
+MAX_PROJECT_TOTAL_ITEMS = 200_000
+MAX_PROJECT_NESTING_DEPTH = 64
+
 
 class ProjectVersionError(ValueError):
     """The file was written by a newer version of the app with a newer file format."""
+
+
+class ProjectFileError(ValueError):
+    """A project file exceeds supported resource limits or is malformed."""
+
+
+def read_project_data(path: str) -> Any:
+    """Read bounded UTF-8 JSON from a project file with actionable errors."""
+    with open(path, "rb") as f:
+        content = f.read(MAX_PROJECT_FILE_SIZE_BYTES + 1)
+    if len(content) > MAX_PROJECT_FILE_SIZE_BYTES:
+        limit_mib = MAX_PROJECT_FILE_SIZE_BYTES / (1024 * 1024)
+        raise ProjectFileError(
+            f"Project file exceeds the {limit_mib:g} MiB size limit."
+        )
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProjectFileError("Project file is not valid UTF-8.") from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProjectFileError(
+            f"Project file contains invalid JSON: {exc.msg}."
+        ) from exc
+    except RecursionError as exc:
+        raise ProjectFileError("Project file is nested too deeply to parse.") from exc
+
+
+def _validate_project_data(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ProjectFileError(
+            "Project file must contain a JSON object at the top level."
+        )
+
+    pending = [(data, 0)]
+    total_items = 0
+    while pending:
+        value, depth = pending.pop()
+        if depth > MAX_PROJECT_NESTING_DEPTH:
+            raise ProjectFileError(
+                f"Project data is nested too deeply (maximum depth: {MAX_PROJECT_NESTING_DEPTH})."
+            )
+        if isinstance(value, dict):
+            item_count = len(value)
+            children = value.values()
+        elif isinstance(value, list):
+            item_count = len(value)
+            children = value
+        else:
+            continue
+
+        if item_count > MAX_PROJECT_COLLECTION_ITEMS:
+            raise ProjectFileError(
+                f"A project collection contains too many items "
+                f"(maximum: {MAX_PROJECT_COLLECTION_ITEMS:,})."
+            )
+        total_items += item_count
+        if total_items > MAX_PROJECT_TOTAL_ITEMS:
+            raise ProjectFileError(
+                f"Project data contains too many collection items "
+                f"(maximum: {MAX_PROJECT_TOTAL_ITEMS:,} total)."
+            )
+        pending.extend(
+            (child, depth + 1) for child in children if isinstance(child, (dict, list))
+        )
 
 
 def _norm(path: str) -> str:
@@ -395,6 +466,7 @@ class Project:
         unknown that can be defaulted or skipped is recorded in
         ``load_warnings`` instead of failing the whole load.
         """
+        _validate_project_data(data)
         data = migrate_project_data(dict(data))
         warnings: List[str] = []
         project = cls(
@@ -455,8 +527,7 @@ class Project:
 
     @classmethod
     def load(cls, path: str) -> "Project":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_project_data(path)
         project = cls.from_dict(data, base_dir=os.path.dirname(os.path.abspath(path)))
         project.file_path = path
         return project

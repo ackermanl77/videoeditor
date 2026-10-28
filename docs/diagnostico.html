@@ -1,0 +1,225 @@
+<title>Diagnóstico Open Video Editor</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: una columna de lectura (~920px) con bandas tipo pista de timeline; la regla de tiempo marca cada sección */
+:root{
+  --bg:#f5f6f8; --surface:#ffffff; --ink:#1b2130; --muted:#5d6678; --line:#dde1e8;
+  --accent:#2f5fd0; --accent-soft:#e6edfb; --audio:#2f8a5b; --audio-soft:#e3f2ea;
+  --ok:#22804f; --ok-bg:#e2f3e9; --warn:#a96a00; --warn-bg:#fbf0d9; --bad:#c03a2b; --bad-bg:#fbe5e2; --info:#5d6678; --info-bg:#eceff4;
+  --display:"Bricolage Grotesque",ui-sans-serif,system-ui,sans-serif;
+  --body:"Source Sans 3",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12151c; --surface:#1a1f29; --ink:#e6e9f0; --muted:#9aa3b5; --line:#2b3240;
+  --accent:#7a9ff0; --accent-soft:#1f2b46; --audio:#5fc28e; --audio-soft:#17302a;
+  --ok:#5fc28e; --ok-bg:#17302a; --warn:#e2ad4a; --warn-bg:#352a14; --bad:#ef7a6c; --bad-bg:#3a1e1b; --info:#9aa3b5; --info-bg:#232a37; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12151c; --surface:#1a1f29; --ink:#e6e9f0; --muted:#9aa3b5; --line:#2b3240;
+  --accent:#7a9ff0; --accent-soft:#1f2b46; --audio:#5fc28e; --audio-soft:#17302a;
+  --ok:#5fc28e; --ok-bg:#17302a; --warn:#e2ad4a; --warn-bg:#352a14; --bad:#ef7a6c; --bad-bg:#3a1e1b; --info:#9aa3b5; --info-bg:#232a37; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:16px/1.55 var(--body);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:32px 56px}
+.wrap{max-width:920px;margin:0 auto;display:flex;flex-direction:column;gap:44px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.15}
+h1{font-size:clamp(2rem,5vw,2.8rem);font-weight:700;letter-spacing:-.01em}
+h2{font-size:1.45rem;font-weight:700}
+h3{font-size:1.02rem;font-weight:600;font-family:var(--body)}
+p{margin:0}
+code,.mono{font-family:var(--mono);font-size:.86em}
+.eyebrow{font:600 .74rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.lede{color:var(--muted);max-width:65ch;font-size:1.08rem}
+header{display:flex;flex-direction:column;gap:14px}
+.tc{display:flex;flex-wrap:wrap;gap:6px 16px;font:400 .82rem var(--mono);color:var(--muted)}
+.tc b{color:var(--accent);font-weight:600}
+section{display:flex;flex-direction:column;gap:18px}
+.sechead{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;border-top:1px solid var(--line);padding-top:16px}
+.sechead .eyebrow{font-weight:400}
+.ruler{height:8px;background:repeating-linear-gradient(90deg,var(--line) 0 1px,transparent 1px 12px);border-radius:1px}
+
+/* KPI */
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:16px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.kpi .v{font:700 2rem/1 var(--display);font-variant-numeric:tabular-nums}
+.kpi .l{font-weight:600}
+.kpi .s{color:var(--muted);font-size:.86rem}
+.kpi.good .v{color:var(--ok)} .kpi.warn .v{color:var(--warn)}
+@media (max-width:760px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* Arquitectura */
+.arch{display:flex;flex-direction:column;gap:0}
+.layer{display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:start;padding:14px 16px;background:var(--surface);border:1px solid var(--line);border-radius:6px}
+.layer .tag{font:600 .78rem var(--mono);color:var(--accent);padding-top:2px}
+.layer .tag.au{color:var(--audio)}
+.layer p{color:var(--muted);font-size:.93rem}
+.layer h3{margin-bottom:3px}
+.arrow{font:400 .78rem var(--mono);color:var(--muted);padding:6px 0 6px 166px}
+.side{margin-top:14px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.side .layer{grid-template-columns:1fr;border-style:dashed}
+@media (max-width:640px){.layer{grid-template-columns:1fr;gap:4px}.arrow{padding-left:16px}.side{grid-template-columns:1fr}}
+
+/* Barras */
+.stack{display:flex;height:34px;border-radius:4px;overflow:hidden;border:1px solid var(--line)}
+.stack div{display:flex;align-items:center;padding:0 10px;font:600 .78rem var(--mono);white-space:nowrap;overflow:hidden}
+.legend{display:flex;flex-wrap:wrap;gap:6px 20px;font-size:.88rem;color:var(--muted)}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px;background:var(--c)}
+.bars{display:flex;flex-direction:column;gap:7px}
+.bar{display:grid;grid-template-columns:minmax(0,230px) 1fr 52px;gap:12px;align-items:center;font-size:.9rem}
+.bar .n{font-family:var(--mono);font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .t{height:14px;background:var(--line);border-radius:2px;overflow:hidden}
+.bar .t i{display:block;height:100%;background:var(--accent);border-radius:2px}
+.bar.core .t i{background:var(--audio)}
+.bar .x{font:400 .8rem var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+@media (max-width:560px){.bar{grid-template-columns:minmax(0,1fr) 48px}.bar .t{grid-column:1/-1;grid-row:2}}
+.note{color:var(--muted);font-size:.93rem;max-width:68ch}
+
+/* Tabla */
+.tablebox{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+table{width:100%;border-collapse:collapse;min-width:620px;font-size:.92rem}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 .72rem var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600;white-space:nowrap}
+td:last-child{color:var(--muted)}
+.pill{display:inline-block;font:600 .72rem/1 var(--mono);padding:5px 8px;border-radius:999px;white-space:nowrap}
+.p-ok{color:var(--ok);background:var(--ok-bg)} .p-part{color:var(--warn);background:var(--warn-bg)}
+.p-bad{color:var(--bad);background:var(--bad-bg)} .p-info{color:var(--info);background:var(--info-bg)}
+
+/* Listas */
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:28px;align-items:start}
+@media (max-width:760px){.cols{grid-template-columns:1fr}}
+ul.done{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}
+ul.done li{display:grid;grid-template-columns:20px 1fr;gap:6px;font-size:.94rem}
+ul.done li::before{content:"✓";color:var(--ok);font-weight:700}
+ul.done small{display:block;color:var(--muted);font-family:var(--mono);font-size:.74rem}
+.issues{display:flex;flex-direction:column;gap:10px}
+.issue{display:grid;grid-template-columns:4px 1fr;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px 14px 12px 0;overflow:hidden}
+.issue::before{content:"";background:var(--sev);margin:-12px 0}
+.issue .top{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:3px}
+.issue p{color:var(--muted);font-size:.9rem}
+.s-alto{--sev:var(--bad)} .s-medio{--sev:var(--warn)} .s-bajo{--sev:var(--info)}
+ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0;counter-reset:s}
+ol.steps li{counter-increment:s;display:grid;grid-template-columns:44px 1fr;gap:14px;padding:14px 0;border-bottom:1px solid var(--line)}
+ol.steps li:last-child{border-bottom:0}
+ol.steps li::before{content:counter(s);font:700 1.3rem/1 var(--display);color:var(--accent);width:36px;height:36px;border:1.5px solid var(--accent);border-radius:50%;display:grid;place-items:center}
+ol.steps p{color:var(--muted);font-size:.93rem;max-width:68ch;margin-top:3px}
+footer{color:var(--muted);font-size:.84rem;border-top:1px solid var(--line);padding-top:14px}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="tc"><span>core/ · ui/ · docs/PROJECT_STATUS.md</span><span><b>v0.2.0</b> (sin tag)</span><span>2026‑10‑27</span></div>
+  <h1>Diagnóstico Open Video Editor</h1>
+  <p class="lede">Estado del editor de video PySide6 + FFmpeg: qué funciona y está cubierto, qué quedó parcial o sin verificar, y qué falta para publicar 0.2.0.</p>
+</header>
+
+<section aria-label="Indicadores">
+  <div class="kpis">
+    <div class="kpi good"><span class="v">689</span><span class="l">Tests pasando</span><span class="s">+95 subtests · 52 archivos · 48.8 s · 0 fallos</span></div>
+    <div class="kpi"><span class="v">25 186</span><span class="l">Líneas de app</span><span class="s">core/ + ui/ + main.py · 75 módulos</span></div>
+    <div class="kpi"><span class="v">7.3%</span><span class="l">Archivo más grande</span><span class="s">timeline_widget.py, 1 831 líneas</span></div>
+    <div class="kpi warn"><span class="v">5</span><span class="l">Archivos sin commit</span><span class="s">+178 / −24 · autosave por generaciones</span></div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><h2>Arquitectura</h2><span class="eyebrow">3 capas · 2 renderizadores del mismo Project</span></div>
+  <div class="arch">
+    <div class="layer"><span class="tag">main.py · ui/</span><div><h3>Interfaz PySide6</h3><p>Un solo MainWindow (dividido en mixins window_projects / window_media / window_render). Lee Project/Track/Clip directamente; nunca los muta fuera de un Command.</p></div></div>
+    <div class="arrow">↓ Command → core.history.History (todo es deshacer/rehacer por construcción)</div>
+    <div class="layer"><span class="tag au">core/</span><div><h3>Modelo de edición y pipeline de render</h3><p>Project, Clip, EditOps, FilterGraph, Exporter, RenderQueue, Autosave, Proxy… Cero dependencias de Qt y cero imports de terceros: se prueba sin pantalla y con solo la stdlib.</p></div></div>
+    <div class="arrow">↓ subprocess (core/ffmpeg_utils.py: bin/ → PATH → imageio‑ffmpeg)</div>
+    <div class="layer"><span class="tag">bin/ffmpeg 9.0.1</span><div><h3>FFmpeg / FFprobe</h3><p>Versión fijada con SHA256 en ffmpeg.lock. Export con -filter_complex completo; NVENC con caída automática a CPU.</p></div></div>
+  </div>
+  <div class="side">
+    <div class="layer"><div><h3>Preview (QMediaPlayer)</h3><p>Reproduce solo el clip de video superior. En pausa, “Accurate frame” muestra el fotograma real del motor de export. Diferencia aceptada, no un bug.</p></div></div>
+    <div class="layer"><div><h3>faster‑whisper (opcional)</h3><p>Solo para Generate Captions. No está en requirements ni en el exe empaquetado; sin él, el comando explica cómo instalarlo.</p></div></div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><h2>Composición del código</h2><span class="eyebrow">líneas por carpeta y top 8 de 75 archivos</span></div>
+  <div class="stack" role="img" aria-label="core 12 823 líneas, ui 12 208, tests 12 211">
+    <div style="width:34.4%;background:var(--audio-soft);color:var(--audio)">core 12 823</div>
+    <div style="width:32.8%;background:var(--accent-soft);color:var(--accent)">ui 12 208</div>
+    <div style="width:32.8%;background:var(--info-bg);color:var(--muted)">tests 12 211</div>
+  </div>
+  <div class="legend"><span style="--c:var(--audio)">core/ · 48 archivos</span><span style="--c:var(--accent)">ui/ · 26 archivos</span><span style="--c:var(--muted)">tests/ · 54 archivos</span></div>
+  <div class="ruler" aria-hidden="true"></div>
+  <div class="bars">
+    <div class="bar"><span class="n">ui/widgets/timeline_widget.py</span><span class="t"><i style="width:100%"></i></span><span class="x">1 831</span></div>
+    <div class="bar"><span class="n">ui/properties_panel.py</span><span class="t"><i style="width:94.2%"></i></span><span class="x">1 724</span></div>
+    <div class="bar"><span class="n">ui/widgets/timeline_items.py</span><span class="t"><i style="width:70.3%"></i></span><span class="x">1 287</span></div>
+    <div class="bar core"><span class="n">core/exporter.py</span><span class="t"><i style="width:69.0%"></i></span><span class="x">1 264</span></div>
+    <div class="bar"><span class="n">ui/main_window.py</span><span class="t"><i style="width:59.5%"></i></span><span class="x">1 090</span></div>
+    <div class="bar"><span class="n">ui/preview_player.py</span><span class="t"><i style="width:57.9%"></i></span><span class="x">1 061</span></div>
+    <div class="bar"><span class="n">ui/export_dialog.py</span><span class="t"><i style="width:56.0%"></i></span><span class="x">1 025</span></div>
+    <div class="bar core"><span class="n">core/clip.py</span><span class="t"><i style="width:54.2%"></i></span><span class="x">992</span></div>
+  </div>
+  <p class="note">El tamaño está repartido: el archivo más grande es solo 1.06× el segundo y no pasa del 7.3% del código. La división R8/R9 del 2026‑10‑21 bajó main_window.py a 1 090 líneas. Hay casi una línea de test por cada dos de código.</p>
+</section>
+
+<section>
+  <div class="sechead"><h2>Matriz de funcionalidades</h2><span class="eyebrow">expuesto en la UI vs. limitado o sin verificar</span></div>
+  <div class="tablebox"><table>
+    <thead><tr><th>Funcionalidad</th><th>Estado</th><th>Detalle</th></tr></thead>
+    <tbody>
+      <tr><td>Edición en timeline</td><td><span class="pill p-ok">Expuesta</span></td><td>Move/trim/split, roll/slip/slide, ripple, lift/extract, razor, multiselección y portapapeles</td></tr>
+      <tr><td>Undo / Redo</td><td><span class="pill p-ok">Expuesta</span></td><td>Toda mutación pasa por un Command; el flag de cambios sigue al historial</td></tr>
+      <tr><td>Export multipista</td><td><span class="pill p-ok">Expuesta</span></td><td>filter_complex con transiciones, opacidad, texto; NVENC con fallback; cola de render</td></tr>
+      <tr><td>Color</td><td><span class="pill p-ok">Expuesta</span></td><td>Corrección, ruedas lift/gamma/gain, Auto Color, LUTs, scopes (waveform, parade, vectorscopio)</td></tr>
+      <tr><td>Reframe con seguimiento</td><td><span class="pill p-ok">Expuesta</span></td><td>Edit &gt; Keep Subject in Frame (F35), con test de render en 9:16</td></tr>
+      <tr><td>Grabación</td><td><span class="pill p-ok">Expuesta</span></td><td>Voz, pantalla y webcam vía DirectShow/gdigrab; probado con 2.5 s reales</td></tr>
+      <tr><td>Autosave por generaciones</td><td><span class="pill p-info">En curso</span></td><td>Escritura vía .pending y rotación .1…N; tests nuevos pasan, falta commit</td></tr>
+      <tr><td>Keyframes</td><td><span class="pill p-part">Parcial</span></td><td>Solo parámetros que FFmpeg evalúa por fotograma; blur, keys, LUTs y denoise son constantes</td></tr>
+      <tr><td>Speed ramps</td><td><span class="pill p-part">Parcial</span></td><td>No se combinan con escala/rotación de Transform ni con crossfades</td></tr>
+      <tr><td>HDR</td><td><span class="pill p-part">Parcial</span></td><td>PQ+HLG mezclados salen en SDR; metadata HDR10 solo con x265, no NVENC/AV1</td></tr>
+      <tr><td>Subtítulos ASS</td><td><span class="pill p-part">Parcial</span></td><td>Preview en vivo sin estilo; en export PQ/HLG libass sale demasiado brillante</td></tr>
+      <tr><td>Accesibilidad</td><td><span class="pill p-part">Parcial</span></td><td>Árbol verificado vía Qt, no con NVDA/Narrator; no respeta el escalado de texto del SO</td></tr>
+      <tr><td>Captions automáticos</td><td><span class="pill p-bad">Sin verificar</span></td><td>Tests con modelo simulado; nunca corrido con un modelo whisper real</td></tr>
+      <tr><td>Instalador y release</td><td><span class="pill p-bad">Sin verificar</span></td><td>release.yml no corrió con el build onedir + instalador; firma Authenticode no probada aquí</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <div class="sechead"><h2>Resuelto y abierto</h2><span class="eyebrow">últimos commits vs. pendientes</span></div>
+  <div class="cols">
+    <div>
+      <h3 style="margin-bottom:12px">Resuelto recientemente</h3>
+      <ul class="done">
+        <li><span>PROJECT_STATUS.md: limitación de reframe alineada con F35 y conteo de tests en 689<small>docs · 10‑27</small></span></li>
+        <li><span>Toggles de pista como íconos vectoriales, también en menús para tecnologías de asistencia<small>bfeb2ab · 10‑26</small></span></li>
+        <li><span>Nombres accesibles en controles de preview y Media Bin, nuevo ícono<small>d1e400f · 10‑22</small></span></li>
+        <li><span>MainWindow y filter graph divididos sin cambiar ninguno de los 128 grafos de los tests<small>534dca7 · 10‑21</small></span></li>
+        <li><span>Speed ramps en clips de pistas de audio ignorados en el export<small>B11 · 10‑17</small></span></li>
+        <li><span>Export de dos pasadas roto para todo proyecto (“output unconnected”)<small>review sep 2026</small></span></li>
+        <li><span>Crossfade fallaba en FFmpeg real: xfade exige frame rate constante<small>review sep 2026</small></span></li>
+      </ul>
+    </div>
+    <div class="issues">
+      <h3>Problemas abiertos</h3>
+      <div class="issue s-alto"><div><div class="top"><span class="pill p-bad">Alto</span><h3>0.2.0 sin publicar</h3></div><p>La única release es v0.1.0 (exe de un solo archivo). La cuota de artifacts de GitHub Actions se agotó el 10‑07 y se renueva el 1 de noviembre.</p></div></div>
+      <div class="issue s-alto"><div><div class="top"><span class="pill p-bad">Alto</span><h3>Autosave a medio commitear</h3></div><p>5 archivos modificados en core/autosave.py, ui/ y tests. Toca la recuperación ante crash: perderlo o mezclarlo con otro cambio es caro.</p></div></div>
+      <div class="issue s-medio"><div><div class="top"><span class="pill p-part">Medio</span><h3>Captions sin prueba real</h3></div><p>Generate Captions solo se probó con un modelo de reemplazo; falta una corrida con descarga del modelo.</p></div></div>
+      <div class="issue s-medio"><div><div class="top"><span class="pill p-part">Medio</span><h3>Reproducción verificada a mano</h3></div><p>QMediaPlayer, arrastres y el aspecto del timeline no se pueden probar sin pantalla.</p></div></div>
+      <div class="issue s-bajo"><div><div class="top"><span class="pill p-info">Bajo</span><h3>Accesibilidad y HDR mixto</h3></div><p>Sin pasada con lector de pantalla; HDR10 en NVENC/AV1 y timelines PQ+HLG siguen fuera.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><h2>Próximos pasos recomendados</h2><span class="eyebrow">en orden</span></div>
+  <ol class="steps">
+    <li><div><h3>Commitear el autosave por generaciones</h3><p>La suite completa pasa con estos cambios (689 tests). Cerrarlo ahora, junto con la corrección de PROJECT_STATUS.md, deja el árbol limpio antes del release.</p></div></li>
+    <li><div><h3>Etiquetar v0.2.0 el 1 de noviembre</h3><p>Cuando vuelva la cuota de Actions: primera corrida de release.yml con onedir + instalador, y una instalación interactiva (menú Inicio, doble clic en .vproj).</p></div></li>
+    <li><div><h3>Correr Generate Captions con un modelo real</h3><p>El modelo tiny basta para confirmar descarga, transcripción y colocación de cues en el timeline.</p></div></li>
+    <li><div><h3>Pasada con NVDA o Narrator</h3><p>El árbol de accesibilidad ya existe; falta confirmarlo con un lector de pantalla real.</p></div></li>
+  </ol>
+</section>
+
+<footer>Fuente: docs/PROJECT_STATUS.md, <code>python -m pytest -q</code> (689 passed, 95 subtests, 48.8 s, con los cambios sin commit), conteo de líneas de core/, ui/, tests/ y main.py, git log (92 commits, main al día con origin, tag v0.1.0). Snapshot local del 2026‑10‑27.</footer>
+</div>

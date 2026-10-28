@@ -609,6 +609,40 @@ class AutosaveTests(unittest.TestCase):  # R2
         with open(session.path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["n"], 4)
 
+    def test_failed_rotation_keeps_new_and_previous_recovery_candidates(self):
+        session = AutosaveSession(self.dir, pid=999_999_999)
+        session.write({"n": 0}, {"name": "p"})
+        replace = os.replace
+
+        def fail_current_rotation(source, target):
+            if source == session.path and target == session.path + ".1":
+                raise OSError("rotation failed")
+            return replace(source, target)
+
+        with patch("core.autosave.os.replace", side_effect=fail_current_rotation):
+            with self.assertRaisesRegex(OSError, "rotation failed"):
+                session.write({"n": 1}, {"name": "p"})
+
+        os.utime(session.path + ".pending", (2_000_000_000, 2_000_000_000))
+        orphan = find_orphaned_autosaves(self.dir)[0]
+        self.assertIn(session.path + ".pending", orphan.generations)
+        self.assertIn(session.path, orphan.generations)
+        with open(orphan.generations[0], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["n"], 1)
+        session.close()
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_orphaned_autosave_includes_older_generations_for_fallback(self):
+        session = AutosaveSession(self.dir, pid=999_999_999)
+        session.write({"n": 0}, {"name": "p"})
+        session.write({"n": 1}, {"name": "p"})
+        with open(session.path, "w", encoding="utf-8") as f:
+            f.write("{")
+        os.utime(session.path, (2_000_000_000, 2_000_000_000))
+        orphan = find_orphaned_autosaves(self.dir)[0]
+        self.assertEqual(orphan.generations[0], session.path)
+        self.assertIn(session.path + ".1", orphan.generations)
+
     def test_only_dead_sessions_are_offered(self):
         live = AutosaveSession(self.dir)
         live.write({}, {"name": "live"})
