@@ -19,7 +19,7 @@ All notable changes to Open Video Editor. The format follows
   meter, background preview renders and per-source GPU decoding.
 - A log file (`~/.video_editor/logs/video_editor.log`, plus `crash.log` for native crashes);
   any uncaught error is logged and shown in a dialog instead of vanishing.
-- An update check that stays off until a release feed is configured.
+- A once-per-launch update check against the project's GitHub Releases (update.json).
 - Dependabot, and a `pip-audit` job in CI.
 - `THIRD_PARTY_NOTICES.md` with the FFmpeg (GPLv3) and PySide6 (LGPLv3) terms and the FFmpeg
   source pointer, shipped in the build and the installer; `SECURITY.md`; a privacy note.

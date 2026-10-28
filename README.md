@@ -426,7 +426,7 @@ Known gaps are listed under "Known Limitations" in
 Projects and media stay on your computer; rendering and preview use the local FFmpeg. The only
 network access is optional: **automatic captions** download a faster-whisper speech model from
 the Hugging Face Hub the first time you use them (the audio itself is transcribed locally).
-A release may switch on the update check: once per launch it downloads a small version file from the release site and sends nothing but the app's name and version. There is no telemetry.
+Once per launch the app checks for a newer release: it downloads a small version file (update.json) from this project's GitHub Releases and sends nothing but the app's name and version. To turn that off, set the environment variable VIDEO_EDITOR_UPDATE_FEED_URL to off. There is no telemetry.
 
 ## License
 
