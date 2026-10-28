@@ -1,3 +1,40 @@
+# CLAUDE.md
+
+Guidance for Claude Code in this repository. Day-to-day commands: [README.md](README.md); user guide:
+[docs/USER_GUIDE.md](docs/USER_GUIDE.md); architecture, release and known limits:
+[docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md); per-feature guides: [docs/workflows/](docs/workflows/README.md).
+
+## What this is
+
+A non-linear video editor: `core/` is the editing model and the FFmpeg render pipeline (no Qt),
+`ui/` is the PySide6 interface, `main.py` the entry point (`--self-test` checks an install or build).
+
+## Commands
+
+```powershell
+python scripts/fetch_ffmpeg.py                       # pinned FFmpeg (ffmpeg.lock) into bin/
+python main.py
+python -m pytest -q                                  # core tests need nothing; FFmpeg/Qt tests skip without them
+python main.py --self-test
+python build.py [--installer]                        # dist/VideoEditor/ (+ Inno Setup installer)
+```
+
+CI: `.github/workflows/ci.yml` (dependency-free core tests + compileall; a Windows job with FFmpeg
+and PySide6 runs everything plus `--self-test`), `release.yml` for releases.
+
+## Rules
+
+- **`ui/` imports `core/`, never the reverse**; nothing in `core/` may import Qt.
+- **Every timeline mutation is a `Command`** (`core/commands.py`, `core/edit_ops.py`) executed
+  through `core.history.History`, so it is undoable. Never mutate the project directly from the UI.
+- **Export is one FFmpeg `-filter_complex` graph** built by `core/filter_graph.py` (with
+  `filter_graph_base/_video/_audio/_text.py`). New effects register in `core/effects.py` (schema,
+  animatable params, filter text); the Properties panel builds its controls from that schema.
+- The preview (`QMediaPlayer`) plays only the topmost clip; only the export and the Accurate frame
+  view (`core/frame_render.py`) are fully composited.
+- Projects (`.vproj`) are versioned in `core/project.py`; older files must keep loading.
+- Qt tests set `QT_QPA_PLATFORM=offscreen`; real-FFmpeg tests live in `tests/integration/`.
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
