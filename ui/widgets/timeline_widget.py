@@ -175,7 +175,7 @@ class FlowLayout(QLayout):
     """A left-to-right layout that wraps to a new row instead of overflowing.
 
     Adapted from Qt's own "Flow Layout" example. The toolbar row (8 buttons
-    plus a zoom slider) needs ~1,088px at its natural size — a plain
+    plus a zoom slider, as first measured) needed ~1,088px at its natural size — a plain
     ``QHBoxLayout`` would let it run past the edge of any window narrower
     than that, with the rightmost buttons rendered off-screen and
     genuinely unreachable (no scrollbar, no wrap). This instead moves
@@ -407,10 +407,8 @@ class TimelineWidget(QWidget):
         self.add_video_track_btn.setToolTip("Add a new video track")
         self.add_audio_track_btn = QPushButton("+ Audio Track")
         self.add_audio_track_btn.setToolTip("Add a new audio track")
-        self.split_btn = QPushButton("Split")
-        self.split_btn.setToolTip("Split the selected clip at the playhead (S)")
-        self.delete_btn = QPushButton("Delete")
-        self.delete_btn.setToolTip("Delete the selected clip (Delete)")
+        # Split and Delete live in the main toolbar (and Edit menu, clip context menu, S / Delete),
+        # once: a second pair here repeated them side by side (2026-10-22 UI audit).
         self.delete_track_btn = QPushButton("Delete Track")
         self.delete_track_btn.setToolTip("Delete the selected track")
         self.snap_btn = QPushButton("Snap")
@@ -427,8 +425,8 @@ class TimelineWidget(QWidget):
         self.add_marker_btn.setToolTip("Add a named marker at the playhead (M)")
 
         for btn in (
-            self.add_video_track_btn, self.add_audio_track_btn, self.split_btn,
-            self.delete_btn, self.delete_track_btn, self.snap_btn, self.ripple_btn,
+            self.add_video_track_btn, self.add_audio_track_btn,
+            self.delete_track_btn, self.snap_btn, self.ripple_btn,
             self.add_marker_btn,
         ):
             toolbar.addWidget(btn)
@@ -487,8 +485,6 @@ class TimelineWidget(QWidget):
     def _connect_signals(self) -> None:
         self.add_video_track_btn.clicked.connect(lambda: self.add_track(TrackType.VIDEO))
         self.add_audio_track_btn.clicked.connect(lambda: self.add_track(TrackType.AUDIO))
-        self.split_btn.clicked.connect(self.split_selected)
-        self.delete_btn.clicked.connect(self.delete_selected)
         self.delete_track_btn.clicked.connect(self.delete_selected_track)
         self.zoom_slider.valueChanged.connect(self._on_zoom_slider)
         self.snap_btn.toggled.connect(self._on_snap_toggled)
