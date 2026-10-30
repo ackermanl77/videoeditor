@@ -239,7 +239,8 @@ GitHub Actions (`.github/workflows/ci.yml`) has two jobs. `test` (Ubuntu) runs t
   frame with `scale2ref` and made a four-plane `yuva420p` mask with `mergeplanes` (a grey mask
   converted to YUV would half-blend the colour). Inline labelled branches inside the clip chain,
   unique per emission (a speed ramp emits one per segment). Works on "pre" and "post" effects; not
-  on stabilization. Static masks (no keyframes yet). Verified pixel-exact in a prototype (inside =
+  on stabilization. Masks were static at this initial 2026-10-18 stage; animated masks were added
+  in the later F16 update documented above. Verified pixel-exact in a prototype (inside =
   the effect's output, outside = the original, chroma included). Tests:
   `tests/integration/test_effect_masks.py` (real FFmpeg exports, invert, pre stage, speed ramp,
   the preview frame, the panel with undo).

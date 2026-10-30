@@ -513,14 +513,85 @@ class MainWindowP2Tests(_QtCase):
             window = self._recovery_window(home, autosave_dir)
             try:
                 with patch("ui.main_window._autosave_dir", return_value=autosave_dir), \
-                        patch("ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes):
+                    patch("ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes) as question:
                     window._offer_autosave_recovery()
+                question.assert_called_once()
                 self.assertEqual(window.project.name, "Fallback")
                 self.assertFalse(os.path.exists(orphan.path))
                 saved = window._autosave_session.generations()
                 self.assertTrue(saved)
                 with open(saved[0], encoding="utf-8") as f:
                     self.assertEqual(json.load(f)["name"], "Fallback")
+            finally:
+                window._autosave_session.close()
+                window.deleteLater()
+
+    def test_autosave_recovery_decline_discards_orphan_without_replacing_project(self):
+        from core.autosave import AutosaveSession
+
+        with tempfile.TemporaryDirectory(prefix="ve_recovery_decline_") as home:
+            autosave_dir = os.path.join(home, "autosave")
+            os.makedirs(autosave_dir)
+            orphan = AutosaveSession(autosave_dir, pid=999_999_999)
+            orphan.write(Project(name="Declined").to_dict(), {"name": "Declined"})
+            window = self._recovery_window(home, autosave_dir)
+            original_project = window.project
+            try:
+                with patch("ui.main_window._autosave_dir", return_value=autosave_dir), \
+                        patch("ui.main_window.QMessageBox.question", return_value=QMessageBox.No) as question:
+                    window._offer_autosave_recovery()
+                question.assert_called_once()
+                self.assertIs(window.project, original_project)
+                self.assertFalse(window._dirty)
+                self.assertFalse(os.path.exists(orphan.path))
+                self.assertEqual(window._autosave_session.generations(), [])
+            finally:
+                window._autosave_session.close()
+                window.deleteLater()
+
+    def test_recent_projects_menu_open_missing_and_clear_flows(self):
+        from ui import window_projects
+
+        with tempfile.TemporaryDirectory(prefix="ve_recent_menu_") as home, \
+                patch.dict(os.environ, {"USERPROFILE": home, "HOME": home}):
+            first_path = os.path.join(home, "First.vproj")
+            second_path = os.path.join(home, "Second.vproj")
+            Project(name="First").save(first_path)
+            Project(name="Second").save(second_path)
+            window = self._window()
+            try:
+                window._add_recent_project(first_path)
+                window._add_recent_project(second_path)
+                actions = window.recent_projects_menu.actions()
+                self.assertEqual([action.text() for action in actions[:2]], ["Second.vproj", "First.vproj"])
+
+                actions[0].trigger()
+                self.assertEqual(window.project.name, "Second")
+                self.assertEqual(window.project.file_path, second_path)
+
+                os.remove(second_path)
+                window._refresh_recent_projects_menu()
+                missing = next(
+                    action for action in window.recent_projects_menu.actions()
+                    if action.toolTip() == second_path
+                )
+                self.assertEqual(missing.text(), "Second.vproj (missing)")
+                self.assertFalse(missing.isEnabled())
+                with patch("ui.main_window.QMessageBox.warning") as warning:
+                    window._open_recent_project(second_path)
+                warning.assert_called_once()
+                self.assertEqual(window_projects._load_recent_projects(), [os.path.abspath(first_path)])
+
+                clear_action = next(
+                    action for action in window.recent_projects_menu.actions()
+                    if action.text() == "Clear Recent Projects"
+                )
+                clear_action.trigger()
+                self.assertEqual(window_projects._load_recent_projects(), [])
+                placeholder = window.recent_projects_menu.actions()
+                self.assertEqual(len(placeholder), 1)
+                self.assertEqual(placeholder[0].text(), "No Recent Projects")
+                self.assertFalse(placeholder[0].isEnabled())
             finally:
                 window._autosave_session.close()
                 window.deleteLater()

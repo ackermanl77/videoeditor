@@ -52,6 +52,10 @@ from core.commands import (
 )
 from core.edit_ops import (
     build_add_edit_all_tracks,
+    build_box_blade_command,
+    build_close_all_gaps_command,
+    build_close_track_gaps_command,
+    clips_beside_playhead,
     build_extend_edit_command,
     build_extract_command,
     build_lift_command,
@@ -260,6 +264,9 @@ class TimelineView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # A scene shorter than the view (few tracks) stays at the top-left; Qt's default centres
+        # it, which left an empty band above the ruler (UI5).
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         # Dragging on empty space draws a rubber band that selects clips (F6).
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setRubberBandSelectionMode(Qt.IntersectsItemShape)
@@ -267,6 +274,7 @@ class TimelineView(QGraphicsView):
         self.setAcceptDrops(True)
         self._scrubbing = False
         self._last_scrub_emit = 0.0
+        self._blade_from = None  # scene point where a Razor drag on empty space began (UI9)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -298,6 +306,13 @@ class TimelineView(QGraphicsView):
             self._last_scrub_emit = time.monotonic()
             self.seek_requested.emit(self._seconds_at(event.pos()))
             return
+        timeline = self._timeline_widget
+        # Razor on: a press on a clip cuts it (the clip handles that); one on empty space starts a
+        # box blade -- drag down across tracks to cut them all at the press time (UI9).
+        self._blade_from = None
+        if (event.button() == Qt.LeftButton and timeline.razor_mode and pos.x() >= HEADER_WIDTH
+                and timeline.clip_id_at(pos) is None):
+            self._blade_from = pos
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -316,7 +331,12 @@ class TimelineView(QGraphicsView):
             self._scrubbing = False
             self.seek_requested.emit(self._seconds_at(event.pos()))  # always land exactly where released
             return
+        start, self._blade_from = self._blade_from, None
         super().mouseReleaseEvent(event)
+        if start is not None and event.button() == Qt.LeftButton:
+            end = self.mapToScene(event.pos())
+            if abs(end.y() - start.y()) >= 4:
+                self._timeline_widget.box_blade(start, end)
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasFormat(MEDIA_MIME_TYPE):
@@ -1342,7 +1362,8 @@ class TimelineWidget(QWidget):
         for item in self._clip_items.values():
             item.razor_mode = self.razor_mode
         self.view.viewport().setCursor(Qt.CrossCursor if self.razor_mode else Qt.ArrowCursor)
-        self.status_message.emit("Razor tool on: click a clip to cut it." if enabled else "Razor tool off.")
+        self.status_message.emit("Razor tool on: click a clip to cut it, or drag down across tracks to cut them all."
+                                 if enabled else "Razor tool off.")
 
     def _on_clip_razor(self, clip_id: str, seconds: float) -> None:
         if self.project is None or self.history is None:
@@ -1405,6 +1426,61 @@ class TimelineWidget(QWidget):
             self.set_playhead(span[0])
         else:
             self.status_message.emit("Nothing to extract between In and Out.")
+        return ok
+
+    # -- close gaps, select beside the playhead, box blade (UI9) --------------------------
+    def clip_id_at(self, scene_pos) -> Optional[str]:
+        """The clip under a scene point, or None."""
+        for clip_id, item in self._clip_items.items():
+            if item.sceneBoundingRect().contains(scene_pos):
+                return clip_id
+        return None
+
+    def _gap_track_id(self) -> Optional[str]:
+        """The track Close Gaps works on: the selected track, else the selected clip's."""
+        if self.selected_track_id is not None:
+            return self.selected_track_id
+        track = self.project.find_clip_track(self.selected_clip_id) if self.selected_clip_id else None
+        return track.id if track is not None else None
+
+    def close_track_gaps(self) -> bool:
+        if self.project is None:
+            return False
+        track_id = self._gap_track_id()
+        if track_id is None:
+            self.status_message.emit("Select a track (or a clip on it) to close its gaps.")
+            return False
+        ok = self._execute_and_select(build_close_track_gaps_command(self.project, track_id), False)
+        self.status_message.emit("Gaps closed on the track." if ok else "That track has no gaps (or is locked).")
+        return ok
+
+    def close_all_gaps(self) -> bool:
+        if self.project is None:
+            return False
+        ok = self._execute_and_select(build_close_all_gaps_command(self.project), False)
+        self.status_message.emit("Gaps closed on all tracks." if ok else "No gap is empty on every track.")
+        return ok
+
+    def select_beside_playhead(self, side: str) -> int:
+        """Select Right/Left of Playhead; returns how many clips were selected."""
+        if self.project is None:
+            return 0
+        ids = clips_beside_playhead(self.project, self.playhead_time, side)
+        self.select_clips(ids)
+        self.status_message.emit(f"{len(ids)} clip(s) {'after' if side == 'right' else 'before'} the playhead selected.")
+        return len(ids)
+
+    def box_blade(self, start, end) -> bool:
+        """Razor dragged from ``start`` to ``end`` (scene points): cut every track the drag spans
+        at the start's time."""
+        if self.project is None or not self._row_tracks:
+            return False
+        rows = sorted(row_at_scene_y(y, self.row_layout) for y in (start.y(), end.y()))
+        last = len(self._row_tracks) - 1
+        tracks = [self._row_tracks[r].id for r in range(min(rows[0], last), min(rows[1], last) + 1)]
+        seconds = max(0.0, (start.x() - HEADER_WIDTH) / self.pixels_per_second)
+        ok = self._execute_and_select(build_box_blade_command(self.project, tracks, seconds), False)
+        self.status_message.emit(f"Cut {len(tracks)} track(s) at {seconds:.2f} s." if ok else "No clip there to cut.")
         return ok
 
     def add_edit_all_tracks(self) -> bool:

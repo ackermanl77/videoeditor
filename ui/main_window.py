@@ -7,7 +7,7 @@ import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QByteArray, QSettings, QThread, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QSettings, QSize, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +64,7 @@ from core.track import TrackType
 from core.waveform import WaveformData, load_waveform
 from ui.export_dialog import ExportDialog
 from ui.help_dialogs import ShortcutsDialog, UserGuideDialog
+from ui.shortcut_editing import ShortcutBook
 from ui.import_worker import ImportWorker
 from ui.window_projects import ProjectsMixin, PROJECT_FILE_FILTER, MAX_RECENT_PROJECTS, _recent_projects_path, _load_recent_projects, _save_recent_projects  # noqa: F401
 from ui.window_media import MediaMixin, _cache_dir, _waveform_cache_dir, AUTO_PROXY_SETTING  # noqa: F401
@@ -88,6 +89,16 @@ def _autosave_dir() -> str:
 
 
 GPU_DECODING_SETTING = "decode/hwaccel"
+
+# First-run window size: this much room when the screen has it, never more than 92% of its work area.
+DEFAULT_WINDOW_SIZE = QSize(1400, 860)
+
+
+def default_window_size(screen) -> QSize:
+    if screen is None:
+        return DEFAULT_WINDOW_SIZE
+    available = screen.availableGeometry().size()
+    return DEFAULT_WINDOW_SIZE.boundedTo(QSize(int(available.width() * 0.92), int(available.height() * 0.92)))
 
 
 def _strict_mode() -> bool:
@@ -134,7 +145,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        self.setMinimumSize(1200, 760)
+        # No fixed minimum: the layout's own (about 1016x385) lets the window fit a 1366x768
+        # laptop's work area; the first-run size comes from _restore_window_state().
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
@@ -154,6 +166,10 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
 
         self._restore_window_state()
         self._restore_workspace_choice()
+        # Editable shortcuts (UI8): the defaults are the keys built above, then the user's own.
+        self.shortcut_book = ShortcutBook(self.findChildren(QAction))
+        self.shortcut_book.load(QSettings())
+        self._refresh_scoped_key_hints()
 
         # Deferred so the window is fully shown before a possible recovery dialog pops up.
         QTimer.singleShot(0, self._offer_autosave_recovery)
@@ -305,6 +321,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         self._add_action(edit_menu, "Paste Attributes", self.timeline.paste_attributes, "Ctrl+Alt+V")
         self._add_action(edit_menu, "Duplicate", self.timeline.duplicate_selected, "Ctrl+D")
         self._add_action(edit_menu, "Select All Clips", self.timeline.select_all, QKeySequence.SelectAll)
+        self._add_action(edit_menu, "Select Right of Playhead", lambda: self.timeline.select_beside_playhead("right"), "Ctrl+Alt+Right")
+        self._add_action(edit_menu, "Select Left of Playhead", lambda: self.timeline.select_beside_playhead("left"), "Ctrl+Alt+Left")
         edit_menu.addSeparator()
         self.split_action = self._add_action(edit_menu, "Split Clip at Playhead", self.timeline.split_selected, "S", icon="split")
         self.delete_action = self._add_action(edit_menu, "Delete Selected Clips", self.timeline.delete_selected, QKeySequence.Delete, icon="delete")
@@ -318,6 +336,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         self._add_action(edit_menu, "Add Edit to All Tracks", self.timeline.add_edit_all_tracks, "Shift+S")
         self._add_action(edit_menu, "Lift (In to Out)", self.timeline.lift_in_out, ";")
         self._add_action(edit_menu, "Extract (In to Out)", self.timeline.extract_in_out, "'")
+        self._add_action(edit_menu, "Close Gaps on Track", self.timeline.close_track_gaps, "Alt+Backspace")
+        self._add_action(edit_menu, "Close Gaps on All Tracks", self.timeline.close_all_gaps, "Ctrl+Alt+Backspace")
         self._add_action(edit_menu, "Match Frame", self.match_frame, "F")
         self._add_action(edit_menu, "Make Subclip...", self.make_subclip, "Ctrl+U")
         self._add_action(edit_menu, "Slip Clip...", self.timeline.slip_selected)
@@ -479,6 +499,7 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
             ("Edit Selected Clip's Properties", "Return", self.focus_properties),
         )
         self.transport_actions: List[QAction] = []
+        self._scoped_key_hints: List[tuple] = []  # (scoped action, its display-only menu entry)
         for text, key, slot in scoped:
             shortcut_action = QAction(text, self)
             shortcut_action.setShortcut(QKeySequence(key))
@@ -489,6 +510,7 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
             self.transport_actions.append(shortcut_action)
             menu_action = menu.addAction(f"{text}\t{key}")  # display-only key hint
             menu_action.triggered.connect(slot)
+            self._scoped_key_hints.append((shortcut_action, menu_action))
         menu.addSeparator()
         self._add_action(menu, "Previous Marker", lambda: self.timeline.go_to_marker(-1), "Shift+M")
         self._add_action(menu, "Next Marker", lambda: self.timeline.go_to_marker(1), "Ctrl+Shift+M")
@@ -619,6 +641,7 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
     def _connect_signals(self) -> None:
         self.media_bin.import_requested.connect(self.import_media_paths)
         self.media_bin.add_to_timeline_requested.connect(self._add_asset_to_timeline_end)
+        self.media_bin.source_monitor_requested.connect(self.open_source_monitor)
         self.media_bin.subclip_rename_requested.connect(self._rename_subclip)
         self.media_bin.subclip_delete_requested.connect(self._delete_subclip)
         self.media_bin.proxy_requested.connect(self.generate_proxy_for)
@@ -928,8 +951,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         Uses ``QSettings`` (backed by the registry on Windows, a plist on
         macOS, an ini file on Linux) under the organization/application
         name set in ``main.py``. Absent on first run, in which case the
-        layout built in ``_build_ui`` (stretch factors, ``setMinimumSize``)
-        stands as the default.
+        window takes ``default_window_size()`` for its screen and the
+        layout built in ``_build_ui`` (stretch factors) stands as the default.
         """
         # Explicit type=QByteArray: some QSettings backends (notably the
         # .ini format) don't round-trip a QByteArray's type without a hint,
@@ -937,8 +960,8 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
         # silently reject.
         settings = QSettings()
         geometry = settings.value("window/geometry", type=QByteArray)
-        if geometry:
-            self.restoreGeometry(geometry)
+        if not geometry or not self.restoreGeometry(geometry):
+            self.resize(default_window_size(self.screen()))
         top_state = settings.value("window/top_splitter", type=QByteArray)
         if top_state:
             self.top_splitter.restoreState(top_state)
@@ -1026,7 +1049,18 @@ class MainWindow(ProjectsMixin, MediaMixin, RenderMixin, ToolsMixin, QMainWindow
                 return
 
     def show_shortcuts(self) -> None:
-        ShortcutsDialog(self.findChildren(QAction), self).exec()
+        ShortcutsDialog(self.shortcut_book, self._on_shortcuts_changed, self).exec()
+
+    def _on_shortcuts_changed(self) -> None:
+        self.shortcut_book.save(QSettings())
+        self._refresh_scoped_key_hints()
+
+    def _refresh_scoped_key_hints(self) -> None:
+        """The Navigate menu shows the timeline-scoped keys as text (their actions live on the
+        timeline and preview): keep that text in step with an edited key."""
+        for action, menu_action in self._scoped_key_hints:
+            key = action.shortcut().toString(QKeySequence.NativeText)
+            menu_action.setText(f"{action.text()}\t{key}" if key else action.text())
 
     def show_user_guide(self) -> None:
         UserGuideDialog(self).exec()

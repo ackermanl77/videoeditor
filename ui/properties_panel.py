@@ -1318,7 +1318,9 @@ class PropertiesPanel(QWidget):
         invert.toggled.connect(commit)
         refresh_enabled()
         box.mask_controls = {"shape": shape, "invert": invert, "track": track_btn, "clear_track": clear_track_btn,
-                             "track_label": track_label, **{key: spin for key, (spin, _s) in fields.items()}}
+                             "track_label": track_label, "keyframe": key_btn, "clear_keyframes": clear_keys_btn,
+                             "keyframe_count": keys_label,
+                             **{key: spin for key, (spin, _s) in fields.items()}}
         return box
 
     def _on_effect_row_changed(self, row: int) -> None:

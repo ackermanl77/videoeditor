@@ -658,3 +658,73 @@ def match_frame(project: Project, t: float, clip_id: Optional[str] = None):
     offset = min(chosen.source_offset_at(t - chosen.timeline_start), chosen.source_length)
     source = chosen.source_out - offset if chosen.reverse else chosen.source_in + offset
     return chosen, max(0.0, source)
+
+
+# ---------------------------------------------------------------------------
+# Close gaps, select left/right of the playhead, box blade (UI9)
+# ---------------------------------------------------------------------------
+def _gap_moves(project: Project, moves: List[MoveClipCommand], label: str) -> Optional[Command]:
+    moves.sort(key=lambda m: project.find_clip(m.clip_id).timeline_start)  # earliest first: no overlaps
+    return CompositeCommand(moves, label) if moves else None
+
+
+def build_close_track_gaps_command(project: Project, track_id: str) -> Optional[Command]:
+    """Close Gaps on one track: its clips move left until each touches the one before it (the
+    first one to 0), keeping their order. Other tracks don't move -- that's Close Gaps on All
+    Tracks' job, which keeps them in sync."""
+    track = project.find_track(track_id)
+    if track is None or track.locked:
+        return None
+    moves, at = [], 0.0
+    for clip in sorted(track.clips, key=lambda c: c.timeline_start):
+        if clip.timeline_start > at + _EPS:
+            moves.append(MoveClipCommand(project, clip.id, at, track.id))
+            at += clip.duration
+        else:
+            at = max(at, clip.timeline_end)
+    return _gap_moves(project, moves, "Close Gaps")
+
+
+def common_gaps(project: Project) -> List[tuple]:
+    """``(start, end)`` stretches where no unlocked track has a clip, from 0 to the last clip's end."""
+    spans = sorted((c.timeline_start, c.timeline_end) for t in project.tracks if not t.locked for c in t.clips)
+    gaps, at = [], 0.0
+    for start, end in spans:
+        if start > at + _EPS:
+            gaps.append((at, start))
+        at = max(at, end)
+    return gaps
+
+
+def build_close_all_gaps_command(project: Project) -> Optional[Command]:
+    """Close Gaps on All Tracks: removes only the stretches empty on every unlocked track, moving
+    everything after each one left by its length -- so the tracks stay in sync, as Blender's
+    "Remove Gaps (All)". Locked tracks don't move."""
+    gaps = common_gaps(project)
+    if not gaps:
+        return None
+    moves = []
+    for track in project.tracks:
+        if track.locked:
+            continue
+        for clip in track.clips:
+            shift = sum(end - start for start, end in gaps if end <= clip.timeline_start + _EPS)
+            if shift > _EPS:
+                moves.append(MoveClipCommand(project, clip.id, clip.timeline_start - shift, track.id))
+    return _gap_moves(project, moves, "Close Gaps on All Tracks")
+
+
+def clips_beside_playhead(project: Project, t: float, side: str) -> List[str]:
+    """Select Right/Left of Playhead: the clips on unlocked tracks that start at or after ``t``
+    ("right"), or end at or before it ("left"). A clip under the playhead is in neither."""
+    if side not in ("left", "right"):
+        raise ValueError(side)
+    return [c.id for track in project.tracks if not track.locked for c in track.clips
+            if (c.timeline_start >= t - _EPS if side == "right" else c.timeline_end <= t + _EPS)]
+
+
+def build_box_blade_command(project: Project, track_ids: Iterable[str], t: float) -> Optional[Command]:
+    """Box blade: the Razor dragged down across tracks cuts every clip under ``t`` on those
+    tracks (locked ones excepted), as one undo step."""
+    tracks = [tr for tr in (project.find_track(tid) for tid in track_ids) if tr is not None and not tr.locked]
+    return _plan_sequential(_split_steps_at(project, tracks, t), "Box Blade")

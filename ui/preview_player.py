@@ -35,12 +35,15 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSlider,
     QStackedWidget,
     QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from core.clip import Clip, MediaType
@@ -201,12 +204,10 @@ class PreviewPlayer(QWidget):
             "effects), rendered by the export engine at preview size."
         )
         self.accurate_checkbox.toggled.connect(self._on_accurate_toggled)
-        controls.addWidget(self.accurate_checkbox)
 
         self.safe_checkbox = QCheckBox("Safe areas")
         self.safe_checkbox.setToolTip("Show action-safe and title-safe guides over the preview.")
         self.safe_checkbox.toggled.connect(self._on_safe_areas_toggled)
-        controls.addWidget(self.safe_checkbox)
 
         self.transform_checkbox = QCheckBox("Transform")
         self.transform_checkbox.setToolTip(
@@ -214,7 +215,27 @@ class PreviewPlayer(QWidget):
             "drag a corner to scale it (one undo step per drag)."
         )
         self.transform_checkbox.toggled.connect(self._update_transform_overlay)
-        controls.addWidget(self.transform_checkbox)
+
+        # The three viewer options live in a "View" menu on the transport row (UI7), like a
+        # monitor's options menu in Resolve, so the row keeps play, time, position and the meters.
+        options = QWidget()
+        options_layout = QVBoxLayout(options)
+        options_layout.setContentsMargins(10, 6, 10, 6)
+        for checkbox in (self.accurate_checkbox, self.safe_checkbox, self.transform_checkbox):
+            options_layout.addWidget(checkbox)
+        options_action = QWidgetAction(self)
+        options_action.setDefaultWidget(options)
+        self.view_menu = QMenu(self)
+        self.view_menu.addAction(options_action)
+        self.view_button = QToolButton()
+        self.view_button.setText("View")
+        self.view_button.setToolTip("Preview options: accurate frame, safe areas, on-preview transform")
+        self.view_button.setAccessibleName("Preview view options")
+        self.view_button.setPopupMode(QToolButton.InstantPopup)
+        self.view_button.setMenu(self.view_menu)
+        for checkbox in (self.accurate_checkbox, self.safe_checkbox, self.transform_checkbox):
+            checkbox.toggled.connect(self._update_view_button)
+        controls.addWidget(self.view_button)
 
         self.meters = _AudioLevelMeters()
         controls.addWidget(self.meters)
@@ -234,7 +255,7 @@ class PreviewPlayer(QWidget):
         layout.addLayout(controls)
 
         self.note_label = QLabel(
-            "Playback shows the top active video clip only. Tick 'Accurate frame' to see the exact "
+            "Playback shows the top active video clip only. Turn on View > Accurate frame to see the exact "
             "export composite (transitions, text, effects) while paused."
         )
         self.note_label.setWordWrap(True)
@@ -454,6 +475,12 @@ class PreviewPlayer(QWidget):
     # ------------------------------------------------------------------
     # Accurate frame (F10b)
     # ------------------------------------------------------------------
+    def _update_view_button(self, _checked: bool = False) -> None:
+        """"View" plus the options that are on ("View: Accurate, Safe"), so they stay visible."""
+        on = [name for name, box in (("Accurate", self.accurate_checkbox), ("Safe", self.safe_checkbox),
+                                     ("Transform", self.transform_checkbox)) if box.isChecked()]
+        self.view_button.setText("View: " + ", ".join(on) if on else "View")
+
     def _on_accurate_toggled(self, checked: bool) -> None:
         if checked:
             self.request_accurate_frame()

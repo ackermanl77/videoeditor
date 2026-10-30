@@ -317,6 +317,43 @@ class EffectKeyframeUiTests(_QtCase):  # F12
         self.assertEqual([e.kind for e in clip.effects], ["color_correction"])
         self.assertEqual(self.panel.effects_list.count(), 1)
 
+    def test_mask_keyframe_controls_add_replace_clear_and_show_count(self):
+        effect = self.clip.effects[0]
+        effect.mask = {
+            "shape": "rectangle", "cx": 0.5, "cy": 0.5, "w": 0.5, "h": 0.5,
+            "angle": 0.0, "feather": 0.05, "invert": False,
+        }
+        self.panel.set_selected_clip(self.clip.id)
+        self.panel.effects_group.setChecked(True)
+
+        self.panel.set_playhead_time(11.0)
+        controls = self.panel.effect_mask_editor.mask_controls
+        controls["cx"].setValue(30)
+        controls["keyframe"].click()
+        self.assertEqual(controls["keyframe_count"].text(), "1 keyframe (add another)")
+
+        self.panel.set_playhead_time(12.0)
+        controls["cx"].setValue(60)
+        controls["keyframe"].click()
+        self.assertEqual(self.clip.effects[0].mask["keyframes"][0][0], 1.0)
+        self.assertEqual(self.clip.effects[0].mask["keyframes"][1][0], 2.0)
+        self.assertEqual(self.panel.effect_mask_editor.mask_controls["keyframe_count"].text(), "2 keyframes")
+
+        self.panel.set_playhead_time(11.0)
+        controls = self.panel.effect_mask_editor.mask_controls
+        controls["cx"].setValue(42)
+        controls["keyframe"].click()
+        keys = self.clip.effects[0].mask["keyframes"]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0][1], 0.42)
+        self.assertEqual(self.panel.effect_mask_editor.mask_controls["keyframe_count"].text(), "2 keyframes")
+
+        self.panel.effect_mask_editor.mask_controls["clear_keyframes"].click()
+        self.assertNotIn("keyframes", self.clip.effects[0].mask)
+        controls = self.panel.effect_mask_editor.mask_controls
+        self.assertEqual(controls["keyframe_count"].text(), "")
+        self.assertFalse(controls["clear_keyframes"].isEnabled())
+
 
 class TimelineAccessibilityTests(_QtCase):  # F13
     def setUp(self):

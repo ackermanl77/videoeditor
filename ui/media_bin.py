@@ -81,6 +81,7 @@ class MediaBinWidget(QWidget):
 
     import_requested = Signal(list)  # list[str] file paths
     add_to_timeline_requested = Signal(str)  # asset id, append to a default track
+    source_monitor_requested = Signal(str)  # asset id: preview it and mark In/Out (UI6)
     proxy_requested = Signal(str)  # asset id -> generate a preview proxy
     relink_requested = Signal()  # open File > Relink Media
     subclip_rename_requested = Signal(str)  # "sub:<id>"
@@ -151,8 +152,15 @@ class MediaBinWidget(QWidget):
             self.import_requested.emit(paths)
 
     def _on_item_double_clicked(self, item: QListWidgetItem) -> None:
+        """A video or audio file opens in the Source Monitor (UI6); a still image or a subclip
+        (its range is already chosen) is appended to the timeline as before."""
         asset_id = item.data(Qt.UserRole)
-        if asset_id:
+        if not asset_id:
+            return
+        asset = next((a for a in self._assets if a.id == str(asset_id)), None)
+        if asset is not None and not asset.is_image:
+            self.source_monitor_requested.emit(str(asset_id))
+        else:
             self.add_to_timeline_requested.emit(str(asset_id))
 
     def _on_speech_search(self, text: str) -> None:
@@ -200,10 +208,17 @@ class MediaBinWidget(QWidget):
             elif chosen == delete_action:
                 self.subclip_delete_requested.emit(asset_id)
             return
+        monitor_action = menu.addAction("Open in Source Monitor")
+        append_action = menu.addAction("Append to Timeline")
+        menu.addSeparator()
         proxy_action = menu.addAction("Generate Preview Proxy")
         relink_action = menu.addAction("Relink Media...")
         chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
-        if chosen == proxy_action:
+        if chosen == monitor_action:
+            self.source_monitor_requested.emit(asset_id)
+        elif chosen == append_action:
+            self.add_to_timeline_requested.emit(asset_id)
+        elif chosen == proxy_action:
             self.proxy_requested.emit(asset_id)
         elif chosen == relink_action:
             self.relink_requested.emit()

@@ -450,8 +450,50 @@ class MediaMixin:
         if asset is None:
             self.status_bar.showMessage("Select a file in the Media Bin first.", 4000)
             return
-        self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite,
-                                               source_range=(source_in, source_out) if source_out is not None else None)
+        # In/Out marked in the Source Monitor (UI6) count for the file selected in the bin.
+        source_range = self.source_ranges.get(asset_id) if source_out is None else (source_in, source_out)
+        self.timeline.insert_asset_at_playhead(asset, overwrite=overwrite, source_range=source_range)
+
+    # -- Source Monitor (UI6) -----------------------------------------------------
+    @property
+    def source_ranges(self) -> dict:
+        """asset id -> (in, out) marked in the Source Monitor, for this session."""
+        if not hasattr(self, "_source_ranges"):
+            self._source_ranges = {}
+        return self._source_ranges
+
+    def open_source_monitor(self, asset_id: str) -> bool:
+        from ui.source_monitor import SourceMonitor
+
+        asset = next((a for a in self.project.media_pool if a.id == asset_id), None)
+        if asset is None or asset.is_image:
+            return False
+        if getattr(self, "source_monitor", None) is None:
+            self.source_monitor = SourceMonitor(self)
+            self.source_monitor.range_changed.connect(self._on_source_range_changed)
+            self.source_monitor.place_requested.connect(self._place_from_source_monitor)
+        # The preview proxy when there is one: same timing, lighter to play.
+        path = asset.proxy_path if asset.proxy_path and os.path.isfile(asset.proxy_path) else asset.path
+        self.source_monitor.open_asset(asset.id, path, asset.duration, asset.display_name, self.source_ranges.get(asset.id))
+        self.source_monitor.show()
+        self.source_monitor.raise_()
+        return True
+
+    def _on_source_range_changed(self, asset_id: str, marked) -> None:
+        if marked is None:
+            self.source_ranges.pop(asset_id, None)
+        else:
+            self.source_ranges[asset_id] = tuple(marked)
+
+    def _place_from_source_monitor(self, asset_id: str, mode: str, marked) -> None:
+        asset = next((a for a in self.project.media_pool if a.id == asset_id), None)
+        if asset is None:
+            return
+        source_range = tuple(marked) if marked else None
+        if mode == "append":
+            self.timeline.add_media_to_timeline(asset, source_range=source_range)
+        else:
+            self.timeline.insert_asset_at_playhead(asset, overwrite=mode == "overwrite", source_range=source_range)
 
     def _refresh_media_bin(self) -> None:
         self.media_bin.set_assets(self.project.media_pool, self._thumbnail_for_asset, self.project.subclips)

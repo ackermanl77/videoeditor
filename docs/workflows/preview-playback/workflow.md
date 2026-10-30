@@ -19,7 +19,7 @@ This means the preview does **not**:
 - Show text overlays drawn on top of video underneath them — a text clip either wins as the topmost clip (shown alone) or is invisible if a video clip is on top of it in track order.
 - Show fades, transitions, or opacity.
 
-All of the above **are** rendered correctly in the exported file — export always builds the full multi-track FFmpeg filter graph (see [export/workflow.md](../export/workflow.md)). This is a deliberate trade-off for a simple, fast, maintainable preview implementation rather than a custom frame compositor; the panel shows a permanent on-screen reminder of this ("Playback shows the top active video clip only. Tick 'Accurate frame' to see the exact export composite (transitions, text, effects) while paused."). While paused or scrubbing, **Accurate frame** closes the gap (see below).
+All of the above **are** rendered correctly in the exported file — export always builds the full multi-track FFmpeg filter graph (see [export/workflow.md](../export/workflow.md)). This is a deliberate trade-off for a simple, fast, maintainable preview implementation rather than a custom frame compositor; the panel shows a permanent on-screen reminder of this ("Playback shows the top active video clip only. Turn on View > Accurate frame to see the exact export composite (transitions, text, effects) while paused."). While paused or scrubbing, **Accurate frame** closes the gap (see below).
 
 ## Playback across gaps and speed
 

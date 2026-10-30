@@ -124,7 +124,8 @@ remembered the next time you open the app.
 1. **Import** your video/audio/image files (drag them onto the Media Bin,
    or click **Import**).
 2. **Drag** a clip from the Media Bin onto a timeline track (or
-   double-click it to append it to the end).
+   right-click it > **Append to Timeline**; double-click opens it in the
+   Source Monitor to choose the part you want).
 3. **Arrange**: drag clips to move them, drag their edges to trim, select
    one and press **S** to split it at the playhead.
 4. **Select a clip** and use the **Properties** panel on the right to
@@ -173,9 +174,16 @@ The left-hand panel lists everything you've imported, with thumbnails and
 durations. From here you can:
 
 - **Drag** an item onto any timeline track.
-- **Double-click** an item to append it to the end of the first compatible
+- **Right-click > Append to Timeline** adds it at the end of the first compatible
   track (video/image files go to a video track, audio-only files go to an
-  audio track).
+  audio track). Double-clicking a still image does the same.
+- **Double-click** a video or audio file to open it in the **Source Monitor**, its
+  own window: play it (Space), step with ← / →, and mark the part you want with
+  **Mark In** (**I**) and **Mark Out** (**O**) (**Clear** goes back to the whole
+  file). **Insert** (**,**), **Overwrite** (**.**) and **Append** place just that
+  part at the timeline's playhead or its end. The marks are remembered for the
+  file while the app is open, so **Edit > Insert / Overwrite** with the file
+  selected in the bin use them too.
 
 **Subclips.** Select a clip on the timeline and choose **Edit > Make Subclip...** (Ctrl+U) to save
 part of its file as a named subclip:
@@ -359,7 +367,7 @@ track above another, scale it down, and move it into a corner.
 | Scale | 0.1x–3.0x | 1.0x |
 | Rotation | -180°–180° | 0° |
 
-**On the preview:** tick **Transform** under the preview to see the selected
+**On the preview:** turn on **View → Transform** under the preview to see the selected
 clip's box where the export puts it. Drag inside the box to move the clip, or
 drag a corner to scale it (one undo step per drag). Rotation stays in the
 Properties panel.
@@ -766,6 +774,9 @@ Split, Ripple Delete, Detach Audio, Roll, Slip, Slide and Reveal in Media Bin.
   | Extract | **'** | The same, then closes the gap: everything after Out moves left on those tracks. |
   | Match Frame | **F** | Finds the source of the frame at the playhead and selects its file in the Media Bin. The next Insert (**,**) or Overwrite (**.**) of it starts at that exact frame. |
   | Add Edit to All Tracks | **Shift+S** | Cuts every clip under the playhead, on every unlocked track. |
+  | Close Gaps on Track | **Alt+Backspace** | Moves the selected track's clips (or the selected clip's track) left until each touches the one before, the first to the start. Other tracks don't move. |
+  | Close Gaps on All Tracks | **Ctrl+Alt+Backspace** | Removes only the stretches that are empty on every unlocked track, so the tracks stay in sync. |
+  | Select Right / Left of Playhead | **Ctrl+Alt+Right / Left** | Selects every clip that starts at or after the playhead (or ends at or before it). A clip under the playhead is in neither. |
   | Extend Edit | **E** | Moves the selected clip's nearer edge to the playhead. An edge touching another clip rolls with it; a free edge is trimmed or extended (not past another clip or the end of the media). |
 - The same edits work by **dragging with a modifier key**:
 
@@ -780,8 +791,9 @@ Split, Ripple Delete, Detach Audio, Roll, Slip, Slide and Reveal in Media Bin.
   not enough footage, it would overlap), nothing changes and the status bar
   says why. **Ctrl+click** inside a clip still adds it to or removes it from
   the selection.
-- **Razor Tool** (**C**): click a clip to cut it there. Press **C** again to
-  turn it off.
+- **Razor Tool** (**C**): click a clip to cut it there, or start on empty space and
+  drag down (or up) across tracks to cut every clip on those tracks at the time
+  where you started (a box blade, one undo step). Press **C** again to turn it off.
 
 **Offline media and relinking**: clips whose file is missing get red hatching
 and "(offline)". **File > Relink Media...** lists missing files: **Locate
@@ -858,7 +870,8 @@ ruler or drag the playhead to scrub.
 - It does **not** show multiple video tracks composited together, text
   drawn over video, crossfade transitions, fades, or opacity.
 
-**Accurate frame**: tick **Accurate frame** under the preview to see the exact
+**Accurate frame**: turn on **View → Accurate frame** under the preview (the **View** button
+names the options that are on) to see the exact
 exported frame (every track, transitions, text, keyframes, effects) whenever
 playback is paused or you scrub. It is rendered by the export engine at
 preview size, so it takes a moment to appear; playback itself stays the fast,
@@ -872,7 +885,7 @@ the frames (the player can only play forwards), so they look a little less
 smooth there and are **silent** in the preview; the exported file has the
 reversed sound. **Accurate frame** shows them exactly.
 
-**Level meters**: the small bar next to **Safe areas** shows the sound level
+**Level meters**: the small bar next to the **View** button shows the sound level
 of the clip under the playhead — red for the peak, green for the average
 (RMS) level. It reads the waveform made at import, so it costs nothing while
 playing; it shows the active clip only (not the mix of every track), takes the
@@ -899,11 +912,11 @@ like. Edit anything in that range and the bar turns **red**: the preview goes
 back to the simplified view until you render again (undoing the edit makes the
 old render valid again). **Cancel Preview Render** stops one in progress.
 
-**Safe areas** draws the action-safe (outer, 90 %) and title-safe (inner,
+**View → Safe areas** draws the action-safe (outer, 90 %) and title-safe (inner,
 80 %) rectangles over the preview, to keep titles and captions away from the
 edges.
 
-**Transform** (next to Safe areas) edits the selected video or image clip right
+**Transform** (in the same **View** menu) edits the selected video or image clip right
 on the preview while the playhead is over it: its box shows where it sits on
 the frame; drag inside it to move the clip, drag a corner to scale it. Each drag
 is one undo step and updates the Transform sliders in Properties. Rotation is
@@ -1034,6 +1047,8 @@ disabled and explained when GIF is selected.
 | Lift / Extract (In to Out) | ; / ' |
 | Match Frame | F |
 | Add Edit to All Tracks | Shift+S |
+| Close Gaps on Track / on All Tracks | Alt+Backspace / Ctrl+Alt+Backspace |
+| Select Right / Left of Playhead | Ctrl+Alt+Right / Ctrl+Alt+Left |
 | Extend Edit to the playhead | E |
 | New Project | Ctrl+N |
 | Open Project | Ctrl+O |
@@ -1076,8 +1091,13 @@ disabled and explained when GIF is selected.
 | Record voiceover / screen / webcam | Ctrl+Shift+R |
 | Keyboard shortcut list | F1 |
 
-**Help > Keyboard Shortcuts** (**F1**) lists every shortcut, generated from
-the app itself. **Help > User Guide** opens this guide. (**Open Recent** and
+**Help > Keyboard Shortcuts** (**F1**) lists every command and its shortcut,
+generated from the app itself, and lets you change them: pick a command (the
+box at the top filters the list), press the new key and click **Assign**.
+**Remove** leaves it without a key, **Default** puts its own back and
+**Restore All** resets every key; a changed key is marked •. A key another
+command already uses isn't assigned: the dialog says which command has it.
+Your keys are kept between sessions. **Help > User Guide** opens this guide. (**Open Recent** and
 **Clear Recent Projects** are menu-only — no keyboard shortcut.)
 
 ## Tips, limits, and things to know
